@@ -1,0 +1,13 @@
+/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.iml
+
+# Local install/test dirs
+/test-install
+/scratch
