@@ -1,0 +1,28 @@
+[package]
+name = "packrelay-app"
+description = "PackRelay launcher (Tauri GUI). Wraps packrelay-core's install + verify modules in a desktop app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# The `_lib` suffix is the Tauri v2 convention — keeps the lib name
+# distinct from the binary name so Windows linking doesn't collide.
+# See https://github.com/rust-lang/cargo/issues/8519.
+name = "packrelay_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+packrelay-core = { path = "../../crates/packrelay-core" }
+
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tokio.workspace = true

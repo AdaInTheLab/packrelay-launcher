@@ -1,0 +1,17 @@
+[package]
+name = "packrelay-core"
+description = "Shared client + install + verify logic for the PackRelay launcher. Both the CLI and the Tauri GUI depend on this crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

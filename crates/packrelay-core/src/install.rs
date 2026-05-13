@@ -1,5 +1,10 @@
 // Install loop — the core of the launcher.
 //
+// Reusable by both the CLI (with an indicatif progress bar) and the
+// Tauri GUI (with frontend event emits). The shared install function
+// emits ProgressEvents through a generic callback so the IO layer
+// stays UI-agnostic.
+//
 // Mirrors scripts/install-pack.sh but with proper parallelism: a
 // bounded buffer_unordered stream pumps `concurrency` file
 // downloads in flight at once, each one streaming bytes through the
@@ -12,7 +17,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{self, StreamExt, TryStreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,68 +27,117 @@ use tokio::io::AsyncWriteExt;
 use crate::client::Client;
 use crate::manifest::{FileEntry, Manifest};
 
-pub async fn run(
+/// Progress events emitted during an install run.
+///
+/// The Tauri GUI serializes these to JSON via `emit()`. The CLI maps
+/// them onto an indicatif bar. Same shape for both surfaces.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ProgressEvent {
+    /// Sent once at the start, after the manifest is fetched.
+    Started {
+        display_name: String,
+        version: String,
+        file_count: u32,
+        total_bytes: u64,
+    },
+    /// Sent each time a chunk of bytes lands on disk. The delta is
+    /// the chunk size — callers accumulate it themselves.
+    Bytes { delta: u64 },
+    /// Sent once a single file is fully written + hash-verified.
+    FileDone { path: String },
+    /// Sent once after every file has been verified and the sidecar
+    /// manifest has been written.
+    Done {
+        file_count: u32,
+        total_bytes: u64,
+    },
+}
+
+/// Summary returned from a successful install. The caller can render
+/// it however it likes — the CLI prints it; the GUI hands it back to
+/// the React frontend.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallReport {
+    pub display_name: String,
+    pub version: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub dest: String,
+}
+
+/// Install a pack into `dest`. Spawns up to `concurrency` parallel
+/// downloads from the cloud's per-file endpoint, hash-verifies each
+/// against the manifest, and writes a sidecar manifest at the end.
+///
+/// `on_progress` is invoked from worker threads with each progress
+/// event — keep it cheap and use atomics/channels if you need to
+/// share state with the UI thread.
+pub async fn install<F>(
     client: &Client,
     slug: &str,
     dest: &Path,
     concurrency: usize,
-) -> Result<()> {
-    println!("[install] fetching manifest for '{slug}'...");
+    on_progress: F,
+) -> Result<InstallReport>
+where
+    F: Fn(ProgressEvent) + Send + Sync + 'static,
+{
     let (manifest_raw, manifest) = client.fetch_manifest(slug).await?;
-
-    println!(
-        "[install] manifest: {} v{} ({} files, {:.1} MB)",
-        manifest.display_name,
-        manifest.version,
-        manifest.files.len(),
-        manifest_total_bytes(&manifest) as f64 / (1024.0 * 1024.0),
-    );
 
     fs::create_dir_all(dest)
         .await
         .with_context(|| format!("creating dest {}", dest.display()))?;
 
     let total_bytes = manifest_total_bytes(&manifest);
-    let bar = ProgressBar::new(total_bytes);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
-             {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} eta {eta:>4}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-    let bar = Arc::new(bar);
+    let file_count = manifest.files.len() as u32;
 
-    // Parallel download stream. The closure captures small &
-    // references; reqwest::Client is Arc-internal so cloning is cheap.
+    let on_progress = Arc::new(on_progress);
+
+    on_progress(ProgressEvent::Started {
+        display_name: manifest.display_name.clone(),
+        version: manifest.version.clone(),
+        file_count,
+        total_bytes,
+    });
+
     let http = client.http().clone();
     let dest_arc: Arc<PathBuf> = Arc::new(dest.to_path_buf());
 
-    let results: Vec<Result<()>> = stream::iter(manifest.files.iter().enumerate().map(
-        |(idx, file)| {
-            let http = http.clone();
-            let dest = dest_arc.clone();
-            let bar = bar.clone();
-            let url = client.file_url(&file.sha256);
-            let file = file.clone();
-            async move {
-                download_and_verify(&http, &url, &file, dest.as_ref(), &bar)
-                    .await
-                    .with_context(|| format!("file #{} ({})", idx + 1, file.path))
-            }
-        },
-    ))
+    // Pre-collect owned (idx, file) pairs into a Vec so the per-task
+    // closures don't borrow from `manifest.files` — that borrow chain
+    // wasn't `Send + 'static`-general enough when this function is
+    // called from inside a Tauri command (HRTB error). Cloning the
+    // file metadata up front is cheap; the file bytes are streamed
+    // separately at download time.
+    let work: Vec<(usize, FileEntry)> = manifest
+        .files
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect();
+
+    let results: Vec<Result<()>> = stream::iter(work.into_iter().map(|(idx, file)| {
+        let http = http.clone();
+        let dest = dest_arc.clone();
+        let url = client.file_url(&file.sha256);
+        let progress = on_progress.clone();
+        async move {
+            download_and_verify(&http, &url, &file, dest.as_ref(), &*progress)
+                .await
+                .with_context(|| format!("file #{} ({})", idx + 1, file.path))
+        }
+    }))
     .buffer_unordered(concurrency)
     .collect()
     .await;
 
-    bar.finish_and_clear();
-
-    // Surface every failure at once — useful when a flaky network
-    // takes out multiple files in a row.
     let failures: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
     if !failures.is_empty() {
+        // Bubble up the first failure (carries the rest in context)
+        // but log all of them — flaky networks often hit multiple
+        // files in a row.
         for err in &failures {
             eprintln!("[install]  - {err:#}");
         }
@@ -103,26 +157,34 @@ pub async fn run(
         .await
         .with_context(|| format!("writing {}", sidecar.display()))?;
 
-    println!(
-        "[install] verified {} files, {:.1} MB. Installed into {}",
-        manifest.files.len(),
-        total_bytes as f64 / (1024.0 * 1024.0),
-        dest.display()
-    );
-    Ok(())
+    on_progress(ProgressEvent::Done {
+        file_count,
+        total_bytes,
+    });
+
+    Ok(InstallReport {
+        display_name: manifest.display_name,
+        version: manifest.version,
+        file_count,
+        total_bytes,
+        dest: dest.display().to_string(),
+    })
 }
 
 fn manifest_total_bytes(m: &Manifest) -> u64 {
     m.files.iter().map(|f| f.size).sum()
 }
 
-async fn download_and_verify(
+async fn download_and_verify<F>(
     http: &reqwest::Client,
     url: &str,
     file: &FileEntry,
     dest: &Path,
-    bar: &ProgressBar,
-) -> Result<()> {
+    on_progress: &F,
+) -> Result<()>
+where
+    F: Fn(ProgressEvent) + Send + Sync + ?Sized,
+{
     // Belt-and-suspenders against a malformed manifest. The server's
     // Zod schema already rejects absolute paths and ".." segments,
     // but we double-check here so a hypothetical server bug can't
@@ -174,7 +236,9 @@ async fn download_and_verify(
         hasher.update(&chunk);
         out.write_all(&chunk).await?;
         total += chunk.len() as u64;
-        bar.inc(chunk.len() as u64);
+        on_progress(ProgressEvent::Bytes {
+            delta: chunk.len() as u64,
+        });
     }
     out.flush().await?;
 
@@ -197,13 +261,9 @@ async fn download_and_verify(
         );
     }
 
-    Ok(())
-}
+    on_progress(ProgressEvent::FileDone {
+        path: file.path.clone(),
+    });
 
-// MultiProgress import kept available for future GUI-bridging usage
-// (per-file bars in the eventual Tauri shell). Silenced for now so
-// the unused-import lint stays quiet.
-#[allow(dead_code)]
-fn _multi_progress_anchor() -> MultiProgress {
-    MultiProgress::new()
+    Ok(())
 }

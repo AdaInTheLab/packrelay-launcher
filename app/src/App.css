@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* Loosely mirror the cloud's design tokens so the launcher feels
+ * like part of the same family. Tweak in a follow-up once we have
+ * the proper design system extracted into a shared source. */
+@theme {
+  --color-bg-page: #0b0b12;
+  --color-bg-panel: #14141d;
+  --color-bg-raised: #22222e;
+  --color-text-bright: #f4f4f8;
+  --color-text-dim: #8b8b96;
+  --color-accent: #7c3aed;
+  --color-accent-soft: #a78bfa;
+  --color-status-success: #50c878;
+  --color-status-warning: #f5a623;
+  --color-status-danger: #ef4444;
+
+  --font-display: "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-bg-page);
+  color: var(--color-text-bright);
+  font-family: var(--font-display);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
