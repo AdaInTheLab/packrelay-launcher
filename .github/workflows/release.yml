@@ -1,15 +1,12 @@
-# Builds the Tauri launcher for Windows + Linux on every tag push
-# matching v*, uploads the bundles to a GitHub Release.
+# Builds the Tauri launcher for Windows / macOS / Linux on every
+# tag push matching v*, uploads the bundles to a GitHub Release.
 #
 # Triggered by:   git tag v0.1.0 && git push --tags
 #
 # Outputs (per platform, in the release):
 #   - Windows: PackRelay_<version>_x64-setup.exe (NSIS) + .msi
+#   - macOS:   PackRelay.app.tar.gz + .dmg (universal target, both arches)
 #   - Linux:   .AppImage + .deb
-#
-# macOS is intentionally out of scope — not part of the current
-# target audience. Source builds via `npm run tauri build` still
-# work on macOS if anyone wants to compile locally.
 #
 # The Windows build is unsigned today — SmartScreen + Safe Browsing
 # will warn on first run until we get a code-signing cert wired in.
@@ -36,10 +33,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows + Linux only. macOS dropped from the matrix —
-          # not part of the current target audience. The Tauri code
-          # itself is still macOS-buildable from source if someone
-          # wants to compile locally; we just don't ship binaries.
+          # macOS universal — one DMG that runs on both Apple Silicon
+          # and Intel. Slightly slower to build than a single-arch
+          # build but produces one artifact instead of two.
+          - platform: macos-latest
+            args: --target universal-apple-darwin
           - platform: ubuntu-22.04
             args: ""
           - platform: windows-latest
@@ -53,6 +51,11 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS universal needs both targets present even though
+          # the rust-toolchain action only installs the host target
+          # by default.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache cargo registry + target
         uses: swatinem/rust-cache@v2
@@ -116,9 +119,9 @@ jobs:
             this release is built by GitHub Actions directly from
             this repo's source.
 
-            macOS isn't part of the current target audience — source
-            builds work via `npm run tauri build` but we don't ship
-            binaries for it.
+            **macOS users:** the .app isn't notarized yet either, so
+            you'll need to right-click → Open the first time
+            instead of double-clicking.
 
             See the README for what's in this release.
           # Mark every release as a draft so we get a chance to

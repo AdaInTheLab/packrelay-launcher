@@ -31,7 +31,7 @@ No telemetry. No analytics. No background processes when the launcher window is 
 
 ## Download
 
-Pre-built binaries are on the [Releases page](https://github.com/AdaInTheLab/packrelay-launcher/releases/latest). Windows and Linux builds are produced from this repo on every tagged release. macOS isn't part of the current target audience — source builds still work but we don't ship binaries.
+Pre-built binaries are on the [Releases page](https://github.com/AdaInTheLab/packrelay-launcher/releases/latest). Windows, macOS, and Linux builds are produced from this repo on every tagged release.
 
 > **Heads up — Windows SmartScreen warning.** The binary isn't yet code-signed (we're working on an OV/EV certificate). On first run you'll see Windows SmartScreen flag it as an "unrecognized app" — click **More info** → **Run anyway**. The launcher is open source and built by GitHub Actions directly from this repo; SHA-256 sums are published alongside each release.
 
