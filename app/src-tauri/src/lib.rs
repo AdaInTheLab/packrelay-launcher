@@ -526,6 +526,76 @@ async fn sign_out(app: AppHandle) -> Result<AuthState, String> {
     Ok(AuthState::SignedOut)
 }
 
+/// One entry in a pack's "what's inside" overview. Each top-level
+/// directory in the manifest's file list is one mod, by 7DTD's
+/// pack-on-disk convention (Mods/<ModName>/ModInfo.xml).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackDirEntry {
+    pub name: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
+}
+
+/// Fetch a pack's manifest and reduce it to its top-level dirs.
+/// Used by DetailView to render "what's inside" without shipping
+/// the entire file list to the React side — for big packs the
+/// manifest can be thousands of entries; we'd waste bytes
+/// serializing it just to throw 99% away.
+#[tauri::command]
+async fn fetch_pack_overview(slug: String) -> Result<Vec<PackDirEntry>, String> {
+    let client = Client::new(DEFAULT_API_URL);
+    let (_raw, manifest) = client
+        .fetch_manifest(&slug)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    // Bucket file count + total bytes by first path segment.
+    // Manifest paths can use either slash flavour on Windows-
+    // published packs (Zod doesn't normalize); canonicalize before
+    // splitting so a backslash-in-path doesn't end up as its own
+    // bogus "dir".
+    let mut by_dir: std::collections::HashMap<String, (u32, u64)> =
+        std::collections::HashMap::new();
+    let mut root_count: u32 = 0;
+    let mut root_bytes: u64 = 0;
+    for file in &manifest.files {
+        let normalized = file.path.replace('\\', "/");
+        match normalized.split_once('/') {
+            Some((first, _)) => {
+                let entry = by_dir.entry(first.to_string()).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += file.size;
+            }
+            None => {
+                // File sitting at the manifest root with no
+                // parent dir. Group as a synthetic "(root)"
+                // bucket at the end of the list — uncommon, but
+                // worth showing rather than silently dropping.
+                root_count += 1;
+                root_bytes += file.size;
+            }
+        }
+    }
+    let mut dirs: Vec<PackDirEntry> = by_dir
+        .into_iter()
+        .map(|(name, (file_count, total_bytes))| PackDirEntry {
+            name,
+            file_count,
+            total_bytes,
+        })
+        .collect();
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    if root_count > 0 {
+        dirs.push(PackDirEntry {
+            name: "(root)".to_string(),
+            file_count: root_count,
+            total_bytes: root_bytes,
+        });
+    }
+    Ok(dirs)
+}
+
 // ---------- Profile commands ----------
 //
 // Profiles are named bundles of (mods + saves + worlds). The core
@@ -993,7 +1063,8 @@ pub fn run() {
             profile_delete,
             profile_snapshot_active,
             profile_list_snapshots,
-            profile_restore_snapshot
+            profile_restore_snapshot,
+            fetch_pack_overview
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

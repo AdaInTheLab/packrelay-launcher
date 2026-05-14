@@ -2227,6 +2227,16 @@ function InstallView({
 // stats, and the install button as a single deliberate CTA at the
 // bottom (mirroring the eventual InstallView mode label so the
 // user isn't surprised on the next screen).
+// Mirrors the Rust PackDirEntry — one top-level mod inside a pack
+// manifest. DetailView fetches these lazily so the page renders
+// before the network roundtrip lands; missing data just hides the
+// "What's inside" section.
+type PackDirEntry = {
+  name: string;
+  fileCount: number;
+  totalBytes: number;
+};
+
 function DetailView({
   pack,
   installedRecord,
@@ -2238,6 +2248,32 @@ function DetailView({
   onBack: () => void;
   onInstall: () => void;
 }) {
+  // "What's inside" list — the top-level dirs in the manifest,
+  // which by 7DTD's pack-on-disk convention are the names of the
+  // mods bundled inside the pack. Fetched lazily so the page
+  // first-paint is instant; if the fetch fails we just don't
+  // show the section.
+  const [insideDirs, setInsideDirs] = useState<PackDirEntry[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setInsideDirs(null);
+    (async () => {
+      try {
+        const dirs = await invoke<PackDirEntry[]>("fetch_pack_overview", {
+          slug: pack.slug,
+        });
+        if (!cancelled) setInsideDirs(dirs);
+      } catch {
+        // Manifest network error or pack-not-found — leave the
+        // section hidden. Not worth a banner; the stats panel
+        // above still tells the user the pack exists.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pack.slug]);
+
   // Mirrors the mode-detection in InstallView so the action button
   // here reads the same as what'll show on the next screen.
   const mode: InstallMode = (() => {
@@ -2340,6 +2376,39 @@ function DetailView({
         />
         <StatCard label="Published" value={ageLabel} />
       </div>
+
+      {insideDirs && insideDirs.length > 0 && (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 px-5 py-5 mb-6">
+          <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3 flex items-baseline justify-between gap-2">
+            <span>What&apos;s inside</span>
+            <span className="text-[10px] text-[var(--color-text-dim)] font-normal tracking-normal normal-case">
+              {insideDirs.length} mod{insideDirs.length === 1 ? "" : "s"}
+            </span>
+          </h2>
+          <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+            {insideDirs.map((d) => (
+              <li
+                key={d.name}
+                className="flex items-center justify-between gap-3 rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2"
+              >
+                <span
+                  className={`text-[12px] truncate ${
+                    d.name === "(root)"
+                      ? "text-[var(--color-text-dim)] italic"
+                      : "text-[var(--color-text-bright)] font-medium"
+                  }`}
+                  title={d.name}
+                >
+                  {d.name}
+                </span>
+                <span className="shrink-0 text-[10px] text-[var(--color-text-dim)] tabular-nums">
+                  {d.fileCount}f · {formatBytes(d.totalBytes)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {pack.description && (
         <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 px-5 py-5 mb-6">
