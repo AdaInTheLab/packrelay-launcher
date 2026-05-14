@@ -11,3 +11,9 @@ Cargo.lock.bak
 # Local install/test dirs
 /test-install
 /scratch
+
+# Tauri updater signing key — the PRIVATE half. Must never be
+# committed. The .pub counterpart is safe to commit and goes
+# into tauri.conf.json. See docs/UPDATER.md.
+tauri-update.key
+tauri-update.key.password
