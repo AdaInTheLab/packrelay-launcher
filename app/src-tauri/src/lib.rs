@@ -15,9 +15,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_opener::OpenerExt;
 
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
+
+/// Steam app id for 7 Days to Die. Encoded in the launch URI so
+/// Steam handles install-validation/family-share/already-running
+/// for us — we don't try to locate the binary ourselves.
+const SEVEN_DAYS_STEAM_APPID: u32 = 251570;
 
 /// The frontend always talks to packrelay.cloud unless we override
 /// for local dev. Wrapped in a single constant so a future "switch
@@ -281,6 +287,19 @@ async fn install_pack(
     Ok(report)
 }
 
+/// Open 7DTD via the Steam protocol. We deliberately don't pass a
+/// connect address through — 7DTD's client doesn't accept one
+/// cleanly from the command line, and our copy-to-clipboard flow
+/// is the reliable handoff. Steam itself takes care of finding +
+/// validating the install.
+#[tauri::command]
+async fn launch_game(app: AppHandle) -> Result<(), String> {
+    let url = format!("steam://rungameid/{SEVEN_DAYS_STEAM_APPID}");
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -290,7 +309,8 @@ pub fn run() {
             list_packs,
             list_servers,
             install_pack,
-            default_install_dest
+            default_install_dest,
+            launch_game
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

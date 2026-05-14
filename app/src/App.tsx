@@ -787,7 +787,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in 7DTD
                   </div>
-                  <ConnectCopy address={connectAddress} />
+                  <LaunchPanel address={connectAddress} />
                 </div>
               )}
             </div>
@@ -1120,6 +1120,70 @@ function ConnectCopy({ address }: { address: string }) {
       >
         {copied ? "Copied" : "Copy"}
       </button>
+    </div>
+  );
+}
+
+// One-click launch: copy the address to clipboard, then ask Steam
+// to spin up 7DTD via its rungameid URI. The user still has to
+// paste the address into Join Game → Connect to IP — 7DTD's
+// client doesn't accept a connect address from the command line,
+// so the launcher's job stops at "Steam is opening".
+function LaunchPanel({ address }: { address: string }) {
+  const [state, setState] = useState<
+    | { kind: "idle" }
+    | { kind: "launching" }
+    | { kind: "launched" }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  const launch = useCallback(async () => {
+    setState({ kind: "launching" });
+    // Prime the clipboard first — even if Steam fails to open,
+    // the user can paste the address into a manually-opened game.
+    try {
+      await navigator.clipboard.writeText(address);
+    } catch {
+      // Non-fatal — the address is still visible and selectable.
+    }
+    try {
+      await invoke("launch_game");
+      setState({ kind: "launched" });
+    } catch (e) {
+      setState({ kind: "error", message: String(e) });
+    }
+  }, [address]);
+
+  return (
+    <div className="space-y-3">
+      <ConnectCopy address={address} />
+      <button
+        type="button"
+        onClick={launch}
+        disabled={state.kind === "launching"}
+        className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+      >
+        {state.kind === "launching" ? "Opening Steam…" : "Launch 7DTD"}
+      </button>
+      {state.kind === "launched" && (
+        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+          Steam is launching 7DTD. The address is on your clipboard
+          — paste it into <span className="text-[var(--color-text-bright)]">Join a Game → Connect to IP</span>.
+        </p>
+      )}
+      {state.kind === "error" && (
+        <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed">
+          Couldn&apos;t open Steam: {state.message}. The address is
+          still on your clipboard — launch 7DTD manually and paste it
+          into Join a Game.
+        </p>
+      )}
+      {state.kind === "idle" && (
+        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+          Opens 7DTD via Steam and copies the address. Paste it into
+          Join a Game → Connect to IP once the menu loads.
+        </p>
+      )}
     </div>
   );
 }
