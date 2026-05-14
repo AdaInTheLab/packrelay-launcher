@@ -19,6 +19,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
+use packrelay_core::verify::{repair, verify, RepairReport, VerifyReport};
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
 /// Steam handles install-validation/family-share/already-running
@@ -287,6 +288,29 @@ async fn install_pack(
     Ok(report)
 }
 
+/// Re-check an installed pack's files against its sidecar manifest.
+/// Cheap enough to run on demand from a history-row button — pure
+/// disk IO + SHA-256 hashing, no network. The frontend renders the
+/// returned VerifyReport (healthy vs. N files missing/corrupt).
+#[tauri::command]
+async fn verify_pack(dest: String) -> Result<VerifyReport, String> {
+    verify(&PathBuf::from(dest))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Re-download any files in an installed pack that failed verify.
+/// Reuses the install loop's hash-verified streaming write path
+/// (see install::download_and_verify), so a half-applied repair
+/// can't leave the dest worse than it started.
+#[tauri::command]
+async fn repair_pack(dest: String) -> Result<RepairReport, String> {
+    let client = Client::new(DEFAULT_API_URL);
+    repair(&client, &PathBuf::from(dest))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// Open 7DTD via the Steam protocol. We deliberately don't pass a
 /// connect address through — 7DTD's client doesn't accept one
 /// cleanly from the command line, and our copy-to-clipboard flow
@@ -310,7 +334,9 @@ pub fn run() {
             list_servers,
             install_pack,
             default_install_dest,
-            launch_game
+            launch_game,
+            verify_pack,
+            repair_pack
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

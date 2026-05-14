@@ -84,6 +84,33 @@ type InstallState =
   | { kind: "done"; report: InstallReport }
   | { kind: "error"; message: string };
 
+// Mirrors packrelay-core's VerifyReport / VerifyFailure / RepairReport
+// (#[serde(rename_all = "camelCase")], internally-tagged enum).
+type VerifyFailure =
+  | { kind: "missing"; path: string }
+  | { kind: "corrupt"; path: string; reason: string };
+
+type VerifyReport = {
+  displayName: string;
+  version: string;
+  totalFiles: number;
+  failures: VerifyFailure[];
+};
+
+type RepairReport = {
+  displayName: string;
+  version: string;
+  filesRepaired: number;
+};
+
+type RowVerifyState =
+  | { kind: "idle" }
+  | { kind: "verifying" }
+  | { kind: "verified"; report: VerifyReport }
+  | { kind: "repairing" }
+  | { kind: "repaired"; report: RepairReport }
+  | { kind: "error"; message: string };
+
 /** A row in the local install-history list. Stored in localStorage
  *  as a JSON array under HISTORY_STORAGE_KEY. */
 type InstallRecord = {
@@ -435,52 +462,248 @@ function HistorySidebar({
         </div>
       ) : (
         <ul className="px-2 py-2">
-          {history.map((r) => {
-            const latest = latestVersionBySlug.get(r.slug);
-            const updateAvailable =
-              latest !== undefined && semverIsNewer(latest, r.version);
-            return (
-              <li key={`${r.slug}-${r.installedAt}`}>
-                <button
-                  type="button"
-                  onClick={() => onPick(r)}
-                  disabled={!catalogReady}
-                  className="w-full text-left rounded-md px-3 py-2 mb-0.5 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                >
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <span className="text-xs font-medium text-[var(--color-text-bright)] truncate flex-1 min-w-0">
-                      {r.name}
-                    </span>
-                    {updateAvailable && (
-                      <span
-                        title={`Update available: v${latest}`}
-                        className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
-                      >
-                        ↻ Update
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
-                    <span className="font-mono truncate">
-                      v{r.version}
-                      {updateAvailable && (
-                        <span className="text-[var(--color-accent-soft)]">
-                          {" "}
-                          → v{latest}
-                        </span>
-                      )}
-                    </span>
-                    <span className="shrink-0">
-                      {formatRelativeTime(r.installedAt)}
-                    </span>
-                  </div>
-                </button>
-              </li>
-            );
-          })}
+          {history.map((r) => (
+            <HistoryRow
+              key={`${r.slug}-${r.installedAt}`}
+              record={r}
+              latestVersionBySlug={latestVersionBySlug}
+              onPick={onPick}
+              catalogReady={catalogReady}
+            />
+          ))}
         </ul>
       )}
     </aside>
+  );
+}
+
+// One row in the install-history list. Holds its own
+// verify/repair state machine so multiple rows can be in different
+// states at once (e.g. one verifying while another is showing a
+// repaired badge). Click-the-row still reinstalls; the Verify
+// button stops propagation so the two actions don't collide.
+function HistoryRow({
+  record,
+  latestVersionBySlug,
+  onPick,
+  catalogReady,
+}: {
+  record: InstallRecord;
+  latestVersionBySlug: Map<string, string>;
+  onPick: (r: InstallRecord) => void;
+  catalogReady: boolean;
+}) {
+  const [verify, setVerify] = useState<RowVerifyState>({ kind: "idle" });
+
+  const latest = latestVersionBySlug.get(record.slug);
+  const updateAvailable =
+    latest !== undefined && semverIsNewer(latest, record.version);
+
+  const runVerify = useCallback(async () => {
+    setVerify({ kind: "verifying" });
+    try {
+      const report = await invoke<VerifyReport>("verify_pack", {
+        dest: record.dest,
+      });
+      setVerify({ kind: "verified", report });
+    } catch (e) {
+      setVerify({ kind: "error", message: typeof e === "string" ? e : `${e}` });
+    }
+  }, [record.dest]);
+
+  const runRepair = useCallback(async () => {
+    setVerify({ kind: "repairing" });
+    try {
+      const report = await invoke<RepairReport>("repair_pack", {
+        dest: record.dest,
+      });
+      setVerify({ kind: "repaired", report });
+    } catch (e) {
+      setVerify({ kind: "error", message: typeof e === "string" ? e : `${e}` });
+    }
+  }, [record.dest]);
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => onPick(record)}
+        disabled={!catalogReady}
+        className="w-full text-left rounded-md px-3 py-2 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+      >
+        <div className="flex items-center gap-1.5 mb-0.5">
+          <span className="text-xs font-medium text-[var(--color-text-bright)] truncate flex-1 min-w-0">
+            {record.name}
+          </span>
+          {updateAvailable && (
+            <span
+              title={`Update available: v${latest}`}
+              className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
+            >
+              ↻ Update
+            </span>
+          )}
+          {/* Verify is a secondary action on the row — small, low-
+              contrast, and stops propagation so the surrounding
+              re-install button doesn't also fire. */}
+          <span
+            role="button"
+            tabIndex={0}
+            title="Verify installed files"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (verify.kind !== "verifying" && verify.kind !== "repairing") {
+                runVerify();
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                runVerify();
+              }
+            }}
+            className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] hover:text-[var(--color-accent-soft)] hover:bg-[var(--color-bg-raised)]/60 cursor-pointer transition-colors"
+          >
+            {verify.kind === "verifying" || verify.kind === "repairing"
+              ? "…"
+              : "✓"}
+          </span>
+        </div>
+        <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
+          <span className="font-mono truncate">
+            v{record.version}
+            {updateAvailable && (
+              <span className="text-[var(--color-accent-soft)]">
+                {" "}
+                → v{latest}
+              </span>
+            )}
+          </span>
+          <span className="shrink-0">{formatRelativeTime(record.installedAt)}</span>
+        </div>
+      </button>
+      <VerifyStatus state={verify} onRepair={runRepair} onDismiss={() => setVerify({ kind: "idle" })} />
+    </li>
+  );
+}
+
+// Inline status block under a history row. Compact by design — it
+// shares the sidebar width so we can't afford a full modal here.
+// Three terminal states: healthy (✓), needs-repair (with action),
+// repaired (success), plus the obvious in-flight + error states.
+function VerifyStatus({
+  state,
+  onRepair,
+  onDismiss,
+}: {
+  state: RowVerifyState;
+  onRepair: () => void;
+  onDismiss: () => void;
+}) {
+  if (state.kind === "idle") return null;
+
+  if (state.kind === "verifying") {
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] text-[var(--color-text-dim)] bg-[var(--color-bg-raised)]/30">
+        Verifying…
+      </div>
+    );
+  }
+
+  if (state.kind === "repairing") {
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] text-[var(--color-text-dim)] bg-[var(--color-bg-raised)]/30">
+        Repairing…
+      </div>
+    );
+  }
+
+  if (state.kind === "verified") {
+    const failures = state.report.failures.length;
+    if (failures === 0) {
+      return (
+        <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] flex items-center justify-between gap-2 bg-[var(--color-status-success)]/10 text-[var(--color-status-success)]">
+          <span>✓ {state.report.totalFiles} files OK</span>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px]"
+          >
+            dismiss
+          </button>
+        </div>
+      );
+    }
+    const missing = state.report.failures.filter((f) => f.kind === "missing").length;
+    const corrupt = failures - missing;
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-2 rounded text-[10px] bg-[var(--color-status-warning)]/10 text-[var(--color-status-warning)] space-y-1.5">
+        <div>
+          ⚠ {failures} file{failures === 1 ? "" : "s"} need repair
+          {missing > 0 && corrupt > 0 && (
+            <span className="text-[var(--color-text-dim)]">
+              {" "}
+              ({missing} missing, {corrupt} corrupt)
+            </span>
+          )}
+          {missing > 0 && corrupt === 0 && (
+            <span className="text-[var(--color-text-dim)]"> ({missing} missing)</span>
+          )}
+          {corrupt > 0 && missing === 0 && (
+            <span className="text-[var(--color-text-dim)]"> ({corrupt} corrupt)</span>
+          )}
+        </div>
+        <div className="flex gap-1.5">
+          <button
+            type="button"
+            onClick={onRepair}
+            className="inline-flex items-center px-2 py-0.5 rounded text-[10px] tracking-wide uppercase bg-[var(--color-accent)]/20 text-[var(--color-accent-soft)] hover:bg-[var(--color-accent)]/30 transition-colors"
+          >
+            Repair
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px] px-1"
+          >
+            dismiss
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state.kind === "repaired") {
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] flex items-center justify-between gap-2 bg-[var(--color-status-success)]/10 text-[var(--color-status-success)]">
+        <span>
+          ✓ Repaired {state.report.filesRepaired} file
+          {state.report.filesRepaired === 1 ? "" : "s"}
+        </span>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px]"
+        >
+          dismiss
+        </button>
+      </div>
+    );
+  }
+
+  // error
+  return (
+    <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] bg-[var(--color-status-danger)]/10 text-[var(--color-status-danger)] space-y-1">
+      <div className="break-words">{state.message}</div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px]"
+      >
+        dismiss
+      </button>
+    </div>
   );
 }
 

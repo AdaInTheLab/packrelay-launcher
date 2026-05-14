@@ -175,7 +175,12 @@ fn manifest_total_bytes(m: &Manifest) -> u64 {
     m.files.iter().map(|f| f.size).sum()
 }
 
-async fn download_and_verify<F>(
+// pub(crate) so the verify::repair() helper can refetch a single
+// file using the exact same streaming-hash-verified write path the
+// initial install loop uses. Keeping it crate-private — external
+// callers should drive installs/repairs through the high-level
+// `install()` / `repair()` entry points.
+pub(crate) async fn download_and_verify<F>(
     http: &reqwest::Client,
     url: &str,
     file: &FileEntry,
