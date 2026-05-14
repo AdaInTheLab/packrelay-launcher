@@ -45,7 +45,16 @@ pub struct UninstallFailure {
 /// the sidecar manifest in the first place (we don't know what to
 /// delete). Per-file failures land in `report.files_failed` so the
 /// caller can surface them without aborting mid-sweep.
-pub async fn uninstall(dest: &Path) -> Result<UninstallReport> {
+///
+/// When `profile_mods` is set, the same delete sweep runs against
+/// the active profile's mods/ tree so that switching away later
+/// doesn't restore the uninstalled pack. Profile deletes are
+/// best-effort — the user-visible report tracks the dest sweep,
+/// since that's what affects whether 7DTD will see the pack.
+pub async fn uninstall(
+    dest: &Path,
+    profile_mods: Option<&Path>,
+) -> Result<UninstallReport> {
     let sidecar = dest.join("_packrelay-manifest.json");
     let raw = fs::read_to_string(&sidecar)
         .await
@@ -64,6 +73,7 @@ pub async fn uninstall(dest: &Path) -> Result<UninstallReport> {
     // after deleting files. We pop the leaves first, so deepest-
     // path-first ordering gives a single bottom-up pass.
     let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut touched_profile_dirs: HashSet<PathBuf> = HashSet::new();
 
     for file in &manifest.files {
         let normalized = file.path.replace('\\', "/");
@@ -95,6 +105,24 @@ pub async fn uninstall(dest: &Path) -> Result<UninstallReport> {
                 reason: format!("{e}"),
             }),
         }
+
+        // Mirror the delete into the active profile's mods/. Errors
+        // here are silent — the user-visible failure list tracks
+        // dest only.
+        if let Some(profile) = profile_mods {
+            let p_target = profile.join(&normalized);
+            if let Some(parent) = p_target.parent() {
+                let mut cursor = parent.to_path_buf();
+                while cursor.starts_with(profile) && cursor != profile {
+                    touched_profile_dirs.insert(cursor.clone());
+                    match cursor.parent() {
+                        Some(p) => cursor = p.to_path_buf(),
+                        None => break,
+                    }
+                }
+            }
+            let _ = fs::remove_file(&p_target).await;
+        }
     }
 
     // Remove the sidecar last. If file deletes mostly succeeded we
@@ -110,6 +138,10 @@ pub async fn uninstall(dest: &Path) -> Result<UninstallReport> {
             Err(_) => false,
         }
     };
+    if let Some(profile) = profile_mods {
+        let p_sidecar = profile.join("_packrelay-manifest.json");
+        let _ = fs::remove_file(&p_sidecar).await;
+    }
 
     // Prune empty directories the pack created. Sort deepest-first
     // so we never try to delete a parent before its children.
@@ -120,6 +152,12 @@ pub async fn uninstall(dest: &Path) -> Result<UninstallReport> {
         // exactly the behavior we want. Anything else (NotFound,
         // NotEmpty, permission) is silently ignored: we never
         // delete a non-empty directory another pack might own.
+        let _ = fs::remove_dir(&dir).await;
+    }
+    // Same pruning in the profile mirror.
+    let mut p_dirs: Vec<PathBuf> = touched_profile_dirs.into_iter().collect();
+    p_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    for dir in p_dirs {
         let _ = fs::remove_dir(&dir).await;
     }
 

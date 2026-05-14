@@ -23,7 +23,7 @@ use crate::auth::{
     clear_stored_token, load_stored_token, save_token, validate_token, AuthState,
 };
 use packrelay_core::client::Client;
-use packrelay_core::install::{install, InstallReport, ProgressEvent};
+use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::profile::{
     self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout,
 };
@@ -45,6 +45,25 @@ fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
         .app_data_dir()
         .map_err(|e| format!("resolving app data dir: {e}"))?;
     Ok(StoreLayout::new(&dir))
+}
+
+/// Build the install context (cache root + active-profile mirror)
+/// that install / update / repair use to populate the blob cache
+/// and keep the profile's mods/ tree in sync. Always sets
+/// cache_root — the cache survives any user state; only
+/// profile_mods is conditional on the profile system being
+/// initialized.
+async fn build_install_context(app: &AppHandle) -> Result<InstallContext, String> {
+    let layout = store_layout(app)?;
+    let profile_mods = match profile::active_profile(&layout).await {
+        Ok(Some(m)) => Some(layout.profile_dir(&m.id).join("mods")),
+        Ok(None) => None,
+        Err(_) => None, // profile system uninitialized → no mirror
+    };
+    Ok(InstallContext {
+        cache_root: Some(layout.cache_dir()),
+        profile_mods,
+    })
 }
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
@@ -265,7 +284,8 @@ async fn install_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let report = install(&client, &slug, &dest_path, 8, move |ev: ProgressEvent| {
+    let ctx = build_install_context(&app).await?;
+    let report = install(&client, &slug, &dest_path, 8, ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
                 total_bytes,
@@ -311,6 +331,12 @@ async fn install_pack(
     .await
     .map_err(|e| format!("{e:#}"))?;
 
+    // Best-effort: tell the active profile what pack lives here now.
+    // Failures are non-fatal — the install itself succeeded.
+    if let Ok(layout) = store_layout(&app) {
+        let _ = profile::bind_pack_to_active(&layout, &slug, &report.version).await;
+    }
+
     Ok(report)
 }
 
@@ -340,7 +366,8 @@ async fn update_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let report = update(&client, &slug, &dest_path, 8, move |ev: ProgressEvent| {
+    let ctx = build_install_context(&app).await?;
+    let report = update(&client, &slug, &dest_path, 8, ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
                 total_bytes,
@@ -384,6 +411,11 @@ async fn update_pack(
     .await
     .map_err(|e| format!("{e:#}"))?;
 
+    // Update the profile's bound version to the new one.
+    if let Ok(layout) = store_layout(&app) {
+        let _ = profile::bind_pack_to_active(&layout, &slug, &report.to_version).await;
+    }
+
     Ok(report)
 }
 
@@ -403,9 +435,10 @@ async fn verify_pack(dest: String) -> Result<VerifyReport, String> {
 /// (see install::download_and_verify), so a half-applied repair
 /// can't leave the dest worse than it started.
 #[tauri::command]
-async fn repair_pack(dest: String) -> Result<RepairReport, String> {
+async fn repair_pack(app: AppHandle, dest: String) -> Result<RepairReport, String> {
     let client = Client::new(DEFAULT_API_URL);
-    repair(&client, &PathBuf::from(dest))
+    let ctx = build_install_context(&app).await?;
+    repair(&client, &PathBuf::from(dest), ctx)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -416,10 +449,24 @@ async fn repair_pack(dest: String) -> Result<RepairReport, String> {
 /// per-file failures (locked, read-only, etc.) so the frontend can
 /// surface them without re-querying the filesystem.
 #[tauri::command]
-async fn uninstall_pack(dest: String) -> Result<UninstallReport, String> {
-    uninstall(&PathBuf::from(dest))
+async fn uninstall_pack(app: AppHandle, dest: String) -> Result<UninstallReport, String> {
+    // Resolve the active profile's mods dir (if any) so the
+    // uninstall also clears the profile's mirror — otherwise
+    // switching back to this profile later would re-install the
+    // pack we just removed.
+    let layout = store_layout(&app)?;
+    let profile_mods = match profile::active_profile(&layout).await {
+        Ok(Some(m)) => Some(layout.profile_dir(&m.id).join("mods")),
+        _ => None,
+    };
+    let report = uninstall(&PathBuf::from(dest), profile_mods.as_deref())
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    // Clear the profile's bound pack so it doesn't claim a pack
+    // that's no longer there.
+    let _ = profile::clear_active_pack(&layout).await;
+    Ok(report)
 }
 
 /// Resolve current auth state on startup (and any time the frontend

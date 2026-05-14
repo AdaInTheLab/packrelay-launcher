@@ -87,7 +87,11 @@ async fn run_install(
     let bar: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
     let bar_for_cb = bar.clone();
 
-    let report = install(client, slug, dest, concurrency, move |ev: ProgressEvent| {
+    // CLI doesn't manage profiles or a blob cache — pass a default
+    // (empty) context so install behaves exactly as it did before
+    // the Phase 4 changes for headless usage.
+    let ctx = packrelay_core::install::InstallContext::default();
+    let report = install(client, slug, dest, concurrency, ctx, move |ev: ProgressEvent| {
         match ev {
             ProgressEvent::Started {
                 display_name,

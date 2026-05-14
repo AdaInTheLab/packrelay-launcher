@@ -23,7 +23,7 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 
 use crate::client::Client;
-use crate::install::download_and_verify;
+use crate::install::{download_and_verify, InstallContext};
 use crate::manifest::{FileEntry, Manifest};
 
 /// Per-file verification failure mode. Tauri serializes these out to
@@ -141,9 +141,18 @@ pub async fn run(dest: &Path) -> Result<()> {
 /// goes through the same hash-verified streaming write the install
 /// loop uses, so we never end the run holding a corrupt file.
 ///
+/// `ctx` opts into the blob cache and active-profile mirroring on
+/// the same terms as install/update — repair takes any
+/// re-downloaded files and tucks them into the cache, where future
+/// installs of the same blob skip the network.
+///
 /// Returns a `RepairReport` summarizing what changed. If the pack
 /// was already healthy this is a fast no-op.
-pub async fn repair(client: &Client, dest: &Path) -> Result<RepairReport> {
+pub async fn repair(
+    client: &Client,
+    dest: &Path,
+    ctx: InstallContext,
+) -> Result<RepairReport> {
     let manifest = read_sidecar(dest).await?;
 
     // Identify what needs refetching. We rerun verify rather than
@@ -174,7 +183,7 @@ pub async fn repair(client: &Client, dest: &Path) -> Result<RepairReport> {
     let http = client.http().clone();
     for entry in &to_repair {
         let url = client.file_url(&entry.sha256);
-        download_and_verify(&http, &url, entry, dest, &|_| {})
+        download_and_verify(&http, &url, entry, dest, &ctx, &|_| {})
             .await
             .with_context(|| format!("repairing {}", entry.path))?;
     }

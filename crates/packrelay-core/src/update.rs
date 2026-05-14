@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::fs;
 
 use crate::client::Client;
-use crate::install::{download_and_verify, ProgressEvent};
+use crate::install::{download_and_verify, InstallContext, ProgressEvent};
 use crate::manifest::{FileEntry, Manifest};
 
 /// Summary returned by `update()`. Mirrors `InstallReport` but adds
@@ -57,6 +57,7 @@ pub async fn update<F>(
     slug: &str,
     dest: &Path,
     concurrency: usize,
+    ctx: InstallContext,
     on_progress: F,
 ) -> Result<UpdateReport>
 where
@@ -149,10 +150,19 @@ where
 
     // Parallel downloads, same pattern as install::install — we
     // re-use download_and_verify so byte-streaming + sha256 +
-    // sidecar-correct write semantics are identical.
+    // sidecar-correct write semantics are identical. The same
+    // InstallContext flows through too, so update populates the
+    // blob cache + mirrors into the active profile on the same
+    // terms as a fresh install.
+    if let Some(profile) = &ctx.profile_mods {
+        fs::create_dir_all(profile)
+            .await
+            .with_context(|| format!("creating {}", profile.display()))?;
+    }
     let on_progress = Arc::new(on_progress);
     let http = client.http().clone();
     let dest_arc: Arc<PathBuf> = Arc::new(dest.to_path_buf());
+    let ctx_arc = Arc::new(ctx);
 
     let work: Vec<(usize, FileEntry)> = to_download.into_iter().enumerate().collect();
     let results: Vec<Result<()>> = stream::iter(work.into_iter().map(|(idx, file)| {
@@ -160,8 +170,9 @@ where
         let dest = dest_arc.clone();
         let url = client.file_url(&file.sha256);
         let progress = on_progress.clone();
+        let ctx = ctx_arc.clone();
         async move {
-            download_and_verify(&http, &url, &file, dest.as_ref(), &*progress)
+            download_and_verify(&http, &url, &file, dest.as_ref(), &ctx, &*progress)
                 .await
                 .with_context(|| format!("file #{} ({})", idx + 1, file.path))
         }
@@ -206,6 +217,12 @@ where
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => files_removed += 1,
             Err(_) => { /* leave it; sidecar will treat it as out-of-scope */ }
         }
+        // Mirror the delete into the active profile so a future
+        // switch-away doesn't capture an obsolete file. Best-effort.
+        if let Some(profile) = &ctx_arc.profile_mods {
+            let p_target = profile.join(&normalized);
+            let _ = fs::remove_file(&p_target).await;
+        }
     }
     let mut dirs: Vec<PathBuf> = touched_dirs.into_iter().collect();
     dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
@@ -219,6 +236,12 @@ where
     fs::write(&sidecar_path, new_raw.as_bytes())
         .await
         .with_context(|| format!("writing {}", sidecar_path.display()))?;
+    if let Some(profile) = &ctx_arc.profile_mods {
+        let p_sidecar = profile.join("_packrelay-manifest.json");
+        fs::write(&p_sidecar, new_raw.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", p_sidecar.display()))?;
+    }
 
     on_progress(ProgressEvent::Done {
         file_count: files_added + files_changed,

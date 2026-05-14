@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+use crate::blob_cache;
 use crate::client::Client;
 use crate::manifest::{FileEntry, Manifest};
 
@@ -67,9 +68,27 @@ pub struct InstallReport {
     pub dest: String,
 }
 
+/// Optional cache + profile-mirror plumbing for install/update/
+/// repair. When set, files land in the cache (deduplicated by
+/// sha256) and are also linked into the active profile's mods/
+/// directory so a future profile switch can capture the install
+/// without a slow byte-by-byte copy. When unset, behaviour
+/// matches the original install — write to dest, no cache, no
+/// mirror.
+#[derive(Clone, Debug, Default)]
+pub struct InstallContext {
+    pub cache_root: Option<PathBuf>,
+    pub profile_mods: Option<PathBuf>,
+}
+
 /// Install a pack into `dest`. Spawns up to `concurrency` parallel
 /// downloads from the cloud's per-file endpoint, hash-verifies each
 /// against the manifest, and writes a sidecar manifest at the end.
+///
+/// `ctx` opts the install into the content-addressed cache and the
+/// active profile's mods mirror. Both fields are independent —
+/// either can be set without the other. Default-empty `ctx`
+/// reproduces the pre-Phase-4 install loop exactly.
 ///
 /// `on_progress` is invoked from worker threads with each progress
 /// event — keep it cheap and use atomics/channels if you need to
@@ -79,6 +98,7 @@ pub async fn install<F>(
     slug: &str,
     dest: &Path,
     concurrency: usize,
+    ctx: InstallContext,
     on_progress: F,
 ) -> Result<InstallReport>
 where
@@ -89,6 +109,11 @@ where
     fs::create_dir_all(dest)
         .await
         .with_context(|| format!("creating dest {}", dest.display()))?;
+    if let Some(profile) = &ctx.profile_mods {
+        fs::create_dir_all(profile)
+            .await
+            .with_context(|| format!("creating {}", profile.display()))?;
+    }
 
     let total_bytes = manifest_total_bytes(&manifest);
     let file_count = manifest.files.len() as u32;
@@ -104,6 +129,7 @@ where
 
     let http = client.http().clone();
     let dest_arc: Arc<PathBuf> = Arc::new(dest.to_path_buf());
+    let ctx_arc = Arc::new(ctx);
 
     // Pre-collect owned (idx, file) pairs into a Vec so the per-task
     // closures don't borrow from `manifest.files` — that borrow chain
@@ -123,8 +149,9 @@ where
         let dest = dest_arc.clone();
         let url = client.file_url(&file.sha256);
         let progress = on_progress.clone();
+        let ctx = ctx_arc.clone();
         async move {
-            download_and_verify(&http, &url, &file, dest.as_ref(), &*progress)
+            download_and_verify(&http, &url, &file, dest.as_ref(), &ctx, &*progress)
                 .await
                 .with_context(|| format!("file #{} ({})", idx + 1, file.path))
         }
@@ -156,6 +183,14 @@ where
     fs::write(&sidecar, manifest_raw.as_bytes())
         .await
         .with_context(|| format!("writing {}", sidecar.display()))?;
+    // Mirror the sidecar into the active profile too so a future
+    // switch-away captures install metadata, not just file bytes.
+    if let Some(profile) = &ctx_arc.profile_mods {
+        let profile_sidecar = profile.join("_packrelay-manifest.json");
+        fs::write(&profile_sidecar, manifest_raw.as_bytes())
+            .await
+            .with_context(|| format!("writing {}", profile_sidecar.display()))?;
+    }
 
     on_progress(ProgressEvent::Done {
         file_count,
@@ -180,11 +215,24 @@ fn manifest_total_bytes(m: &Manifest) -> u64 {
 // initial install loop uses. Keeping it crate-private — external
 // callers should drive installs/repairs through the high-level
 // `install()` / `repair()` entry points.
+//
+// When `ctx.cache_root` is set, this function will:
+//   - Check the cache first; on hit, link from cache → dest and
+//     skip the network entirely. Emits one Bytes progress event
+//     covering the whole file so the bar moves.
+//   - On miss, download as usual, then promote the verified file
+//     into the cache. Both dest and cache end up as hardlinks to
+//     the same inode on the same volume.
+//
+// When `ctx.profile_mods` is set, the same file is also linked
+// (from cache when possible, else copied from dest) into the
+// active profile's mods/ tree so switch-away captures the install.
 pub(crate) async fn download_and_verify<F>(
     http: &reqwest::Client,
     url: &str,
     file: &FileEntry,
     dest: &Path,
+    ctx: &InstallContext,
     on_progress: &F,
 ) -> Result<()>
 where
@@ -211,7 +259,37 @@ where
             .await
             .with_context(|| format!("creating parent {}", parent.display()))?;
     }
+    let profile_target = ctx
+        .profile_mods
+        .as_ref()
+        .map(|root| root.join(&normalized));
 
+    // Fast path: cache already has this blob. Link it into dest +
+    // profile mirror without touching the network.
+    if let Some(cache) = ctx.cache_root.as_deref() {
+        if blob_cache::has_blob(cache, &file.sha256).await {
+            blob_cache::link_into(cache, &file.sha256, &target)
+                .await
+                .with_context(|| format!("linking cached blob for {}", file.path))?;
+            if let Some(ptarget) = &profile_target {
+                blob_cache::link_into(cache, &file.sha256, ptarget)
+                    .await
+                    .with_context(|| {
+                        format!("mirroring cached blob to profile for {}", file.path)
+                    })?;
+            }
+            // Emit the whole file's worth of bytes in one event so
+            // the progress bar moves; the consumer doesn't need to
+            // know the file came from cache.
+            on_progress(ProgressEvent::Bytes { delta: file.size });
+            on_progress(ProgressEvent::FileDone {
+                path: file.path.clone(),
+            });
+            return Ok(());
+        }
+    }
+
+    // Slow path: download + hash + write in one streaming pass.
     let res = http
         .get(url)
         .send()
@@ -264,6 +342,30 @@ where
             digest,
             file.sha256
         );
+    }
+
+    // Promote the just-written file into the cache (turns dest
+    // into a hardlink to the canonical blob). Then mirror to the
+    // profile's mods/ if set.
+    if let Some(cache) = ctx.cache_root.as_deref() {
+        blob_cache::promote_to_cache(cache, &file.sha256, &target)
+            .await
+            .with_context(|| format!("caching blob for {}", file.path))?;
+        if let Some(ptarget) = &profile_target {
+            blob_cache::link_into(cache, &file.sha256, ptarget)
+                .await
+                .with_context(|| {
+                    format!("mirroring blob to profile for {}", file.path)
+                })?;
+        }
+    } else if let Some(ptarget) = &profile_target {
+        // No cache — fall back to a direct copy into profile.
+        if let Some(parent) = ptarget.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(&target, ptarget)
+            .await
+            .with_context(|| format!("mirroring {} to profile", file.path))?;
     }
 
     on_progress(ProgressEvent::FileDone {
