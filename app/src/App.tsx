@@ -257,6 +257,66 @@ function saveHistory(entries: InstallRecord[]): void {
   }
 }
 
+// Filter state — persisted to localStorage so settings survive
+// view changes AND launcher restarts. Match the website's /browse
+// and /servers params so a future "open this filter in the web"
+// link could share the same shape.
+type PackSort = "popular" | "new";
+type PackFilters = { q: string; tag: string; sort: PackSort };
+type ServerFilters = {
+  region: string;
+  onlineOnly: boolean;
+  notFull: boolean;
+};
+
+const PACK_FILTERS_KEY = "packrelay.packFilters.v1";
+const SERVER_FILTERS_KEY = "packrelay.serverFilters.v1";
+
+const DEFAULT_PACK_FILTERS: PackFilters = { q: "", tag: "", sort: "popular" };
+const DEFAULT_SERVER_FILTERS: ServerFilters = {
+  region: "",
+  onlineOnly: false,
+  notFull: false,
+};
+
+function loadPackFilters(): PackFilters {
+  try {
+    const raw = localStorage.getItem(PACK_FILTERS_KEY);
+    if (!raw) return DEFAULT_PACK_FILTERS;
+    const parsed = JSON.parse(raw);
+    return {
+      q: typeof parsed.q === "string" ? parsed.q : "",
+      tag: typeof parsed.tag === "string" ? parsed.tag : "",
+      sort: parsed.sort === "new" ? "new" : "popular",
+    };
+  } catch {
+    return DEFAULT_PACK_FILTERS;
+  }
+}
+
+function loadServerFilters(): ServerFilters {
+  try {
+    const raw = localStorage.getItem(SERVER_FILTERS_KEY);
+    if (!raw) return DEFAULT_SERVER_FILTERS;
+    const parsed = JSON.parse(raw);
+    return {
+      region: typeof parsed.region === "string" ? parsed.region : "",
+      onlineOnly: !!parsed.onlineOnly,
+      notFull: !!parsed.notFull,
+    };
+  } catch {
+    return DEFAULT_SERVER_FILTERS;
+  }
+}
+
+function saveFilters(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Quota or private-mode — filter state is convenience only.
+  }
+}
+
 function App() {
   const [view, setView] = useState<ViewKey>("dashboard");
 
@@ -283,6 +343,22 @@ function App() {
   // InstallView uses it as the initial destination so users don't
   // type or even pick a folder for the common case.
   const [defaultDest, setDefaultDest] = useState<string>(FALLBACK_DEFAULT_DEST);
+
+  // Filter state hoisted out of the views so it survives both
+  // intra-app navigation (clicking a pack and coming back) and
+  // launcher restarts. Persisted via the effects below.
+  const [packFilters, setPackFilters] = useState<PackFilters>(() =>
+    loadPackFilters()
+  );
+  const [serverFilters, setServerFilters] = useState<ServerFilters>(() =>
+    loadServerFilters()
+  );
+  useEffect(() => {
+    saveFilters(PACK_FILTERS_KEY, packFilters);
+  }, [packFilters]);
+  useEffect(() => {
+    saveFilters(SERVER_FILTERS_KEY, serverFilters);
+  }, [serverFilters]);
 
   // Auth state — resolved on startup from the persisted token (if
   // any). When signedIn the Header chip shows the user's name; the
@@ -544,6 +620,8 @@ function App() {
         packs={packs}
         error={packsError}
         onSelect={openPackDetail}
+        filters={packFilters}
+        onFiltersChange={setPackFilters}
       />
     );
   } else if (view === "servers") {
@@ -552,6 +630,8 @@ function App() {
         servers={servers}
         error={serversError}
         onSelect={setSelectedServer}
+        filters={serverFilters}
+        onFiltersChange={setServerFilters}
       />
     );
   } else if (view === "library") {
@@ -1494,10 +1574,14 @@ function BrowseView({
   packs,
   error,
   onSelect,
+  filters,
+  onFiltersChange,
 }: {
   packs: CatalogPack[] | null;
   error: string | null;
   onSelect: (p: CatalogPack) => void;
+  filters: PackFilters;
+  onFiltersChange: (next: PackFilters) => void;
 }) {
   if (error) {
     return (
@@ -1525,59 +1609,224 @@ function BrowseView({
     );
   }
 
+  // Distinct tag list across the catalog. Cheap to compute in
+  // every render since the catalog list is bounded at 100 by the
+  // server — saves us a separate /tags endpoint.
+  const allTags = Array.from(
+    new Set(packs.flatMap((p) => p.tags))
+  ).sort((a, b) => a.localeCompare(b));
+
+  const qNorm = filters.q.trim().toLowerCase();
+  const filtered = packs
+    .filter((p) => {
+      if (qNorm && !p.name.toLowerCase().includes(qNorm)) return false;
+      if (filters.tag && !p.tags.includes(filters.tag)) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (filters.sort === "new") {
+        return (
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+      }
+      // "popular" — by downloadCount descending. Stable enough as a
+      // default since the cloud already serves popular-sorted; this
+      // re-sort just preserves order after client-side filtering.
+      return b.downloadCount - a.downloadCount;
+    });
+
+  const hasFilters =
+    !!filters.q.trim() || !!filters.tag || filters.sort !== "popular";
+  const clearFilters = () => onFiltersChange(DEFAULT_PACK_FILTERS);
+
   return (
     <div className="px-6 py-8">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight">Browse packs</h1>
-        <p className="text-xs text-[var(--color-text-dim)] mt-1">
-          Click a pack to install it into your 7DTD Mods/ directory.
-        </p>
+      <div className="mb-5 flex items-end justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Browse packs</h1>
+          <p className="text-xs text-[var(--color-text-dim)] mt-1">
+            Click a pack to install it into your 7DTD Mods/ directory.
+          </p>
+        </div>
+        <div className="text-[11px] text-[var(--color-text-dim)] tabular-nums">
+          {hasFilters
+            ? `${filtered.length} of ${packs.length} packs`
+            : `${packs.length} packs`}
+        </div>
       </div>
-      <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        {packs.map((p) => (
-          <li key={p.slug}>
+
+      <div className="mb-5 space-y-3">
+        {/* Search + sort row */}
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="search"
+            value={filters.q}
+            onChange={(e) =>
+              onFiltersChange({ ...filters, q: e.currentTarget.value })
+            }
+            placeholder="Search packs by name…"
+            className="flex-1 min-w-[180px] max-w-md rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-1.5 text-sm text-[var(--color-text-bright)] placeholder:text-[var(--color-text-dim)]/60 outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors"
+          />
+          <span className="text-[11px] text-[var(--color-text-dim)] ml-2">
+            Sort
+          </span>
+          <SortChip
+            active={filters.sort === "popular"}
+            onClick={() => onFiltersChange({ ...filters, sort: "popular" })}
+          >
+            Popular
+          </SortChip>
+          <SortChip
+            active={filters.sort === "new"}
+            onClick={() => onFiltersChange({ ...filters, sort: "new" })}
+          >
+            Newest
+          </SortChip>
+          {hasFilters && (
             <button
               type="button"
-              onClick={() => onSelect(p)}
-              className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
+              onClick={clearFilters}
+              className="ml-auto text-[10px] tracking-[0.14em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] transition-colors"
             >
-              <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
-                <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
-                  no cover
-                </div>
-                <CoverImage
-                  src={p.coverImage}
-                  className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
-              </div>
-              <div className="p-4">
-                <div className="flex items-baseline gap-2 mb-1">
-                  <span className="font-medium text-[var(--color-text-bright)] truncate">
-                    {p.name}
-                  </span>
-                  {p.latestVersion && (
-                    <span className="font-mono text-[10px] text-[var(--color-text-dim)]">
-                      v{p.latestVersion}
-                    </span>
-                  )}
-                </div>
-                <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
-                  by {p.publisherName}
-                </div>
-                <p className="text-xs text-[var(--color-text-dim)] leading-relaxed line-clamp-2">
-                  {p.summary ?? ""}
-                </p>
-                <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
-                  <span>{p.fileCount.toLocaleString()} files</span>
-                  <span>{formatBytes(p.totalSizeBytes)}</span>
-                </div>
-              </div>
+              Clear filters
             </button>
-          </li>
-        ))}
-      </ul>
+          )}
+        </div>
+
+        {/* Tag chips — only render when the catalog actually has
+            tags so we don't show an empty row. "All" pill clears
+            the tag filter without changing q or sort. */}
+        {allTags.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] text-[var(--color-text-dim)] mr-1">
+              Tag
+            </span>
+            <SortChip
+              active={!filters.tag}
+              onClick={() => onFiltersChange({ ...filters, tag: "" })}
+            >
+              All
+            </SortChip>
+            {allTags.map((t) => (
+              <SortChip
+                key={t}
+                active={filters.tag === t}
+                onClick={() =>
+                  onFiltersChange({
+                    ...filters,
+                    tag: filters.tag === t ? "" : t,
+                  })
+                }
+              >
+                {t}
+              </SortChip>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 px-6 py-10 text-center">
+          <div className="text-sm text-[var(--color-text-bright)] font-medium mb-1">
+            No packs match these filters
+          </div>
+          <p className="text-xs text-[var(--color-text-dim)] mb-4">
+            Try a different tag, drop the search, or clear all filters.
+          </p>
+          <button
+            type="button"
+            onClick={clearFilters}
+            className="inline-flex items-center px-3.5 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs"
+          >
+            Clear filters
+          </button>
+        </div>
+      ) : (
+        <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filtered.map((p) => (
+            <li key={p.slug}>
+              <button
+                type="button"
+                onClick={() => onSelect(p)}
+                className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
+              >
+                <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
+                  <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+                    no cover
+                  </div>
+                  <CoverImage
+                    src={p.coverImage}
+                    className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
+                </div>
+                <div className="p-4">
+                  <div className="flex items-baseline gap-2 mb-1">
+                    <span className="font-medium text-[var(--color-text-bright)] truncate">
+                      {p.name}
+                    </span>
+                    {p.latestVersion && (
+                      <span className="font-mono text-[10px] text-[var(--color-text-dim)]">
+                        v{p.latestVersion}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
+                    by {p.publisherName}
+                  </div>
+                  <p className="text-xs text-[var(--color-text-dim)] leading-relaxed line-clamp-2">
+                    {p.summary ?? ""}
+                  </p>
+                  {p.tags.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {p.tags.slice(0, 3).map((t) => (
+                        <span
+                          key={t}
+                          className="text-[9px] tracking-wide uppercase px-1.5 py-0.5 rounded bg-[var(--color-bg-raised)]/60 text-[var(--color-text-bright)]/75"
+                        >
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
+                    <span>{p.fileCount.toLocaleString()} files</span>
+                    <span>{formatBytes(p.totalSizeBytes)}</span>
+                  </div>
+                </div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
+  );
+}
+
+// Pill-shaped sort/tag chip — matches the website's chipClass.
+// Reused for both sort buttons and tag chips since they share the
+// "two-state pill" pattern.
+function SortChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center px-3 py-1 rounded-full border text-[11px] tracking-wide uppercase transition-colors ${
+        active
+          ? "border-[var(--color-accent-soft)]/50 bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)]"
+          : "border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 text-[var(--color-text-dim)] hover:border-[var(--color-accent-soft)]/30 hover:text-[var(--color-text-bright)]"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -2094,10 +2343,14 @@ function ServerBrowseView({
   servers,
   error,
   onSelect,
+  filters,
+  onFiltersChange,
 }: {
   servers: CatalogServer[] | null;
   error: string | null;
   onSelect: (s: CatalogServer) => void;
+  filters: ServerFilters;
+  onFiltersChange: (next: ServerFilters) => void;
 }) {
   if (error) {
     return (
@@ -2123,7 +2376,14 @@ function ServerBrowseView({
     );
   }
 
-  return <ServerBrowseLoaded servers={servers} onSelect={onSelect} />;
+  return (
+    <ServerBrowseLoaded
+      servers={servers}
+      onSelect={onSelect}
+      filters={filters}
+      onFiltersChange={onFiltersChange}
+    />
+  );
 }
 
 // All the regions the catalog supports; "" means "any region" in
@@ -2143,16 +2403,20 @@ const FILTER_REGIONS: { value: string; label: string }[] = [
 function ServerBrowseLoaded({
   servers,
   onSelect,
+  filters,
+  onFiltersChange,
 }: {
   servers: CatalogServer[];
   onSelect: (s: CatalogServer) => void;
+  filters: ServerFilters;
+  onFiltersChange: (next: ServerFilters) => void;
 }) {
-  // Filter state is local to this component — it resets if the
-  // user leaves the Servers tab and comes back, which is fine for
-  // v1. Hoist to App if cross-navigation persistence becomes a need.
-  const [region, setRegion] = useState<string>("");
-  const [onlineOnly, setOnlineOnly] = useState(false);
-  const [notFull, setNotFull] = useState(false);
+  const { region, onlineOnly, notFull } = filters;
+  const setRegion = (v: string) => onFiltersChange({ ...filters, region: v });
+  const setOnlineOnly = (v: boolean) =>
+    onFiltersChange({ ...filters, onlineOnly: v });
+  const setNotFull = (v: boolean) =>
+    onFiltersChange({ ...filters, notFull: v });
 
   const filtered = servers.filter((s) => {
     if (region && s.region !== region) return false;
@@ -2161,11 +2425,7 @@ function ServerBrowseLoaded({
     return true;
   });
   const hasFilters = !!region || onlineOnly || notFull;
-  const clearFilters = () => {
-    setRegion("");
-    setOnlineOnly(false);
-    setNotFull(false);
-  };
+  const clearFilters = () => onFiltersChange(DEFAULT_SERVER_FILTERS);
 
   return (
     <div className="px-6 py-8">
@@ -2202,14 +2462,14 @@ function ServerBrowseLoaded({
         <span className="mx-1 text-[var(--color-bg-raised)]">·</span>
         <FilterChip
           active={onlineOnly}
-          onClick={() => setOnlineOnly((v) => !v)}
+          onClick={() => setOnlineOnly(!onlineOnly)}
           dotColor="success"
         >
           Online only
         </FilterChip>
         <FilterChip
           active={notFull}
-          onClick={() => setNotFull((v) => !v)}
+          onClick={() => setNotFull(!notFull)}
           dotColor="accent"
         >
           Not full
