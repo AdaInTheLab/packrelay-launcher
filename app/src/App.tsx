@@ -300,7 +300,7 @@ function saveHistory(entries: InstallRecord[]): void {
 // view changes AND launcher restarts. Match the website's /browse
 // and /servers params so a future "open this filter in the web"
 // link could share the same shape.
-type PackSort = "popular" | "new";
+type PackSort = "popular" | "new" | "favorites";
 type PackFilters = { q: string; tag: string; sort: PackSort };
 type ServerFilters = {
   region: string;
@@ -326,7 +326,12 @@ function loadPackFilters(): PackFilters {
     return {
       q: typeof parsed.q === "string" ? parsed.q : "",
       tag: typeof parsed.tag === "string" ? parsed.tag : "",
-      sort: parsed.sort === "new" ? "new" : "popular",
+      sort:
+        parsed.sort === "new"
+          ? "new"
+          : parsed.sort === "favorites"
+            ? "favorites"
+            : "popular",
     };
   } catch {
     return DEFAULT_PACK_FILTERS;
@@ -1868,6 +1873,9 @@ function BrowseView({
           new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
         );
       }
+      if (filters.sort === "favorites") {
+        return b.favoriteCount - a.favoriteCount;
+      }
       // "popular" — by downloadCount descending. Stable enough as a
       // default since the cloud already serves popular-sorted; this
       // re-sort just preserves order after client-side filtering.
@@ -1920,6 +1928,12 @@ function BrowseView({
             onClick={() => onFiltersChange({ ...filters, sort: "new" })}
           >
             Newest
+          </SortChip>
+          <SortChip
+            active={filters.sort === "favorites"}
+            onClick={() => onFiltersChange({ ...filters, sort: "favorites" })}
+          >
+            Favorites
           </SortChip>
           {hasFilters && (
             <button
