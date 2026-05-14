@@ -9,7 +9,7 @@
 // Browse/install logic itself lives in packrelay-core — both the
 // CLI and this GUI just decorate the same primitives differently.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -61,6 +61,65 @@ struct InstallProgressPayload {
     /// Optional — set when the event was triggered by a file
     /// completing rather than just a byte chunk.
     last_completed_file: Option<String>,
+}
+
+/// Best-guess location for the user's 7DTD Mods/ folder. Returns
+/// the OS-canonical user-data path joined with "7DaysToDie/Mods",
+/// which is where the game itself reads per-user mods from. The
+/// directory doesn't need to exist yet — we create it on install.
+///
+/// Returns None on unsupported platforms or if the relevant env var
+/// is missing, in which case the frontend falls back to a hardcoded
+/// guess.
+#[tauri::command]
+fn default_install_dest() -> Option<String> {
+    let path = canonical_mods_path()?;
+    Some(path.display().to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn canonical_mods_path() -> Option<PathBuf> {
+    // %APPDATA% is where 7DTD reads per-user mods from on Windows.
+    // Concretely: C:\Users\<name>\AppData\Roaming\7DaysToDie\Mods
+    std::env::var_os("APPDATA")
+        .map(|appdata| Path::new(&appdata).join("7DaysToDie").join("Mods"))
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_mods_path() -> Option<PathBuf> {
+    // ~/Library/Application Support/7DaysToDie/Mods — same shape as
+    // the game's own save directory.
+    std::env::var_os("HOME").map(|home| {
+        Path::new(&home)
+            .join("Library")
+            .join("Application Support")
+            .join("7DaysToDie")
+            .join("Mods")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_mods_path() -> Option<PathBuf> {
+    // XDG_DATA_HOME wins if set; otherwise default to
+    // ~/.local/share/7DaysToDie/Mods per the XDG Base Directory spec.
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        Some(Path::new(&xdg).join("7DaysToDie").join("Mods"))
+    } else if let Some(home) = std::env::var_os("HOME") {
+        Some(
+            Path::new(&home)
+                .join(".local")
+                .join("share")
+                .join("7DaysToDie")
+                .join("Mods"),
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn canonical_mods_path() -> Option<PathBuf> {
+    None
 }
 
 #[tauri::command]
@@ -164,7 +223,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_packs, install_pack])
+        .invoke_handler(tauri::generate_handler![
+            list_packs,
+            install_pack,
+            default_install_dest
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

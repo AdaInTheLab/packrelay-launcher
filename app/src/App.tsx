@@ -60,11 +60,15 @@ type InstallRecord = {
 const HISTORY_STORAGE_KEY = "packrelay.installHistory.v1";
 const HISTORY_MAX_ENTRIES = 50;
 
-const PACKRELAY_DEFAULT_DEST = navigator.platform
+/** Browser-side fallback used if the Tauri command fails (e.g. in a
+ *  Vite-only preview without the backend). The real path comes from
+ *  the backend's default_install_dest() which knows the OS-canonical
+ *  7DTD Mods folder location. */
+const FALLBACK_DEFAULT_DEST = navigator.platform
   .toLowerCase()
   .includes("win")
-  ? "C:\\7DaysToDie\\Mods"
-  : "/opt/7DaysToDie/Mods";
+  ? "C:\\Users\\You\\AppData\\Roaming\\7DaysToDie\\Mods"
+  : "~/7DaysToDie/Mods";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -80,6 +84,29 @@ function formatRelativeTime(iso: string): string {
   if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}m ago`;
   if (deltaSec < 86400) return `${Math.floor(deltaSec / 3600)}h ago`;
   return `${Math.floor(deltaSec / 86400)}d ago`;
+}
+
+/** Quick-and-dirty semver compare. Splits on `.` and `-`, parses
+ *  ints, lexicographic on the resulting int vectors. Doesn't fully
+ *  honor SemVer 2.0's prerelease rules (alpha < beta < rc < release
+ *  by string compare in practice, but PackRelay's manifest only
+ *  uses pure numeric versions today, so it's fine). */
+function semverIsNewer(candidate: string, baseline: string): boolean {
+  const parse = (s: string): number[] =>
+    s.split(/[.-]/).map((p) => {
+      const n = Number.parseInt(p, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+  const a = parse(candidate);
+  const b = parse(baseline);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? 0;
+    const bi = b[i] ?? 0;
+    if (ai > bi) return true;
+    if (ai < bi) return false;
+  }
+  return false;
 }
 
 function loadHistory(): InstallRecord[] {
@@ -108,6 +135,10 @@ function App() {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [selected, setSelected] = useState<CatalogPack | null>(null);
   const [history, setHistory] = useState<InstallRecord[]>(() => loadHistory());
+  // OS-canonical 7DTD Mods/ path, fetched once on mount. The
+  // InstallView uses it as the initial destination so users don't
+  // type or even pick a folder for the common case.
+  const [defaultDest, setDefaultDest] = useState<string>(FALLBACK_DEFAULT_DEST);
 
   useEffect(() => {
     (async () => {
@@ -116,6 +147,15 @@ function App() {
         setPacks(list);
       } catch (e) {
         setCatalogError(typeof e === "string" ? e : `${e}`);
+      }
+    })();
+    (async () => {
+      try {
+        const detected = await invoke<string | null>("default_install_dest");
+        if (detected) setDefaultDest(detected);
+      } catch {
+        // Leave the fallback in place — used in Vite-only preview
+        // mode and on platforms without a canonical path.
       }
     })();
   }, []);
@@ -155,12 +195,24 @@ function App() {
     [packs]
   );
 
+  // Pre-compute the slug → latest catalog version map once per
+  // render; the sidebar uses it to flag "update available" entries
+  // without doing a linear scan per row.
+  const latestVersionBySlug = new Map<string, string>(
+    (packs ?? [])
+      .filter((p): p is CatalogPack & { latestVersion: string } =>
+        Boolean(p.latestVersion)
+      )
+      .map((p) => [p.slug, p.latestVersion])
+  );
+
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
       <div className="flex-1 flex min-h-0">
         <HistorySidebar
           history={history}
+          latestVersionBySlug={latestVersionBySlug}
           onPick={reinstallFromHistory}
           catalogReady={packs !== null}
         />
@@ -168,6 +220,7 @@ function App() {
           {selected ? (
             <InstallView
               pack={selected}
+              defaultDest={defaultDest}
               onBack={() => setSelected(null)}
               onInstalled={(report) => recordInstall(selected, report)}
             />
@@ -203,10 +256,12 @@ function Header() {
 
 function HistorySidebar({
   history,
+  latestVersionBySlug,
   onPick,
   catalogReady,
 }: {
   history: InstallRecord[];
+  latestVersionBySlug: Map<string, string>;
   onPick: (r: InstallRecord) => void;
   catalogReady: boolean;
 }) {
@@ -224,26 +279,49 @@ function HistorySidebar({
         </div>
       ) : (
         <ul className="px-2 py-2">
-          {history.map((r) => (
-            <li key={`${r.slug}-${r.installedAt}`}>
-              <button
-                type="button"
-                onClick={() => onPick(r)}
-                disabled={!catalogReady}
-                className="w-full text-left rounded-md px-3 py-2 mb-0.5 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                <div className="text-xs font-medium text-[var(--color-text-bright)] truncate">
-                  {r.name}
-                </div>
-                <div className="text-[10px] text-[var(--color-text-dim)] mt-0.5 flex items-center justify-between gap-2">
-                  <span className="font-mono truncate">v{r.version}</span>
-                  <span className="shrink-0">
-                    {formatRelativeTime(r.installedAt)}
-                  </span>
-                </div>
-              </button>
-            </li>
-          ))}
+          {history.map((r) => {
+            const latest = latestVersionBySlug.get(r.slug);
+            const updateAvailable =
+              latest !== undefined && semverIsNewer(latest, r.version);
+            return (
+              <li key={`${r.slug}-${r.installedAt}`}>
+                <button
+                  type="button"
+                  onClick={() => onPick(r)}
+                  disabled={!catalogReady}
+                  className="w-full text-left rounded-md px-3 py-2 mb-0.5 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="text-xs font-medium text-[var(--color-text-bright)] truncate flex-1 min-w-0">
+                      {r.name}
+                    </span>
+                    {updateAvailable && (
+                      <span
+                        title={`Update available: v${latest}`}
+                        className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
+                      >
+                        ↻ Update
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
+                    <span className="font-mono truncate">
+                      v{r.version}
+                      {updateAvailable && (
+                        <span className="text-[var(--color-accent-soft)]">
+                          {" "}
+                          → v{latest}
+                        </span>
+                      )}
+                    </span>
+                    <span className="shrink-0">
+                      {formatRelativeTime(r.installedAt)}
+                    </span>
+                  </div>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </aside>
@@ -347,14 +425,16 @@ function BrowseView({
 
 function InstallView({
   pack,
+  defaultDest,
   onBack,
   onInstalled,
 }: {
   pack: CatalogPack;
+  defaultDest: string;
   onBack: () => void;
   onInstalled: (report: InstallReport) => void;
 }) {
-  const [dest, setDest] = useState(PACKRELAY_DEFAULT_DEST);
+  const [dest, setDest] = useState(defaultDest);
   const [state, setState] = useState<InstallState>({ kind: "idle" });
 
   useEffect(() => {
