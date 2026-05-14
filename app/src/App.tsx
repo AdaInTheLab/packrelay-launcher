@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import "./App.css";
+import { UpdateToast } from "./UpdateToast";
+import { useAutoUpdate } from "./useAutoUpdate";
 
 // Mirrors the Rust CatalogPack struct in src-tauri/src/lib.rs.
 // Tauri's invoke serializes camelCase by default since the Rust
@@ -920,8 +922,22 @@ function App() {
           }}
         />
       )}
+      {/* Background-checks for a new launcher release on mount;
+        * renders nothing when nothing's available. See useAutoUpdate. */}
+      <AutoUpdateDock />
     </div>
   );
+}
+
+/**
+ * Wraps the update hook + toast so the App-level component
+ * tree stays tidy. Pulled out so the hook can be lifted later
+ * (e.g. when we want to expose a manual "Check for updates"
+ * button in Settings) without re-plumbing call sites.
+ */
+function AutoUpdateDock() {
+  const updater = useAutoUpdate();
+  return <UpdateToast {...updater} />;
 }
 
 // Full-height left-rail nav. Replaces the previous top-tab header;

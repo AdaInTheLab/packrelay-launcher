@@ -100,6 +100,19 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing secrets — see docs/UPDATER.md for the
+          # one-time keypair-generation walkthrough. When these are
+          # set, tauri-action:
+          #   - signs each platform bundle with the private key
+          #   - generates a `latest.json` describing the release
+          #   - uploads it alongside the binaries
+          # The launcher's tauri.conf.json `endpoints` points at
+          # the latest release's `latest.json` URL, and the bundled
+          # `pubkey` verifies signatures at install time.
+          # When unset, tauri-action skips signing — releases still
+          # publish but in-app auto-update is a no-op.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           # The Tauri app lives in app/, not at the repo root, so
           # the action needs the project path to find tauri.conf.json.

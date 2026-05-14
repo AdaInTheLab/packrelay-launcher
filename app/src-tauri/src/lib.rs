@@ -1151,6 +1151,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Updater plugin — checks `endpoints` from tauri.conf.json
+        // on demand (we drive the check from JS at launch). Signature
+        // verification happens locally against the `pubkey` baked into
+        // tauri.conf.json, so a compromised endpoint can't push a
+        // malicious binary as long as the private key stays safe in
+        // CI secrets.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             list_packs,
             list_servers,

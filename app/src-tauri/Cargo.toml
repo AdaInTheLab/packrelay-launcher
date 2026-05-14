@@ -26,4 +26,14 @@ serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# Update channel — the plugin handles signature verification, download
+# progress, and the platform-specific install hand-off (NSIS update on
+# Windows, replace-in-place on macOS .app, AppImage swap on Linux).
+# Pairs with `endpoints` + `pubkey` in tauri.conf.json. The signing
+# private key is held in CI secrets (see docs/UPDATER.md).
+tauri-plugin-updater = "2"
+# Process plugin — exposes `relaunch()` to the frontend so we can
+# restart cleanly after the updater has swapped in the new binary.
+# Tauri's updater doesn't auto-restart on its own.
+tauri-plugin-process = "2"
 tokio.workspace = true
