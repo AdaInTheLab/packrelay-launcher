@@ -60,6 +60,7 @@ type ViewKey =
   | "packs"
   | "servers"
   | "library"
+  | "profiles"
   | "settings";
 
 const REGION_LABEL: Record<string, string> = {
@@ -155,6 +156,42 @@ type RowVerifyState =
   | { kind: "repairing" }
   | { kind: "repaired"; report: RepairReport }
   | { kind: "error"; message: string };
+
+// Mirrors packrelay-core::profile types verbatim. camelCase via
+// #[serde(rename_all = "camelCase")] on the Rust side.
+//
+// Note: ProfileMeta (the create/rename return shape) is dropped on
+// the frontend — every consumer refreshes the full list afterwards
+// so a single-row type adds nothing.
+type ProfileSummary = {
+  id: string;
+  name: string;
+  packSlug: string | null;
+  packVersion: string | null;
+  createdAt: string;
+  lastPlayedAt: string | null;
+  isActive: boolean;
+  modsBytes: number;
+  savesBytes: number;
+  worldsBytes: number;
+  snapshotCount: number;
+};
+
+type ProfileSnapshot = {
+  id: string;
+  createdAt: string;
+  label: string | null;
+  savesBytes: number;
+  worldsBytes: number;
+};
+
+type ProfileInitialState =
+  | { kind: "uninitialized"; suggestedUserdataDir: string | null }
+  | {
+      kind: "initialized";
+      activeProfileId: string | null;
+      userdataDir: string | null;
+    };
 
 type UninstallFailure = { path: string; reason: string };
 type UninstallReport = {
@@ -646,6 +683,8 @@ function App() {
         onBrowse={() => setView("packs")}
       />
     );
+  } else if (view === "profiles") {
+    mainContent = <ProfilesView />;
   } else if (view === "settings") {
     mainContent = <SettingsView auth={auth} onSignOut={handleSignOut} />;
   } else {
@@ -751,6 +790,13 @@ function LeftRail({
           glyph={<LibraryGlyph />}
         >
           My Library
+        </RailItem>
+        <RailItem
+          active={view === "profiles"}
+          onClick={() => onViewChange("profiles")}
+          glyph={<ProfileGlyph />}
+        >
+          Profiles
         </RailItem>
         <RailItem
           active={view === "settings"}
@@ -3170,6 +3216,635 @@ function SettingsView({
   );
 }
 
+// Profile management surface. Two life-cycle states:
+//
+//   uninitialized — no profiles exist yet. Render onboarding card
+//     that imports the user's current 7DTD setup as the first
+//     profile.
+//   initialized — show the profile list, with create / switch /
+//     rename / delete affordances + snapshot history per row.
+//
+// All ops route through the Tauri commands; the view holds local
+// optimistic state for the list so switches feel instant even
+// when the underlying copy is slow.
+function ProfilesView() {
+  const [initial, setInitial] = useState<ProfileInitialState | null>(null);
+  const [profiles, setProfiles] = useState<ProfileSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [snapshotsForId, setSnapshotsForId] = useState<string | null>(null);
+  const [snapshots, setSnapshots] = useState<ProfileSnapshot[] | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [state, list] = await Promise.all([
+        invoke<ProfileInitialState>("profile_initial_state"),
+        invoke<ProfileSummary[]>("profile_list"),
+      ]);
+      setInitial(state);
+      setProfiles(list);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (initial === null || profiles === null) {
+    return (
+      <div className="px-6 py-12 text-sm text-[var(--color-text-dim)]">
+        Loading profiles…
+      </div>
+    );
+  }
+
+  if (initial.kind === "uninitialized") {
+    return (
+      <ProfilesOnboarding
+        suggestedUserdataDir={initial.suggestedUserdataDir}
+        onImported={() => {
+          setInitial(null);
+          setProfiles(null);
+          void refresh();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="px-6 py-8">
+      <div className="mb-5 flex items-end justify-between gap-4 flex-wrap">
+        <div>
+          <div className="text-[10px] tracking-[0.22em] uppercase text-[var(--color-accent-soft)] mb-1">
+            Multiple worlds, one launcher
+          </div>
+          <h1 className="text-xl font-semibold tracking-tight">Profiles</h1>
+          <p className="text-xs text-[var(--color-text-dim)] mt-1">
+            Each profile is its own bundle of mods, saves, and worlds.
+            Switching swaps all three at once — keep a vanilla profile
+            alongside a heavily-modded one, with their saves kept
+            separate.
+          </p>
+        </div>
+      </div>
+
+      <NewProfileCard
+        onCreated={() => void refresh()}
+        onError={setError}
+      />
+
+      {error && (
+        <div className="mb-4 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)] flex items-start justify-between gap-3">
+          <span className="break-words">{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            className="shrink-0 text-[10px] tracking-[0.14em] uppercase hover:underline"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+
+      <ul className="space-y-3">
+        {profiles.map((p) => (
+          <li key={p.id}>
+            <ProfileCard
+              profile={p}
+              busy={busy === p.id}
+              onSwitch={async () => {
+                setBusy(p.id);
+                setError(null);
+                try {
+                  await invoke("profile_switch", { id: p.id });
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                } finally {
+                  setBusy(null);
+                }
+              }}
+              onRename={async (newName) => {
+                setError(null);
+                try {
+                  await invoke("profile_rename", { id: p.id, name: newName });
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                }
+              }}
+              onDelete={async () => {
+                const ok = await ask(
+                  `Delete profile "${p.name}"?\n\nRemoves the profile's mods, saves, worlds, and snapshots from disk. The live 7DTD files aren't touched (those belong to whichever profile is currently active).`,
+                  { title: "Delete profile", kind: "warning" }
+                );
+                if (!ok) return;
+                setError(null);
+                try {
+                  await invoke("profile_delete", { id: p.id });
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                }
+              }}
+              onShowSnapshots={async () => {
+                setSnapshotsForId(p.id);
+                setSnapshots(null);
+                try {
+                  const list = await invoke<ProfileSnapshot[]>(
+                    "profile_list_snapshots",
+                    { profileId: p.id }
+                  );
+                  setSnapshots(list);
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                  setSnapshotsForId(null);
+                }
+              }}
+            />
+          </li>
+        ))}
+      </ul>
+
+      {snapshotsForId && (
+        <SnapshotsModal
+          profileId={snapshotsForId}
+          profileName={
+            profiles.find((p) => p.id === snapshotsForId)?.name ?? "profile"
+          }
+          snapshots={snapshots}
+          isActive={
+            profiles.find((p) => p.id === snapshotsForId)?.isActive ?? false
+          }
+          onRestored={async () => {
+            await refresh();
+          }}
+          onClose={() => {
+            setSnapshotsForId(null);
+            setSnapshots(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// First-run onboarding card. Asks the user to confirm/pick the
+// 7DTD userdata dir (we pre-fill our best guess from the OS
+// canonical path) and name the imported profile.
+function ProfilesOnboarding({
+  suggestedUserdataDir,
+  onImported,
+}: {
+  suggestedUserdataDir: string | null;
+  onImported: () => void;
+}) {
+  const [dir, setDir] = useState(suggestedUserdataDir ?? "");
+  const [name, setName] = useState("Default");
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div className="px-6 py-12 max-w-2xl mx-auto">
+      <div className="text-[10px] tracking-[0.22em] uppercase text-[var(--color-accent-soft)] mb-2">
+        Get started
+      </div>
+      <h1 className="text-2xl font-semibold tracking-tight mb-3">
+        Set up profiles
+      </h1>
+      <p className="text-sm text-[var(--color-text-dim)] leading-relaxed mb-6">
+        A profile is a named bundle of mods, saves, and worlds. PackRelay
+        keeps each profile isolated so you can run a heavily-modded
+        server alongside a vanilla save without them clobbering each
+        other. Switch profiles → mods, saves, and worlds all swap at
+        once.
+      </p>
+
+      <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] p-5 space-y-4">
+        <div>
+          <label
+            htmlFor="userdata-dir"
+            className="block text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1.5"
+          >
+            7DTD userdata folder
+          </label>
+          <input
+            id="userdata-dir"
+            type="text"
+            value={dir}
+            onChange={(e) => setDir(e.currentTarget.value)}
+            disabled={importing}
+            className="w-full rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
+            placeholder="Path containing Mods/, Saves/, GeneratedWorlds/"
+            spellCheck={false}
+          />
+          <p className="mt-1.5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            On Windows the standard path is{" "}
+            <code className="font-mono">%APPDATA%\7DaysToDie</code> — the
+            parent of the Mods folder you install packs into.
+          </p>
+        </div>
+
+        <div>
+          <label
+            htmlFor="profile-name"
+            className="block text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1.5"
+          >
+            Name this profile
+          </label>
+          <input
+            id="profile-name"
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.currentTarget.value)}
+            disabled={importing}
+            maxLength={64}
+            className="w-full rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
+            placeholder="Default"
+          />
+          <p className="mt-1.5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            We&apos;ll snapshot your current Mods + Saves + GeneratedWorlds
+            into this profile so nothing's lost. You can rename it later.
+          </p>
+        </div>
+
+        {error && (
+          <div className="rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)] break-words">
+            {error}
+          </div>
+        )}
+
+        <button
+          type="button"
+          disabled={importing || !dir.trim() || !name.trim()}
+          onClick={async () => {
+            setImporting(true);
+            setError(null);
+            try {
+              await invoke("profile_import_current", {
+                userdataDir: dir,
+                name,
+              });
+              onImported();
+            } catch (e) {
+              setError(typeof e === "string" ? e : `${e}`);
+            } finally {
+              setImporting(false);
+            }
+          }}
+          className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+        >
+          {importing ? "Importing…" : "Import current setup as profile"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Inline "create new profile" form on the profiles list page. Bare
+// — name only, no mods/saves picked yet (those come via switching
+// to it + installing packs).
+function NewProfileCard({
+  onCreated,
+  onError,
+}: {
+  onCreated: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] p-4 mb-5">
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (!name.trim()) return;
+          setCreating(true);
+          try {
+            await invoke("profile_create", { name });
+            setName("");
+            onCreated();
+          } catch (err) {
+            onError(typeof err === "string" ? err : `${err}`);
+          } finally {
+            setCreating(false);
+          }
+        }}
+        className="flex flex-wrap items-end gap-3"
+      >
+        <div className="flex-1 min-w-[200px]">
+          <label
+            htmlFor="new-profile-name"
+            className="block text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1.5"
+          >
+            New profile
+          </label>
+          <input
+            id="new-profile-name"
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.currentTarget.value)}
+            disabled={creating}
+            maxLength={64}
+            placeholder="e.g. Hardcore Day 7, Vanilla, Test Build"
+            className="w-full rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm text-[var(--color-text-bright)] placeholder:text-[var(--color-text-dim)]/60 outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={creating || !name.trim()}
+          className="inline-flex items-center px-4 py-2 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+        >
+          {creating ? "Creating…" : "Create"}
+        </button>
+      </form>
+      <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+        New profiles start empty. Switch to one, then install a pack —
+        that pack lives in this profile and follows it when you switch
+        back later.
+      </p>
+    </div>
+  );
+}
+
+function ProfileCard({
+  profile: p,
+  busy,
+  onSwitch,
+  onRename,
+  onDelete,
+  onShowSnapshots,
+}: {
+  profile: ProfileSummary;
+  busy: boolean;
+  onSwitch: () => void;
+  onRename: (newName: string) => Promise<void>;
+  onDelete: () => void;
+  onShowSnapshots: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(p.name);
+
+  const totalBytes = p.modsBytes + p.savesBytes + p.worldsBytes;
+
+  return (
+    <div
+      className={`rounded-xl border ${
+        p.isActive
+          ? "border-[var(--color-accent-soft)]/50 bg-[var(--color-accent)]/8"
+          : "border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]"
+      } p-5 transition-colors`}
+    >
+      <div className="flex items-start justify-between gap-4 mb-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            {editing ? (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  if (draft.trim() && draft !== p.name) {
+                    await onRename(draft.trim());
+                  }
+                  setEditing(false);
+                }}
+                className="flex-1 flex items-center gap-1.5"
+              >
+                <input
+                  autoFocus
+                  type="text"
+                  value={draft}
+                  onChange={(e) => setDraft(e.currentTarget.value)}
+                  onBlur={() => {
+                    setDraft(p.name);
+                    setEditing(false);
+                  }}
+                  maxLength={64}
+                  className="flex-1 min-w-0 rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-2.5 py-1 text-sm text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60"
+                />
+              </form>
+            ) : (
+              <span
+                className="text-base font-semibold text-[var(--color-text-bright)] truncate cursor-text"
+                onDoubleClick={() => {
+                  setDraft(p.name);
+                  setEditing(true);
+                }}
+                title="Double-click to rename"
+              >
+                {p.name}
+              </span>
+            )}
+            {p.isActive && (
+              <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] tracking-[0.14em] uppercase font-medium bg-[var(--color-status-success)]/15 text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40">
+                <span className="size-1.5 rounded-full bg-[var(--color-status-success)] shadow-[0_0_6px_rgba(80,200,120,0.7)]" />
+                Active
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] text-[var(--color-text-dim)] flex flex-wrap items-center gap-x-3 gap-y-0.5">
+            {p.packSlug && (
+              <span>
+                Pack:{" "}
+                <span className="text-[var(--color-accent-soft)]">
+                  {p.packSlug}
+                </span>
+                {p.packVersion && (
+                  <span className="font-mono"> v{p.packVersion}</span>
+                )}
+              </span>
+            )}
+            <span className="font-mono tabular-nums">{formatBytes(totalBytes)}</span>
+            <span>
+              {p.snapshotCount} snapshot{p.snapshotCount === 1 ? "" : "s"}
+            </span>
+            <span>created {formatRelativeTime(p.createdAt)}</span>
+          </div>
+        </div>
+        <div className="shrink-0 flex items-center gap-1.5">
+          {!p.isActive && (
+            <button
+              type="button"
+              onClick={onSwitch}
+              disabled={busy}
+              className="inline-flex items-center px-3 py-1.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 transition-colors text-[11px] tracking-[0.14em] uppercase font-medium"
+            >
+              {busy ? "Switching…" : "Switch to"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onShowSnapshots}
+            className="inline-flex items-center px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase transition-colors"
+          >
+            Snapshots
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDraft(p.name);
+              setEditing(true);
+            }}
+            className="inline-flex items-center px-2.5 py-1.5 rounded-md text-[10px] tracking-wide uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40 transition-colors"
+            title="Rename"
+          >
+            ✎
+          </button>
+          {!p.isActive && (
+            <button
+              type="button"
+              onClick={onDelete}
+              className="inline-flex items-center px-2.5 py-1.5 rounded-md text-[10px] tracking-wide uppercase text-[var(--color-text-dim)] hover:text-[var(--color-status-danger)] hover:bg-[var(--color-bg-raised)]/40 transition-colors"
+              title="Delete"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 text-[11px]">
+        <ProfileStat label="Mods" bytes={p.modsBytes} />
+        <ProfileStat label="Saves" bytes={p.savesBytes} />
+        <ProfileStat label="Worlds" bytes={p.worldsBytes} />
+      </div>
+    </div>
+  );
+}
+
+function ProfileStat({ label, bytes }: { label: string; bytes: number }) {
+  return (
+    <div className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-2.5 py-1.5">
+      <div className="text-[9px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-dim)]">
+        {label}
+      </div>
+      <div className="text-[12px] font-medium text-[var(--color-text-bright)] tabular-nums mt-0.5">
+        {bytes > 0 ? formatBytes(bytes) : "—"}
+      </div>
+    </div>
+  );
+}
+
+function SnapshotsModal({
+  profileId,
+  profileName,
+  snapshots,
+  isActive,
+  onRestored,
+  onClose,
+}: {
+  profileId: string;
+  profileName: string;
+  snapshots: ProfileSnapshot[] | null;
+  isActive: boolean;
+  onRestored: () => Promise<void>;
+  onClose: () => void;
+}) {
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center px-6"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-[var(--color-bg-raised)]/60 flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold">Snapshots</h2>
+            <p className="text-[11px] text-[var(--color-text-dim)]">
+              {profileName} · pre-launch saves + worlds backups
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-lg leading-none"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="px-5 py-4">
+          {!isActive && (
+            <p className="rounded-md border border-[var(--color-status-warning)]/40 bg-[var(--color-status-warning)]/10 px-3 py-2 text-[11px] text-[var(--color-status-warning)] mb-3">
+              This profile isn&apos;t active. Switch to it before
+              restoring a snapshot — restores write to the live 7DTD
+              folders, which only this profile claims when active.
+            </p>
+          )}
+          {snapshots === null ? (
+            <div className="text-[11px] text-[var(--color-text-dim)]">
+              Loading…
+            </div>
+          ) : snapshots.length === 0 ? (
+            <div className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+              No snapshots yet. The launcher auto-snapshots saves +
+              worlds every time you click <b>Launch 7DTD</b>, keeping
+              the last 5.
+            </div>
+          ) : (
+            <ul className="space-y-2">
+              {snapshots.map((s) => (
+                <li
+                  key={s.id}
+                  className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2.5 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="text-[12px] text-[var(--color-text-bright)] truncate">
+                      {s.label ?? "Snapshot"}
+                    </div>
+                    <div className="text-[10px] text-[var(--color-text-dim)] tabular-nums">
+                      {formatRelativeTime(s.createdAt)} ·{" "}
+                      {formatBytes(s.savesBytes + s.worldsBytes)}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!isActive || restoring === s.id}
+                    onClick={async () => {
+                      const ok = await ask(
+                        `Restore "${s.label ?? "snapshot"}" from ${formatRelativeTime(s.createdAt)}?\n\nReplaces your current Saves + GeneratedWorlds with the snapshot's contents. Mods aren't touched.`,
+                        { title: "Restore snapshot", kind: "warning" }
+                      );
+                      if (!ok) return;
+                      setRestoring(s.id);
+                      setError(null);
+                      try {
+                        await invoke("profile_restore_snapshot", {
+                          profileId,
+                          snapshotId: s.id,
+                        });
+                        await onRestored();
+                      } catch (e) {
+                        setError(typeof e === "string" ? e : `${e}`);
+                      } finally {
+                        setRestoring(null);
+                      }
+                    }}
+                    className="shrink-0 inline-flex items-center px-3 py-1 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-[10px] tracking-[0.14em] uppercase disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {restoring === s.id ? "Restoring…" : "Restore"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {error && (
+            <div className="mt-3 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)] break-words">
+              {error}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Persistent status strip at the bottom of the window. v0 is
 // hard-coded — once we have a status API on packrelay.cloud the
 // "All Systems Operational" pill becomes live.
@@ -3237,6 +3912,19 @@ function SettingsGlyph() {
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <circle cx="8" cy="8" r="2" />
       <path d="M8 1.5v2M8 12.5v2M14.5 8h-2M3.5 8h-2M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4M12.6 12.6l-1.4-1.4M4.8 4.8L3.4 3.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// Stylized fox-mark glyph for the Profiles rail item — kitsune-
+// adjacent visual hint that ties profile-switching to the broader
+// PackRelay aesthetic.
+function ProfileGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+      <path d="M3 4.5l2.5 1L4 8l1.5 4.5L8 11l2.5 1.5L12 8l-1.5-2.5L13 4.5 11 3 8 5 5 3 3 4.5z" strokeLinejoin="round" />
+      <circle cx="6.5" cy="7.5" r="0.6" fill="currentColor" />
+      <circle cx="9.5" cy="7.5" r="0.6" fill="currentColor" />
     </svg>
   );
 }

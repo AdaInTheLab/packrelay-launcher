@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::auth::{
@@ -24,9 +24,28 @@ use crate::auth::{
 };
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
+use packrelay_core::profile::{
+    self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout,
+};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::update::{update, UpdateReport};
 use packrelay_core::verify::{repair, verify, RepairReport, VerifyReport};
+
+/// How many pre-launch snapshots we keep per profile before
+/// pruning the oldest. User-tweakable in a future settings panel;
+/// 5 is a reasonable default — enough to roll back the last few
+/// play sessions, not so many that big saves balloon disk usage.
+const SNAPSHOT_KEEP_LAST: usize = 5;
+
+/// Resolve the launcher's app-data store layout. Centralized so
+/// every profile command goes through the same root.
+fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("resolving app data dir: {e}"))?;
+    Ok(StoreLayout::new(&dir))
+}
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
 /// Steam handles install-validation/family-share/already-running
@@ -460,13 +479,208 @@ async fn sign_out(app: AppHandle) -> Result<AuthState, String> {
     Ok(AuthState::SignedOut)
 }
 
+// ---------- Profile commands ----------
+//
+// Profiles are named bundles of (mods + saves + worlds). The core
+// logic lives in packrelay_core::profile; these commands are thin
+// wrappers that resolve the store layout from Tauri's app-data
+// dir and translate anyhow errors into frontend-friendly strings.
+
+/// State returned by `profile_initial_state` — drives the
+/// ProfilesView's first-run flow. SignedOut-equivalent: no
+/// profiles + no userdata dir set → show onboarding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+enum ProfileInitialState {
+    /// Profile system has never been used. Frontend offers
+    /// "Import current setup" onboarding.
+    Uninitialized {
+        /// Best guess at the 7DTD userdata dir, derived from the
+        /// canonical Mods/ path. The frontend pre-fills the
+        /// onboarding form with this.
+        suggested_userdata_dir: Option<String>,
+    },
+    /// At least one profile exists; system is set up.
+    Initialized {
+        active_profile_id: Option<String>,
+        userdata_dir: Option<String>,
+    },
+}
+
+#[tauri::command]
+async fn profile_initial_state(app: AppHandle) -> Result<ProfileInitialState, String> {
+    let layout = store_layout(&app)?;
+    let (active_id, userdata) = profile::read_active(&layout)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let profiles = profile::list_profiles(&layout)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if profiles.is_empty() && active_id.is_none() {
+        // Suggest the userdata dir: it's the parent of the
+        // canonical Mods/ path. The frontend already calls
+        // default_install_dest() to get Mods/ — we duplicate the
+        // derivation here so the suggestion's always available
+        // even if the frontend hasn't queried yet.
+        let suggested = canonical_mods_path()
+            .and_then(|p| p.parent().map(|x| x.display().to_string()));
+        return Ok(ProfileInitialState::Uninitialized {
+            suggested_userdata_dir: suggested,
+        });
+    }
+    Ok(ProfileInitialState::Initialized {
+        active_profile_id: active_id,
+        userdata_dir: userdata,
+    })
+}
+
+#[tauri::command]
+async fn profile_list(app: AppHandle) -> Result<Vec<ProfileSummary>, String> {
+    let layout = store_layout(&app)?;
+    profile::list_profiles(&layout)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_active(app: AppHandle) -> Result<Option<ProfileMeta>, String> {
+    let layout = store_layout(&app)?;
+    profile::active_profile(&layout)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_create(app: AppHandle, name: String) -> Result<ProfileMeta, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    let layout = store_layout(&app)?;
+    profile::create_profile(&layout, &trimmed)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// First-run onboarding: snapshot the user's existing 7DTD Mods/
+/// Saves/ GeneratedWorlds/ into a brand-new profile, mark it
+/// active, and remember the userdata dir so subsequent switches
+/// know where to mirror to/from.
+#[tauri::command]
+async fn profile_import_current(
+    app: AppHandle,
+    userdata_dir: String,
+    name: String,
+) -> Result<ProfileMeta, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    let dir = PathBuf::from(userdata_dir);
+    if !dir.exists() {
+        return Err(format!(
+            "7DTD userdata dir doesn't exist: {}",
+            dir.display()
+        ));
+    }
+    let layout = store_layout(&app)?;
+    profile::import_current_as_profile(&layout, &dir, &trimmed)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_switch(app: AppHandle, id: String) -> Result<(), String> {
+    let layout = store_layout(&app)?;
+    profile::switch_profile(&layout, &id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_rename(
+    app: AppHandle,
+    id: String,
+    name: String,
+) -> Result<ProfileMeta, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    let layout = store_layout(&app)?;
+    profile::rename_profile(&layout, &id, &trimmed)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
+    let layout = store_layout(&app)?;
+    profile::delete_profile(&layout, &id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_snapshot_active(
+    app: AppHandle,
+    label: Option<String>,
+) -> Result<ProfileSnapshot, String> {
+    let layout = store_layout(&app)?;
+    profile::snapshot_active(&layout, label.as_deref(), SNAPSHOT_KEEP_LAST)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_list_snapshots(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<Vec<ProfileSnapshot>, String> {
+    let layout = store_layout(&app)?;
+    profile::list_snapshots(&layout, &profile_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn profile_restore_snapshot(
+    app: AppHandle,
+    profile_id: String,
+    snapshot_id: String,
+) -> Result<(), String> {
+    let layout = store_layout(&app)?;
+    profile::restore_snapshot(&layout, &profile_id, &snapshot_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// Open 7DTD via the Steam protocol. We deliberately don't pass a
 /// connect address through — 7DTD's client doesn't accept one
 /// cleanly from the command line, and our copy-to-clipboard flow
 /// is the reliable handoff. Steam itself takes care of finding +
 /// validating the install.
+///
+/// Before opening Steam we auto-snapshot the active profile's
+/// saves+worlds so the user has a rollback point if the play
+/// session corrupts a world. Snapshot failures are logged but
+/// non-fatal — we'd rather let the user play with no snapshot
+/// than block the launch on a transient filesystem error.
 #[tauri::command]
 async fn launch_game(app: AppHandle) -> Result<(), String> {
+    // Best-effort pre-launch snapshot. Only runs when the profile
+    // system is initialized — first-time users without profiles
+    // get the existing launch behavior unchanged.
+    let layout = store_layout(&app)?;
+    match profile::snapshot_active(&layout, Some("pre-launch"), SNAPSHOT_KEEP_LAST).await {
+        Ok(_) => {}
+        Err(e) => {
+            // Common shapes: no active profile (expected pre-onboarding),
+            // userdata dir not configured. Don't block launch on these.
+            eprintln!("[launch] pre-launch snapshot skipped: {e:#}");
+        }
+    }
+
     let url = format!("steam://rungameid/{SEVEN_DAYS_STEAM_APPID}");
     app.opener()
         .open_url(url, None::<&str>)
@@ -490,7 +704,18 @@ pub fn run() {
             update_pack,
             get_auth_state,
             sign_in,
-            sign_out
+            sign_out,
+            profile_initial_state,
+            profile_list,
+            profile_active,
+            profile_create,
+            profile_import_current,
+            profile_switch,
+            profile_rename,
+            profile_delete,
+            profile_snapshot_active,
+            profile_list_snapshots,
+            profile_restore_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
