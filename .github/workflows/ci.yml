@@ -1,0 +1,78 @@
+# Fast feedback on every push to main and every PR opened against
+# it. Two parallel jobs:
+#
+#   rust  -- cargo check + cargo test on the whole workspace
+#   web   -- tsc --noEmit + vite build for the React frontend
+#
+# Both run on Ubuntu only — the release.yml workflow handles the
+# cross-platform build matrix when we cut a tagged release. CI is
+# just "does this branch compile and pass tests?" speed-tuned for
+# rapid PR feedback.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight CI run when a new commit lands on the same
+# branch/PR. Saves a minute or two on rapid iteration.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      # The Tauri crate depends on libwebkit2gtk via the build-time
+      # tauri-build crate, which probes for these on Linux even
+      # under `cargo check`. Skip the install and the check job
+      # fails with a pkg-config error on the webkit2gtk-4.1 probe.
+      - name: Install Tauri build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  web:
+    name: Frontend
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      # `npm run build` already runs `tsc && vite build` per the
+      # package.json script, so we get type-check + bundle in one
+      # step. Splitting them out would just add overhead.
+      - name: Type-check + bundle
+        run: npm run build
