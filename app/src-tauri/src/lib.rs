@@ -702,11 +702,23 @@ async fn profile_restore_snapshot(
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Open 7DTD via the Steam protocol. We deliberately don't pass a
-/// connect address through — 7DTD's client doesn't accept one
-/// cleanly from the command line, and our copy-to-clipboard flow
-/// is the reliable handoff. Steam itself takes care of finding +
-/// validating the install.
+/// Default 7DTD client port. Used when a server's `connectAddress`
+/// is just an IP / hostname with no port — every documented 7DTD
+/// server install binds 26900 by default.
+const SEVEN_DAYS_DEFAULT_PORT: u16 = 26900;
+
+/// Open 7DTD via the Steam protocol. If `connect_address` is
+/// provided (server-browse one-click-join flow), we ride Steam's
+/// `steam://run/<appid>//<args>` form to pass
+/// `-connecttoip=<ip> -connecttoport=<port>` through to the
+/// client — the long-documented community pattern for "launch
+/// the game and jump straight into a server."
+///
+/// Steam occasionally strips args (varies by Steam client
+/// version). When that happens the user still lands on the main
+/// menu — the clipboard fallback (the connect address was already
+/// copied client-side before the launch fired) lets them paste
+/// into Join Game manually.
 ///
 /// Before opening Steam we auto-snapshot the active profile's
 /// saves+worlds so the user has a rollback point if the play
@@ -714,7 +726,10 @@ async fn profile_restore_snapshot(
 /// non-fatal — we'd rather let the user play with no snapshot
 /// than block the launch on a transient filesystem error.
 #[tauri::command]
-async fn launch_game(app: AppHandle) -> Result<(), String> {
+async fn launch_game(
+    app: AppHandle,
+    connect_address: Option<String>,
+) -> Result<(), String> {
     // Best-effort pre-launch snapshot. Only runs when the profile
     // system is initialized — first-time users without profiles
     // get the existing launch behavior unchanged.
@@ -728,10 +743,82 @@ async fn launch_game(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    let url = format!("steam://rungameid/{SEVEN_DAYS_STEAM_APPID}");
+    let url = build_launch_url(connect_address.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))
+}
+
+/// Build the Steam URI we open to launch 7DTD. Without a connect
+/// address we use the bare `rungameid` form (no args). With one,
+/// we parse `<host>[:<port>]` and pass `-connecttoip` /
+/// `-connecttoport` via Steam's `steam://run/<appid>//<args>`
+/// form. Args are space-separated inside the URI; Steam decodes
+/// percent-encoding before handing them to the game.
+fn build_launch_url(connect_address: Option<&str>) -> String {
+    let bare = format!("steam://rungameid/{SEVEN_DAYS_STEAM_APPID}");
+    let Some(raw) = connect_address.map(str::trim).filter(|s| !s.is_empty()) else {
+        return bare;
+    };
+    let (host, port) = parse_connect_address(raw);
+    // Refuse to forward anything that isn't a plausible host —
+    // belt-and-suspenders against a malformed catalog entry
+    // smuggling shell-like content into the Steam URI.
+    if host.is_empty() || !is_safe_host(&host) {
+        return bare;
+    }
+    let host_enc = percent_encode_arg(&host);
+    // `steam://run/<appid>//<args>` — args go after the second
+    // slash. The leading "// " keeps the args block syntactically
+    // visible to Steam as a single field.
+    format!(
+        "steam://run/{SEVEN_DAYS_STEAM_APPID}//-connecttoip={host_enc}%20-connecttoport={port}"
+    )
+}
+
+/// Split a `host[:port]` address into its parts. Defaults to
+/// 26900 when the port is missing. We split on the LAST colon so
+/// IPv6 literals (which contain multiple colons) survive — though
+/// 7DTD's connect args don't actually support IPv6 today, so
+/// IPv6-only addresses will fail at the game side and the user
+/// falls back to clipboard paste.
+fn parse_connect_address(raw: &str) -> (String, u16) {
+    match raw.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse::<u16>().unwrap_or(SEVEN_DAYS_DEFAULT_PORT);
+            (host.trim().to_string(), port)
+        }
+        None => (raw.trim().to_string(), SEVEN_DAYS_DEFAULT_PORT),
+    }
+}
+
+/// Plausibility check: ASCII letters, digits, `.`, `-`, `:` (for
+/// IPv6 in brackets if we ever support it). Rejects spaces,
+/// quotes, command separators — anything that could escape the
+/// Steam URI into shell-like territory.
+fn is_safe_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+        })
+}
+
+/// Conservative percent-encoder: keeps unreserved URL chars,
+/// escapes everything else. We only call this on a host that's
+/// already passed `is_safe_host`, so the encoded output is
+/// effectively a no-op except for the rare case of square
+/// brackets in IPv6 literals.
+fn percent_encode_arg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

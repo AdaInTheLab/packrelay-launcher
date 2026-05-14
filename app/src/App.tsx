@@ -2961,7 +2961,11 @@ function LaunchPanel({ address }: { address: string }) {
       // Non-fatal — the address is still visible and selectable.
     }
     try {
-      await invoke("launch_game");
+      // Pass the connect address through so the Rust side can ask
+      // Steam to forward -connecttoip / -connecttoport to the
+      // client. Steam occasionally strips args (varies by version),
+      // so the clipboard prime above is the reliable fallback.
+      await invoke("launch_game", { connectAddress: address });
       setState({ kind: "launched" });
     } catch (e) {
       setState({ kind: "error", message: String(e) });
@@ -2981,8 +2985,9 @@ function LaunchPanel({ address }: { address: string }) {
       </button>
       {state.kind === "launched" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Steam is launching 7DTD. The address is on your clipboard
-          — paste it into <span className="text-[var(--color-text-bright)]">Join a Game → Connect to IP</span>.
+          Steam is launching 7DTD with the connect args. If it lands
+          on the main menu instead, the address is on your clipboard —
+          paste it into <span className="text-[var(--color-text-bright)]">Join a Game → Connect to IP</span>.
         </p>
       )}
       {state.kind === "error" && (
@@ -2994,8 +2999,9 @@ function LaunchPanel({ address }: { address: string }) {
       )}
       {state.kind === "idle" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Opens 7DTD via Steam and copies the address. Paste it into
-          Join a Game → Connect to IP once the menu loads.
+          Asks Steam to launch 7DTD and connect to this server. If
+          Steam strips the connect args the address is on your
+          clipboard for a manual paste.
         </p>
       )}
     </div>
