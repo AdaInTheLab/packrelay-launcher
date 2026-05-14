@@ -19,6 +19,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
+use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::verify::{repair, verify, RepairReport, VerifyReport};
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
@@ -311,6 +312,18 @@ async fn repair_pack(dest: String) -> Result<RepairReport, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Remove an installed pack from disk. Reads the sidecar manifest
+/// at `dest` to learn which files to delete, sweeps empty dirs the
+/// pack created, and returns a structured report including any
+/// per-file failures (locked, read-only, etc.) so the frontend can
+/// surface them without re-querying the filesystem.
+#[tauri::command]
+async fn uninstall_pack(dest: String) -> Result<UninstallReport, String> {
+    uninstall(&PathBuf::from(dest))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 /// Open 7DTD via the Steam protocol. We deliberately don't pass a
 /// connect address through — 7DTD's client doesn't accept one
 /// cleanly from the command line, and our copy-to-clipboard flow
@@ -336,7 +349,8 @@ pub fn run() {
             default_install_dest,
             launch_game,
             verify_pack,
-            repair_pack
+            repair_pack,
+            uninstall_pack
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

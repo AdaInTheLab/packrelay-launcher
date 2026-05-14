@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import "./App.css";
 
@@ -109,6 +109,21 @@ type RowVerifyState =
   | { kind: "verified"; report: VerifyReport }
   | { kind: "repairing" }
   | { kind: "repaired"; report: RepairReport }
+  | { kind: "error"; message: string };
+
+type UninstallFailure = { path: string; reason: string };
+type UninstallReport = {
+  displayName: string;
+  version: string;
+  filesRemoved: number;
+  filesFailed: UninstallFailure[];
+  sidecarRemoved: boolean;
+};
+
+type RowUninstallState =
+  | { kind: "idle" }
+  | { kind: "uninstalling" }
+  | { kind: "partial"; report: UninstallReport }
   | { kind: "error"; message: string };
 
 /** A row in the local install-history list. Stored in localStorage
@@ -276,6 +291,19 @@ function App() {
     []
   );
 
+  // Called after a successful uninstall — drops the record from
+  // the sidebar. Keyed by slug+installedAt so re-installing the
+  // same slug later doesn't accidentally match a stale entry.
+  const removeFromHistory = useCallback((record: InstallRecord) => {
+    setHistory((prev) => {
+      const next = prev.filter(
+        (r) => !(r.slug === record.slug && r.installedAt === record.installedAt)
+      );
+      saveHistory(next);
+      return next;
+    });
+  }, []);
+
   const reinstallFromHistory = useCallback(
     (record: InstallRecord) => {
       // If the catalog has a matching pack, drill into InstallView
@@ -368,6 +396,7 @@ function App() {
           history={history}
           latestVersionBySlug={latestVersionBySlug}
           onPick={reinstallFromHistory}
+          onRemove={removeFromHistory}
           catalogReady={packs !== null}
         />
         <main className="flex-1 overflow-y-auto">{mainContent}</main>
@@ -441,11 +470,13 @@ function HistorySidebar({
   history,
   latestVersionBySlug,
   onPick,
+  onRemove,
   catalogReady,
 }: {
   history: InstallRecord[];
   latestVersionBySlug: Map<string, string>;
   onPick: (r: InstallRecord) => void;
+  onRemove: (r: InstallRecord) => void;
   catalogReady: boolean;
 }) {
   return (
@@ -468,6 +499,7 @@ function HistorySidebar({
               record={r}
               latestVersionBySlug={latestVersionBySlug}
               onPick={onPick}
+              onRemove={onRemove}
               catalogReady={catalogReady}
             />
           ))}
@@ -486,14 +518,17 @@ function HistoryRow({
   record,
   latestVersionBySlug,
   onPick,
+  onRemove,
   catalogReady,
 }: {
   record: InstallRecord;
   latestVersionBySlug: Map<string, string>;
   onPick: (r: InstallRecord) => void;
+  onRemove: (r: InstallRecord) => void;
   catalogReady: boolean;
 }) {
   const [verify, setVerify] = useState<RowVerifyState>({ kind: "idle" });
+  const [uninstall, setUninstall] = useState<RowUninstallState>({ kind: "idle" });
 
   const latest = latestVersionBySlug.get(record.slug);
   const updateAvailable =
@@ -522,6 +557,42 @@ function HistoryRow({
       setVerify({ kind: "error", message: typeof e === "string" ? e : `${e}` });
     }
   }, [record.dest]);
+
+  // Uninstall flow: native confirm → uninstall_pack → either drop
+  // from history (clean run) or show inline partial-failure panel
+  // listing the locked files so the user can act on them.
+  const runUninstall = useCallback(async () => {
+    const ok = await ask(
+      `Remove ${record.name} v${record.version}?\n\nDeletes the pack's files under ${record.dest}. The Mods/ folder and any other packs inside it are left alone.`,
+      { title: "Uninstall pack", kind: "warning" }
+    );
+    if (!ok) return;
+    setUninstall({ kind: "uninstalling" });
+    // Clear the verify panel — its state is about to be obsolete
+    // whether the uninstall succeeds or fails.
+    setVerify({ kind: "idle" });
+    try {
+      const report = await invoke<UninstallReport>("uninstall_pack", {
+        dest: record.dest,
+      });
+      if (report.filesFailed.length === 0) {
+        // Clean run — drop from history; the row unmounts.
+        onRemove(record);
+      } else {
+        setUninstall({ kind: "partial", report });
+      }
+    } catch (e) {
+      setUninstall({
+        kind: "error",
+        message: typeof e === "string" ? e : `${e}`,
+      });
+    }
+  }, [record, onRemove]);
+
+  const inFlight =
+    verify.kind === "verifying" ||
+    verify.kind === "repairing" ||
+    uninstall.kind === "uninstalling";
 
   return (
     <li>
@@ -552,15 +623,13 @@ function HistoryRow({
             title="Verify installed files"
             onClick={(e) => {
               e.stopPropagation();
-              if (verify.kind !== "verifying" && verify.kind !== "repairing") {
-                runVerify();
-              }
+              if (!inFlight) runVerify();
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 e.stopPropagation();
-                runVerify();
+                if (!inFlight) runVerify();
               }
             }}
             className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] hover:text-[var(--color-accent-soft)] hover:bg-[var(--color-bg-raised)]/60 cursor-pointer transition-colors"
@@ -568,6 +637,29 @@ function HistoryRow({
             {verify.kind === "verifying" || verify.kind === "repairing"
               ? "…"
               : "✓"}
+          </span>
+          {/* Uninstall is the destructive sibling — same low-
+              contrast styling, hover-only red so it doesn't read as
+              dangerous at rest. Native confirm gates the actual
+              delete. */}
+          <span
+            role="button"
+            tabIndex={0}
+            title="Uninstall pack"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!inFlight) runUninstall();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!inFlight) runUninstall();
+              }
+            }}
+            className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] hover:text-[var(--color-status-danger)] hover:bg-[var(--color-bg-raised)]/60 cursor-pointer transition-colors"
+          >
+            {uninstall.kind === "uninstalling" ? "…" : "✕"}
           </span>
         </div>
         <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
@@ -584,7 +676,97 @@ function HistoryRow({
         </div>
       </button>
       <VerifyStatus state={verify} onRepair={runRepair} onDismiss={() => setVerify({ kind: "idle" })} />
+      <UninstallStatus
+        state={uninstall}
+        onRetry={runUninstall}
+        onDismiss={() => setUninstall({ kind: "idle" })}
+        onForceRemove={() => onRemove(record)}
+      />
     </li>
+  );
+}
+
+// Inline status block under a history row for uninstall results.
+// In the clean-success path the row unmounts (parent drops the
+// record from history) so we don't render a state here; only
+// partial failures and hard errors land in this component.
+function UninstallStatus({
+  state,
+  onRetry,
+  onDismiss,
+  onForceRemove,
+}: {
+  state: RowUninstallState;
+  onRetry: () => void;
+  onDismiss: () => void;
+  onForceRemove: () => void;
+}) {
+  if (state.kind === "idle") return null;
+
+  if (state.kind === "uninstalling") {
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] text-[var(--color-text-dim)] bg-[var(--color-bg-raised)]/30">
+        Uninstalling…
+      </div>
+    );
+  }
+
+  if (state.kind === "partial") {
+    const stuck = state.report.filesFailed.length;
+    return (
+      <div className="mx-3 mb-2 mt-1 px-2 py-2 rounded text-[10px] bg-[var(--color-status-warning)]/10 text-[var(--color-status-warning)] space-y-1.5">
+        <div>
+          Removed {state.report.filesRemoved} files, but {stuck} couldn&apos;t
+          be deleted (likely in use by 7DTD).
+        </div>
+        <div className="text-[var(--color-text-dim)] max-h-16 overflow-y-auto font-mono">
+          {state.report.filesFailed.slice(0, 5).map((f) => (
+            <div key={f.path} className="truncate">
+              {f.path}
+            </div>
+          ))}
+          {stuck > 5 && <div>…and {stuck - 5} more</div>}
+        </div>
+        <div className="flex gap-1.5">
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex items-center px-2 py-0.5 rounded text-[10px] tracking-wide uppercase bg-[var(--color-accent)]/20 text-[var(--color-accent-soft)] hover:bg-[var(--color-accent)]/30 transition-colors"
+          >
+            Retry
+          </button>
+          <button
+            type="button"
+            onClick={onForceRemove}
+            className="inline-flex items-center px-2 py-0.5 rounded text-[10px] tracking-wide uppercase bg-[var(--color-status-danger)]/20 text-[var(--color-status-danger)] hover:bg-[var(--color-status-danger)]/30 transition-colors"
+            title="Forget this pack from history without retrying the on-disk delete"
+          >
+            Drop from list
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px] px-1"
+          >
+            dismiss
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // error
+  return (
+    <div className="mx-3 mb-2 mt-1 px-2 py-1.5 rounded text-[10px] bg-[var(--color-status-danger)]/10 text-[var(--color-status-danger)] space-y-1">
+      <div className="break-words">{state.message}</div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-[10px]"
+      >
+        dismiss
+      </button>
+    </div>
   );
 }
 
