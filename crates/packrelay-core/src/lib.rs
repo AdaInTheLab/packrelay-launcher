@@ -8,4 +8,5 @@ pub mod client;
 pub mod install;
 pub mod manifest;
 pub mod uninstall;
+pub mod update;
 pub mod verify;

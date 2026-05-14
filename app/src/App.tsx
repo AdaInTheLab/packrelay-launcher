@@ -78,10 +78,32 @@ type InstallProgress = {
   lastCompletedFile: string | null;
 };
 
+// Mirrors packrelay-core's UpdateReport. Same camelCase serde.
+type UpdateReport = {
+  displayName: string;
+  fromVersion: string;
+  toVersion: string;
+  filesAdded: number;
+  filesChanged: number;
+  filesRemoved: number;
+  filesKept: number;
+  bytesDownloaded: number;
+  dest: string;
+};
+
+// Which flavour of the "install" action we're rendering. Affects
+// the button label, the destination input (locked for update so
+// the manifest diff actually applies), and the done-state copy.
+type InstallMode = "install" | "update" | "reinstall";
+
+type DoneResult =
+  | { mode: "install" | "reinstall"; report: InstallReport }
+  | { mode: "update"; report: UpdateReport };
+
 type InstallState =
   | { kind: "idle" }
   | { kind: "running"; progress: InstallProgress | null }
-  | { kind: "done"; report: InstallReport }
+  | { kind: "done"; result: DoneResult }
   | { kind: "error"; message: string };
 
 // Mirrors packrelay-core's VerifyReport / VerifyFailure / RepairReport
@@ -291,6 +313,38 @@ function App() {
     []
   );
 
+  // Called after a successful smart update. Bumps the existing
+  // history record's version + timestamp in place; we deliberately
+  // don't dedupe-to-top here because the sort order already reflects
+  // recency, and re-installing keeps the same slug→one-row invariant.
+  const recordUpdate = useCallback(
+    (slug: string, report: UpdateReport) => {
+      setHistory((prev) => {
+        const next = prev.map((r) =>
+          r.slug === slug
+            ? {
+                ...r,
+                version: report.toVersion,
+                installedAt: new Date().toISOString(),
+                // fileCount/totalBytes aren't reported by update —
+                // we don't bother stale-stamping them; the values
+                // are only used for the recent-installs sidebar
+                // hover stats today.
+              }
+            : r
+        );
+        // Float the updated entry to the top so it reads as a fresh
+        // event, like a re-install would.
+        const updated = next.find((r) => r.slug === slug);
+        const rest = next.filter((r) => r.slug !== slug);
+        const reordered = updated ? [updated, ...rest] : next;
+        saveHistory(reordered);
+        return reordered;
+      });
+    },
+    []
+  );
+
   // Called after a successful uninstall — drops the record from
   // the sidebar. Keyed by slug+installedAt so re-installing the
   // same slug later doesn't accidentally match a stale entry.
@@ -347,14 +401,22 @@ function App() {
   let mainContent: React.ReactNode;
   if (selectedPack) {
     const backToServer = selectedServer ?? null;
+    // If the selected pack is in history we're either updating (catalog
+    // version is newer) or re-installing (same/older). Drives the
+    // InstallView's mode + locks dest to the on-disk path so the
+    // smart-update manifest diff actually applies.
+    const installedRecord =
+      history.find((r) => r.slug === selectedPack.slug) ?? null;
     mainContent = (
       <InstallView
         pack={selectedPack}
-        defaultDest={defaultDest}
+        defaultDest={installedRecord?.dest ?? defaultDest}
+        installedRecord={installedRecord}
         connectAddress={backToServer?.connectAddress ?? null}
         backLabel={backToServer ? backToServer.name.toUpperCase() : "BROWSE"}
         onBack={() => setSelectedPack(null)}
         onInstalled={(report) => recordInstall(selectedPack.slug, report)}
+        onUpdated={(report) => recordUpdate(selectedPack.slug, report)}
       />
     );
   } else if (selectedServer) {
@@ -987,13 +1049,20 @@ function BrowseView({
 function InstallView({
   pack,
   defaultDest,
+  installedRecord,
   connectAddress,
   backLabel,
   onBack,
   onInstalled,
+  onUpdated,
 }: {
   pack: CatalogPack;
   defaultDest: string;
+  /** History entry for this pack, if it's already installed.
+   *  Drives the InstallView's mode (install vs update vs reinstall)
+   *  and locks dest to the on-disk path so update's manifest diff
+   *  applies to the right directory. */
+  installedRecord: InstallRecord | null;
   /** When the install was launched from a server detail page, the
    *  server's connect address gets surfaced under the "done" state
    *  with a copy button — the actual point of "one-click join." */
@@ -1003,7 +1072,24 @@ function InstallView({
   backLabel: string;
   onBack: () => void;
   onInstalled: (report: InstallReport) => void;
+  onUpdated: (report: UpdateReport) => void;
 }) {
+  // Mode is derived from history + catalog state. Update fires when
+  // both the installed record AND a newer catalog version exist;
+  // reinstall covers the "same version on disk" or "older catalog"
+  // edge cases (which can happen if a publisher pulls a version).
+  const mode: InstallMode = (() => {
+    if (!installedRecord) return "install";
+    if (
+      pack.latestVersion &&
+      semverIsNewer(pack.latestVersion, installedRecord.version)
+    ) {
+      return "update";
+    }
+    return "reinstall";
+  })();
+  const destLocked = mode === "update";
+
   const [dest, setDest] = useState(defaultDest);
   const [state, setState] = useState<InstallState>({ kind: "idle" });
 
@@ -1040,12 +1126,21 @@ function InstallView({
   async function startInstall() {
     setState({ kind: "running", progress: null });
     try {
-      const report = await invoke<InstallReport>("install_pack", {
-        slug: pack.slug,
-        dest,
-      });
-      setState({ kind: "done", report });
-      onInstalled(report);
+      if (mode === "update") {
+        const report = await invoke<UpdateReport>("update_pack", {
+          slug: pack.slug,
+          dest,
+        });
+        setState({ kind: "done", result: { mode: "update", report } });
+        onUpdated(report);
+      } else {
+        const report = await invoke<InstallReport>("install_pack", {
+          slug: pack.slug,
+          dest,
+        });
+        setState({ kind: "done", result: { mode, report } });
+        onInstalled(report);
+      }
     } catch (e) {
       setState({
         kind: "error",
@@ -1053,6 +1148,16 @@ function InstallView({
       });
     }
   }
+
+  const primaryButtonLabel =
+    mode === "update"
+      ? `Update to v${pack.latestVersion ?? "?"}`
+      : mode === "reinstall"
+        ? "Re-install"
+        : "Install pack";
+  const errorTitle =
+    mode === "update" ? "Update failed" : "Install failed";
+  const inFlightLabel = mode === "update" ? "Updating…" : "Installing…";
 
   const running = state.kind === "running";
   const progress = state.kind === "running" ? state.progress : null;
@@ -1117,7 +1222,7 @@ function InstallView({
             type="text"
             value={dest}
             onChange={(e) => setDest(e.currentTarget.value)}
-            disabled={running}
+            disabled={running || destLocked}
             className="flex-1 min-w-0 rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
             placeholder="Path to your 7DTD Mods/ directory"
             spellCheck={false}
@@ -1125,7 +1230,7 @@ function InstallView({
           <button
             type="button"
             onClick={pickFolder}
-            disabled={running}
+            disabled={running || destLocked}
             className="shrink-0 inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             title="Open a folder picker"
           >
@@ -1134,10 +1239,42 @@ function InstallView({
           </button>
         </div>
         <p className="mt-1.5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          The pack folder lands inside this directory. On Windows the
-          standard path is{" "}
-          <code className="font-mono">%APPDATA%\7DaysToDie\Mods</code>.
+          {destLocked && installedRecord ? (
+            <>
+              Update applies to the existing install at this path —
+              only changed files are refetched. To install fresh
+              elsewhere, uninstall first.
+            </>
+          ) : (
+            <>
+              The pack folder lands inside this directory. On Windows the
+              standard path is{" "}
+              <code className="font-mono">%APPDATA%\7DaysToDie\Mods</code>.
+            </>
+          )}
         </p>
+        {mode === "update" && installedRecord && (
+          <div className="mt-3 rounded-md border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/10 px-3 py-2 text-[11px] flex items-center justify-between gap-3">
+            <span>
+              <span className="font-mono text-[var(--color-accent-soft)]">
+                v{installedRecord.version}
+              </span>
+              <span className="text-[var(--color-text-dim)]"> → </span>
+              <span className="font-mono text-[var(--color-accent-soft)]">
+                v{pack.latestVersion}
+              </span>
+            </span>
+            <span className="text-[var(--color-text-dim)]">
+              Smart update: only changed files are refetched.
+            </span>
+          </div>
+        )}
+        {mode === "reinstall" && installedRecord && (
+          <div className="mt-3 rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2 text-[11px] text-[var(--color-text-dim)]">
+            v{installedRecord.version} already installed here.
+            Re-installing fetches the full pack again.
+          </div>
+        )}
 
         <div className="mt-5">
           {state.kind === "idle" && (
@@ -1147,14 +1284,14 @@ function InstallView({
               disabled={!dest.trim()}
               className="inline-flex items-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
             >
-              Install pack
+              {primaryButtonLabel}
             </button>
           )}
           {state.kind === "running" && (
             <div>
               <div className="flex items-center justify-between text-xs mb-1.5">
                 <span className="text-[var(--color-text-dim)]">
-                  Installing…
+                  {inFlightLabel}
                 </span>
                 <span className="font-mono text-[var(--color-text-bright)]/85">
                   {progress
@@ -1175,16 +1312,43 @@ function InstallView({
               )}
             </div>
           )}
-          {state.kind === "done" && (
+          {state.kind === "done" && state.result.mode === "update" && (
             <div className="space-y-3">
               <div className="rounded-md border border-[var(--color-status-success)]/40 bg-[var(--color-status-success)]/10 px-4 py-3 text-sm">
                 <div className="font-medium mb-1">
-                  ✓ {state.report.displayName} v{state.report.version} installed
+                  ✓ {state.result.report.displayName} updated to v
+                  {state.result.report.toVersion}
                 </div>
                 <div className="text-xs text-[var(--color-text-dim)]">
-                  {state.report.fileCount} files,{" "}
-                  {formatBytes(state.report.totalBytes)} →{" "}
-                  <code className="font-mono">{state.report.dest}</code>
+                  {state.result.report.filesChanged} changed,{" "}
+                  {state.result.report.filesAdded} new,{" "}
+                  {state.result.report.filesRemoved} removed,{" "}
+                  {state.result.report.filesKept} kept · downloaded{" "}
+                  {formatBytes(state.result.report.bytesDownloaded)}
+                </div>
+              </div>
+              {connectAddress && (
+                <div className="rounded-md border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/10 px-4 py-3">
+                  <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
+                    Now connect in 7DTD
+                  </div>
+                  <LaunchPanel address={connectAddress} />
+                </div>
+              )}
+            </div>
+          )}
+          {state.kind === "done" && state.result.mode !== "update" && (
+            <div className="space-y-3">
+              <div className="rounded-md border border-[var(--color-status-success)]/40 bg-[var(--color-status-success)]/10 px-4 py-3 text-sm">
+                <div className="font-medium mb-1">
+                  ✓ {state.result.report.displayName} v
+                  {state.result.report.version}{" "}
+                  {state.result.mode === "reinstall" ? "re-installed" : "installed"}
+                </div>
+                <div className="text-xs text-[var(--color-text-dim)]">
+                  {state.result.report.fileCount} files,{" "}
+                  {formatBytes(state.result.report.totalBytes)} →{" "}
+                  <code className="font-mono">{state.result.report.dest}</code>
                 </div>
               </div>
               {connectAddress && (
@@ -1199,7 +1363,7 @@ function InstallView({
           )}
           {state.kind === "error" && (
             <div className="rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-4 py-3 text-sm">
-              <div className="font-medium mb-1">Install failed</div>
+              <div className="font-medium mb-1">{errorTitle}</div>
               <div className="text-xs font-mono whitespace-pre-wrap break-words">
                 {state.message}
               </div>

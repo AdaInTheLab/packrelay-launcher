@@ -20,6 +20,7 @@ use tauri_plugin_opener::OpenerExt;
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
+use packrelay_core::update::{update, UpdateReport};
 use packrelay_core::verify::{repair, verify, RepairReport, VerifyReport};
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
@@ -289,6 +290,79 @@ async fn install_pack(
     Ok(report)
 }
 
+/// Smart update: diff the installed sidecar against the catalog
+/// manifest and only refetch files that changed. Emits the same
+/// install://progress events as install_pack — the frontend's bar
+/// renders identically, just with a smaller total_bytes since
+/// kept-unchanged files aren't counted.
+#[tauri::command]
+async fn update_pack(
+    app: AppHandle,
+    slug: String,
+    dest: String,
+) -> Result<UpdateReport, String> {
+    let client = Client::new(DEFAULT_API_URL);
+    let dest_path = PathBuf::from(&dest);
+
+    // Same atomic-counter shape as install_pack so the frontend's
+    // progress listener doesn't have to differentiate between
+    // install and update event streams.
+    let bytes_so_far = Arc::new(AtomicU64::new(0));
+    let total_bytes = Arc::new(AtomicU64::new(0));
+    let file_count = Arc::new(AtomicU64::new(0));
+
+    let bytes_clone = bytes_so_far.clone();
+    let total_clone = total_bytes.clone();
+    let file_count_clone = file_count.clone();
+    let app_clone = app.clone();
+
+    let report = update(&client, &slug, &dest_path, 8, move |ev: ProgressEvent| {
+        let payload = match ev {
+            ProgressEvent::Started {
+                total_bytes,
+                file_count: fc,
+                ..
+            } => {
+                total_clone.store(total_bytes, Ordering::Relaxed);
+                file_count_clone.store(fc as u64, Ordering::Relaxed);
+                InstallProgressPayload {
+                    bytes_so_far: 0,
+                    total_bytes,
+                    file_count: fc,
+                    last_completed_file: None,
+                }
+            }
+            ProgressEvent::Bytes { delta } => {
+                let new_total =
+                    bytes_clone.fetch_add(delta, Ordering::Relaxed) + delta;
+                InstallProgressPayload {
+                    bytes_so_far: new_total,
+                    total_bytes: total_clone.load(Ordering::Relaxed),
+                    file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                    last_completed_file: None,
+                }
+            }
+            ProgressEvent::FileDone { path } => InstallProgressPayload {
+                bytes_so_far: bytes_clone.load(Ordering::Relaxed),
+                total_bytes: total_clone.load(Ordering::Relaxed),
+                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                last_completed_file: Some(path),
+            },
+            ProgressEvent::Done { .. } => InstallProgressPayload {
+                bytes_so_far: total_clone.load(Ordering::Relaxed),
+                total_bytes: total_clone.load(Ordering::Relaxed),
+                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                last_completed_file: None,
+            },
+        };
+        let _ = app_clone.emit("install://progress", payload);
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+
+    Ok(report)
+}
+
 /// Re-check an installed pack's files against its sidecar manifest.
 /// Cheap enough to run on demand from a history-row button — pure
 /// disk IO + SHA-256 hashing, no network. The frontend renders the
@@ -350,7 +424,8 @@ pub fn run() {
             launch_game,
             verify_pack,
             repair_pack,
-            uninstall_pack
+            uninstall_pack,
+            update_pack
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
