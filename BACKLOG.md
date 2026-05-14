@@ -25,6 +25,12 @@ features.
   signal.
 - **Install-count pill** on browse cards — display `downloadCount`
   inline next to file count. Data is already there; just unhidden.
+- **Sort selector on Browse Servers** — the pack browse has
+  Popular / Newest / Favorites chips; the server browse only has
+  region + boolean filters. Add a sort selector mirroring the
+  cloud's three modes (Players / Newest / Favorites). Needs
+  list_servers to take a sort param + the filter state to gain
+  a `sort` field with persistence.
 
 ## Profiles / library
 
