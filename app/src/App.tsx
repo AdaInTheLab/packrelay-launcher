@@ -51,7 +51,16 @@ type CatalogServer = {
   attachedPack: AttachedPack | null;
 };
 
-type Tab = "packs" | "servers";
+// Top-level view the main pane renders when nothing has been
+// drilled into. Overlay views (detail/install/server-detail) still
+// take precedence — selecting a pack opens the detail page over
+// whichever rail item is highlighted at the time.
+type ViewKey =
+  | "dashboard"
+  | "packs"
+  | "servers"
+  | "library"
+  | "settings";
 
 const REGION_LABEL: Record<string, string> = {
   na_east: "NA East",
@@ -249,7 +258,7 @@ function saveHistory(entries: InstallRecord[]): void {
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>("packs");
+  const [view, setView] = useState<ViewKey>("dashboard");
 
   const [packs, setPacks] = useState<CatalogPack[] | null>(null);
   const [packsError, setPacksError] = useState<string | null>(null);
@@ -329,10 +338,11 @@ function App() {
     }
   }, []);
 
-  const handleTabChange = useCallback((next: Tab) => {
-    setTab(next);
-    // Reset selections when switching tabs so the user always lands
-    // on the browse view of the tab they picked.
+  const handleViewChange = useCallback((next: ViewKey) => {
+    setView(next);
+    // Switching views clears any drill-down overlay so the user
+    // always lands on the rail item they picked, not on whatever
+    // pack/server was previously open.
     setSelectedPack(null);
     setSelectedServer(null);
     setPackView("detail");
@@ -434,7 +444,10 @@ function App() {
       // surface a soft error by ignoring the click.
       const match = packs?.find((p) => p.slug === record.slug);
       if (match) {
-        setTab("packs");
+        // Library is the natural "home" for a re-install action; if
+        // the user got here from another rail item, send them back to
+        // their list afterward via the back button.
+        setView("library");
         setSelectedServer(null);
         openPackInstall(match);
       }
@@ -525,7 +538,7 @@ function App() {
         onInstall={(pack) => openPackInstall(pack)}
       />
     );
-  } else if (tab === "packs") {
+  } else if (view === "packs") {
     mainContent = (
       <BrowseView
         packs={packs}
@@ -533,7 +546,7 @@ function App() {
         onSelect={openPackDetail}
       />
     );
-  } else {
+  } else if (view === "servers") {
     mainContent = (
       <ServerBrowseView
         servers={servers}
@@ -541,27 +554,46 @@ function App() {
         onSelect={setSelectedServer}
       />
     );
+  } else if (view === "library") {
+    mainContent = (
+      <LibraryView
+        history={history}
+        packBySlug={packBySlug}
+        latestVersionBySlug={latestVersionBySlug}
+        catalogReady={packs !== null}
+        onPick={reinstallFromHistory}
+        onRemove={removeFromHistory}
+        onBrowse={() => setView("packs")}
+      />
+    );
+  } else if (view === "settings") {
+    mainContent = <SettingsView auth={auth} onSignOut={handleSignOut} />;
+  } else {
+    mainContent = (
+      <DashboardView
+        auth={auth}
+        history={history}
+        packBySlug={packBySlug}
+        onBrowse={() => setView("packs")}
+        onOpenPack={openPackDetail}
+        onSignIn={() => setShowSignIn(true)}
+      />
+    );
   }
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header
-        tab={tab}
-        onTabChange={handleTabChange}
-        auth={auth}
-        onSignInClick={() => setShowSignIn(true)}
-        onSignOut={handleSignOut}
-      />
       <div className="flex-1 flex min-h-0">
-        <HistorySidebar
-          history={history}
-          latestVersionBySlug={latestVersionBySlug}
-          onPick={reinstallFromHistory}
-          onRemove={removeFromHistory}
-          catalogReady={packs !== null}
+        <LeftRail
+          view={view}
+          onViewChange={handleViewChange}
+          auth={auth}
+          onSignInClick={() => setShowSignIn(true)}
+          onSignOut={handleSignOut}
         />
         <main className="flex-1 overflow-y-auto">{mainContent}</main>
       </div>
+      <FooterStrip />
       {showSignIn && (
         <SignInModal
           onClose={() => setShowSignIn(false)}
@@ -575,58 +607,191 @@ function App() {
   );
 }
 
-function Header({
-  tab,
-  onTabChange,
+// Full-height left-rail nav. Replaces the previous top-tab header;
+// primary nav lives here, the auth chip docks at the bottom, and
+// community links sit in their own subsection. Active state is
+// driven from App's ViewKey state machine — overlays (detail /
+// install / server-detail) leave the rail untouched so the user
+// can always see "where they were" in the structure.
+function LeftRail({
+  view,
+  onViewChange,
   auth,
   onSignInClick,
   onSignOut,
 }: {
-  tab: Tab;
-  onTabChange: (next: Tab) => void;
+  view: ViewKey;
+  onViewChange: (next: ViewKey) => void;
   auth: AuthState;
   onSignInClick: () => void;
   onSignOut: () => void;
 }) {
   return (
-    <header className="border-b border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm shrink-0">
-      <div className="px-6 py-3 flex items-center justify-between gap-4">
-        <div className="flex items-baseline gap-3">
-          <span className="font-bold tracking-tight text-base">
-            PACKRELAY
-          </span>
-          <span className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)]">
-            launcher · v0.1
-          </span>
+    <aside className="w-56 shrink-0 border-r border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 flex flex-col">
+      <div className="px-4 pt-4 pb-3 border-b border-[var(--color-bg-raised)]">
+        {/* Brand mark — served from app/public/ so Vite copies it as
+            a static asset in both dev and build. Designed for dark
+            backgrounds so it sits cleanly on the rail's panel bg. */}
+        <img
+          src="/dark-logo-trans.png"
+          alt="PackRelay.cloud"
+          className="w-full h-auto select-none"
+          draggable={false}
+        />
+        <div className="text-[9px] tracking-[0.22em] uppercase text-[var(--color-text-dim)] text-center mt-1">
+          launcher · v0.1
         </div>
-        <nav className="flex gap-1 text-[11px] tracking-[0.14em] uppercase">
-          <TabButton
-            active={tab === "packs"}
-            onClick={() => onTabChange("packs")}
-          >
-            Packs
-          </TabButton>
-          <TabButton
-            active={tab === "servers"}
-            onClick={() => onTabChange("servers")}
-          >
-            Servers
-          </TabButton>
-        </nav>
+      </div>
+
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
+        <RailItem
+          active={view === "dashboard"}
+          onClick={() => onViewChange("dashboard")}
+          glyph={<HomeGlyph />}
+        >
+          Dashboard
+        </RailItem>
+        <RailItem
+          active={view === "packs"}
+          onClick={() => onViewChange("packs")}
+          glyph={<PackGlyph />}
+        >
+          Browse Packs
+        </RailItem>
+        <RailItem
+          active={view === "servers"}
+          onClick={() => onViewChange("servers")}
+          glyph={<ServerGlyph />}
+        >
+          Browse Servers
+        </RailItem>
+        <RailItem
+          active={view === "library"}
+          onClick={() => onViewChange("library")}
+          glyph={<LibraryGlyph />}
+        >
+          My Library
+        </RailItem>
+        <RailItem
+          active={view === "settings"}
+          onClick={() => onViewChange("settings")}
+          glyph={<SettingsGlyph />}
+        >
+          Settings
+        </RailItem>
+
+        <div className="px-3 pt-5 pb-1 text-[9px] font-medium tracking-[0.22em] uppercase text-[var(--color-text-dim)]/70">
+          Community
+        </div>
+        <RailExternal
+          href="https://packrelay.cloud/discord"
+          glyph={<DiscordGlyph />}
+        >
+          Discord
+        </RailExternal>
+        <RailExternal
+          href="https://packrelay.cloud/news"
+          glyph={<NewsGlyph />}
+        >
+          News
+        </RailExternal>
+        <RailExternal
+          href="https://packrelay.cloud/support"
+          glyph={<SupportGlyph />}
+        >
+          Support
+        </RailExternal>
+      </nav>
+
+      <div className="px-3 pb-3 pt-2 border-t border-[var(--color-bg-raised)]">
         <AuthChip
           auth={auth}
           onSignInClick={onSignInClick}
           onSignOut={onSignOut}
         />
       </div>
-    </header>
+    </aside>
   );
 }
 
-// Header pill on the far right of the chrome. Two states:
-// signedOut renders a subtle "Sign in" button; signedIn renders
-// the user's display name with a small avatar tile and exposes
-// sign-out via a click-toggled menu.
+// One row in the rail's primary nav. Active = accent-tinted bg +
+// soft glow on the left edge; inactive = subdued text that brightens
+// on hover. The leading glyph sits at fixed size so labels align.
+function RailItem({
+  active,
+  onClick,
+  glyph,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  glyph: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[12px] tracking-wide transition-colors ${
+        active
+          ? "bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/30"
+          : "text-[var(--color-text-bright)]/85 hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40"
+      }`}
+    >
+      <span
+        className={`size-4 shrink-0 ${
+          active
+            ? "text-[var(--color-accent-soft)]"
+            : "text-[var(--color-text-dim)]"
+        }`}
+      >
+        {glyph}
+      </span>
+      <span className="font-medium">{children}</span>
+    </button>
+  );
+}
+
+// Same shape as RailItem, but for community links that open in the
+// user's browser via the opener plugin. Never shows "active" since
+// it's not a launcher route.
+function RailExternal({
+  href,
+  glyph,
+  children,
+}: {
+  href: string;
+  glyph: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          const mod = await import("@tauri-apps/plugin-opener");
+          await mod.openUrl(href);
+        } catch {
+          // No graceful fallback inside the rail — community links
+          // are non-essential and the user can copy the URL via the
+          // packrelay.cloud header if the opener plugin glue is
+          // somehow missing.
+        }
+      }}
+      className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-[12px] tracking-wide text-[var(--color-text-bright)]/85 hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40 transition-colors"
+    >
+      <span className="size-4 shrink-0 text-[var(--color-text-dim)]">
+        {glyph}
+      </span>
+      <span className="font-medium flex-1 text-left">{children}</span>
+      <span className="text-[10px] text-[var(--color-text-dim)]">↗</span>
+    </button>
+  );
+}
+
+// Auth chip — rail-bottom shape this time. Same two states
+// (signedOut → "Sign in" pill, signedIn → avatar + name with a
+// click-toggled menu) but laid out for the narrow rail column.
 function AuthChip({
   auth,
   onSignInClick,
@@ -656,9 +821,9 @@ function AuthChip({
       <button
         type="button"
         onClick={() => setMenuOpen((v) => !v)}
-        className="inline-flex items-center gap-2 px-2 py-1 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 transition-colors"
+        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-[var(--color-bg-raised)]/50 transition-colors"
       >
-        <span className="size-6 rounded-full bg-[var(--color-accent)]/30 text-[var(--color-accent-soft)] text-[11px] font-semibold flex items-center justify-center overflow-hidden">
+        <span className="size-7 rounded-full bg-[var(--color-accent)]/30 text-[var(--color-accent-soft)] text-[12px] font-semibold flex items-center justify-center overflow-hidden shrink-0">
           {auth.user.image ? (
             <img
               src={auth.user.image}
@@ -669,8 +834,16 @@ function AuthChip({
             initial
           )}
         </span>
-        <span className="text-[12px] font-medium text-[var(--color-text-bright)] max-w-[10rem] truncate">
-          {auth.user.displayName}
+        <span className="min-w-0 flex-1 text-left">
+          <span className="block text-[12px] font-medium text-[var(--color-text-bright)] truncate">
+            {auth.user.displayName}
+          </span>
+          <span className="block text-[9px] uppercase tracking-[0.16em] text-[var(--color-text-dim)] truncate">
+            {auth.user.role.replace("_", " ")}
+          </span>
+        </span>
+        <span className="text-[10px] text-[var(--color-text-dim)] shrink-0">
+          {menuOpen ? "▴" : "▾"}
         </span>
       </button>
       {menuOpen && (
@@ -680,7 +853,10 @@ function AuthChip({
             className="fixed inset-0 z-40"
             onClick={() => setMenuOpen(false)}
           />
-          <div className="absolute right-0 top-full mt-1 z-50 min-w-[180px] rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] shadow-lg overflow-hidden">
+          {/* Open upward — the chip is at the rail-bottom, so a
+              downward menu would overflow off-screen. Aligned to the
+              chip's left edge for the same reason. */}
+          <div className="absolute left-0 right-0 bottom-full mb-1 z-50 rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] shadow-lg overflow-hidden">
             <div className="px-3 py-2 border-b border-[var(--color-bg-raised)]/60">
               <div className="text-[11px] text-[var(--color-text-bright)] font-medium truncate">
                 {auth.user.displayName}
@@ -840,93 +1016,112 @@ function SignInModal({
   );
 }
 
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`px-3 py-1.5 rounded-md transition-colors ${
-        active
-          ? "bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
-          : "text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-function HistorySidebar({
+// Main-pane home for the user's installed packs. Replaces the old
+// sidebar list. Renders a grid of cover-art tiles, an empty state
+// that points to Browse, and (via LibraryTile) the same verify /
+// uninstall affordances the sidebar row had — just in a tile-shaped
+// visual instead of a tight row.
+function LibraryView({
   history,
+  packBySlug,
   latestVersionBySlug,
+  catalogReady,
   onPick,
   onRemove,
-  catalogReady,
+  onBrowse,
 }: {
   history: InstallRecord[];
+  packBySlug: Map<string, CatalogPack>;
   latestVersionBySlug: Map<string, string>;
+  catalogReady: boolean;
   onPick: (r: InstallRecord) => void;
   onRemove: (r: InstallRecord) => void;
-  catalogReady: boolean;
+  onBrowse: () => void;
 }) {
-  return (
-    <aside className="w-64 shrink-0 border-r border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 overflow-y-auto">
-      <div className="px-4 py-4 border-b border-[var(--color-bg-raised)]">
-        <h2 className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)]">
-          Recent installs
-        </h2>
-      </div>
-      {history.length === 0 ? (
-        <div className="px-4 py-5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Packs you install land here. Click an entry later to jump
-          back to its page.
+  if (history.length === 0) {
+    return (
+      <div className="px-6 py-12">
+        <div className="mb-6">
+          <h1 className="text-xl font-semibold tracking-tight">My Library</h1>
+          <p className="text-xs text-[var(--color-text-dim)] mt-1">
+            Packs you install land here.
+          </p>
         </div>
-      ) : (
-        <ul className="px-2 py-2">
-          {history.map((r) => (
-            <HistoryRow
-              key={`${r.slug}-${r.installedAt}`}
-              record={r}
-              latestVersionBySlug={latestVersionBySlug}
-              onPick={onPick}
-              onRemove={onRemove}
-              catalogReady={catalogReady}
-            />
-          ))}
-        </ul>
-      )}
-    </aside>
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 px-6 py-10 text-center max-w-xl">
+          <div className="text-sm text-[var(--color-text-bright)] font-medium mb-1">
+            No installs yet
+          </div>
+          <p className="text-xs text-[var(--color-text-dim)] mb-4">
+            Browse the catalog and install a pack to fill this view.
+          </p>
+          <button
+            type="button"
+            onClick={onBrowse}
+            className="inline-flex items-center px-4 py-2 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 text-xs font-medium transition-colors"
+          >
+            Browse packs
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-6 py-8">
+      <div className="mb-5 flex items-end justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">My Library</h1>
+          <p className="text-xs text-[var(--color-text-dim)] mt-1">
+            Packs you&apos;ve installed on this machine. Click one to re-
+            install, update, or grab a connect address.
+          </p>
+        </div>
+        <div className="text-[11px] text-[var(--color-text-dim)] tabular-nums">
+          {history.length} pack{history.length === 1 ? "" : "s"}
+        </div>
+      </div>
+      <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {history.map((r) => (
+          <LibraryTile
+            key={`${r.slug}-${r.installedAt}`}
+            record={r}
+            catalogPack={packBySlug.get(r.slug) ?? null}
+            latestVersionBySlug={latestVersionBySlug}
+            catalogReady={catalogReady}
+            onPick={onPick}
+            onRemove={onRemove}
+          />
+        ))}
+      </ul>
+    </div>
   );
 }
 
-// One row in the install-history list. Holds its own
-// verify/repair state machine so multiple rows can be in different
-// states at once (e.g. one verifying while another is showing a
-// repaired badge). Click-the-row still reinstalls; the Verify
-// button stops propagation so the two actions don't collide.
-function HistoryRow({
+// One tile in the library grid. Click the card → re-install /
+// update / detail (depending on InstallView's mode); the small
+// ✓ and ✕ affordances in the top-right run verify and uninstall
+// without taking you off the page. The same state machine the
+// old sidebar row had, just laid out for a wider card with cover
+// art on top.
+function LibraryTile({
   record,
+  catalogPack,
   latestVersionBySlug,
+  catalogReady,
   onPick,
   onRemove,
-  catalogReady,
 }: {
   record: InstallRecord;
+  catalogPack: CatalogPack | null;
   latestVersionBySlug: Map<string, string>;
+  catalogReady: boolean;
   onPick: (r: InstallRecord) => void;
   onRemove: (r: InstallRecord) => void;
-  catalogReady: boolean;
 }) {
   const [verify, setVerify] = useState<RowVerifyState>({ kind: "idle" });
-  const [uninstall, setUninstall] = useState<RowUninstallState>({ kind: "idle" });
+  const [uninstall, setUninstall] = useState<RowUninstallState>({
+    kind: "idle",
+  });
 
   const latest = latestVersionBySlug.get(record.slug);
   const updateAvailable =
@@ -956,9 +1151,6 @@ function HistoryRow({
     }
   }, [record.dest]);
 
-  // Uninstall flow: native confirm → uninstall_pack → either drop
-  // from history (clean run) or show inline partial-failure panel
-  // listing the locked files so the user can act on them.
   const runUninstall = useCallback(async () => {
     const ok = await ask(
       `Remove ${record.name} v${record.version}?\n\nDeletes the pack's files under ${record.dest}. The Mods/ folder and any other packs inside it are left alone.`,
@@ -966,15 +1158,12 @@ function HistoryRow({
     );
     if (!ok) return;
     setUninstall({ kind: "uninstalling" });
-    // Clear the verify panel — its state is about to be obsolete
-    // whether the uninstall succeeds or fails.
     setVerify({ kind: "idle" });
     try {
       const report = await invoke<UninstallReport>("uninstall_pack", {
         dest: record.dest,
       });
       if (report.filesFailed.length === 0) {
-        // Clean run — drop from history; the row unmounts.
         onRemove(record);
       } else {
         setUninstall({ kind: "partial", report });
@@ -993,87 +1182,101 @@ function HistoryRow({
     uninstall.kind === "uninstalling";
 
   return (
-    <li>
+    <li className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden hover:border-[var(--color-accent-soft)]/40 transition-colors group">
       <button
         type="button"
         onClick={() => onPick(record)}
         disabled={!catalogReady}
-        className="w-full text-left rounded-md px-3 py-2 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        className="w-full text-left disabled:opacity-60 disabled:cursor-not-allowed"
       >
-        <div className="flex items-center gap-1.5 mb-0.5">
-          <span className="text-xs font-medium text-[var(--color-text-bright)] truncate flex-1 min-w-0">
-            {record.name}
-          </span>
+        <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
+          <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+            no cover
+          </div>
+          <CoverImage
+            src={catalogPack?.coverImage}
+            className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+          />
+          <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
           {updateAvailable && (
             <span
               title={`Update available: v${latest}`}
-              className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
+              className="absolute top-2 left-2 inline-flex items-center gap-0.5 px-2 py-0.5 rounded text-[10px] tracking-wide uppercase font-medium bg-[var(--color-accent)]/20 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40 backdrop-blur-sm"
             >
               ↻ Update
             </span>
           )}
-          {/* Verify is a secondary action on the row — small, low-
-              contrast, and stops propagation so the surrounding
-              re-install button doesn't also fire. */}
-          <span
-            role="button"
-            tabIndex={0}
-            title="Verify installed files"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!inFlight) runVerify();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
+          {/* Inline action chips, top-right. role="button"-on-span +
+              stopPropagation so the outer click-to-pick doesn't fire
+              when the user wants to verify or uninstall. */}
+          <div className="absolute top-2 right-2 flex gap-1">
+            <span
+              role="button"
+              tabIndex={0}
+              title="Verify installed files"
+              onClick={(e) => {
                 e.stopPropagation();
                 if (!inFlight) runVerify();
-              }
-            }}
-            className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] hover:text-[var(--color-accent-soft)] hover:bg-[var(--color-bg-raised)]/60 cursor-pointer transition-colors"
-          >
-            {verify.kind === "verifying" || verify.kind === "repairing"
-              ? "…"
-              : "✓"}
-          </span>
-          {/* Uninstall is the destructive sibling — same low-
-              contrast styling, hover-only red so it doesn't read as
-              dangerous at rest. Native confirm gates the actual
-              delete. */}
-          <span
-            role="button"
-            tabIndex={0}
-            title="Uninstall pack"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!inFlight) runUninstall();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!inFlight) runVerify();
+                }
+              }}
+              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-[var(--color-bg-page)]/80 backdrop-blur-sm text-[var(--color-text-bright)]/85 ring-1 ring-[var(--color-bg-raised)]/40 hover:text-[var(--color-accent-soft)] cursor-pointer transition-colors"
+            >
+              {verify.kind === "verifying" || verify.kind === "repairing"
+                ? "…"
+                : "✓"}
+            </span>
+            <span
+              role="button"
+              tabIndex={0}
+              title="Uninstall pack"
+              onClick={(e) => {
                 e.stopPropagation();
                 if (!inFlight) runUninstall();
-              }
-            }}
-            className="shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide text-[var(--color-text-dim)] hover:text-[var(--color-status-danger)] hover:bg-[var(--color-bg-raised)]/60 cursor-pointer transition-colors"
-          >
-            {uninstall.kind === "uninstalling" ? "…" : "✕"}
-          </span>
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!inFlight) runUninstall();
+                }
+              }}
+              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-[var(--color-bg-page)]/80 backdrop-blur-sm text-[var(--color-text-bright)]/85 ring-1 ring-[var(--color-bg-raised)]/40 hover:text-[var(--color-status-danger)] cursor-pointer transition-colors"
+            >
+              {uninstall.kind === "uninstalling" ? "…" : "✕"}
+            </span>
+          </div>
         </div>
-        <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
-          <span className="font-mono truncate">
-            v{record.version}
-            {updateAvailable && (
-              <span className="text-[var(--color-accent-soft)]">
-                {" "}
-                → v{latest}
-              </span>
-            )}
-          </span>
-          <span className="shrink-0">{formatRelativeTime(record.installedAt)}</span>
+        <div className="p-4">
+          <div className="font-medium text-[var(--color-text-bright)] truncate mb-1">
+            {record.name}
+          </div>
+          <div className="text-[10px] text-[var(--color-text-dim)] flex items-center justify-between gap-2">
+            <span className="font-mono truncate">
+              v{record.version}
+              {updateAvailable && (
+                <span className="text-[var(--color-accent-soft)]">
+                  {" "}
+                  → v{latest}
+                </span>
+              )}
+            </span>
+            <span className="shrink-0">
+              {formatRelativeTime(record.installedAt)}
+            </span>
+          </div>
         </div>
       </button>
-      <VerifyStatus state={verify} onRepair={runRepair} onDismiss={() => setVerify({ kind: "idle" })} />
+      <VerifyStatus
+        state={verify}
+        onRepair={runRepair}
+        onDismiss={() => setVerify({ kind: "idle" })}
+      />
       <UninstallStatus
         state={uninstall}
         onRetry={runUninstall}
@@ -2508,6 +2711,301 @@ function FolderGlyph() {
         d="M2 5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5z"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+// Dashboard landing — the first view a user sees on launch.
+// Reuses the kitsune brand mark as a visual anchor, surfaces a
+// short "what you can do here" pitch, and shows recent installs
+// + a sign-in CTA when signed out. Lightweight on purpose — the
+// real Dashboard fleshes out in follow-up rounds once metrics
+// and notifications have backend support.
+function DashboardView({
+  auth,
+  history,
+  packBySlug,
+  onBrowse,
+  onOpenPack,
+  onSignIn,
+}: {
+  auth: AuthState;
+  history: InstallRecord[];
+  packBySlug: Map<string, CatalogPack>;
+  onBrowse: () => void;
+  onOpenPack: (p: CatalogPack) => void;
+  onSignIn: () => void;
+}) {
+  const greeting =
+    auth.kind === "signedIn"
+      ? `Welcome back, ${auth.user.displayName}`
+      : "Welcome to PackRelay";
+  const tagline =
+    auth.kind === "signedIn"
+      ? "Ready to sync, survivor?"
+      : "Sign in to save your library + servers to your account.";
+  const recent = history.slice(0, 4);
+
+  return (
+    <div className="px-6 py-8 max-w-5xl mx-auto">
+      <div className="mb-6">
+        <div className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)]">
+          {greeting.split(",")[0].toUpperCase()}
+        </div>
+        <h1 className="text-2xl font-semibold tracking-tight mt-1">
+          {greeting}
+        </h1>
+        <p className="text-sm text-[var(--color-text-dim)] mt-1">{tagline}</p>
+      </div>
+
+      {/* Hero card with the kitsune mark on the right. The grid
+          collapses to a single column on narrower viewports; the
+          mark is decorative so it just disappears below the text. */}
+      <div className="relative overflow-hidden rounded-2xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] mb-8">
+        <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-6 items-center px-6 sm:px-8 py-7">
+          <div className="min-w-0">
+            <div className="text-[10px] tracking-[0.22em] uppercase text-[var(--color-accent-soft)] mb-2">
+              Connect · Sync · Survive
+            </div>
+            <h2 className="text-xl font-semibold tracking-tight mb-2 text-[var(--color-text-bright)]">
+              Signed pack delivery for 7DTD.
+            </h2>
+            <p className="text-sm text-[var(--color-text-dim)] leading-relaxed max-w-md mb-5">
+              Browse a catalog of community-built modpacks, install
+              into your Mods/ directory in one click, and jump into a
+              server with the connect address already on your
+              clipboard.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={onBrowse}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
+              >
+                Browse packs
+              </button>
+              {auth.kind === "signedOut" && (
+                <button
+                  type="button"
+                  onClick={onSignIn}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-sm font-medium transition-colors"
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
+          </div>
+          <img
+            src="/logo-512x512.png"
+            alt=""
+            className="hidden sm:block size-40 select-none opacity-90"
+            draggable={false}
+          />
+        </div>
+      </div>
+
+      {recent.length > 0 && (
+        <div className="mb-8">
+          <div className="flex items-end justify-between mb-3">
+            <h2 className="text-sm font-semibold tracking-tight">
+              Recently installed
+            </h2>
+            <button
+              type="button"
+              onClick={onBrowse}
+              className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] transition-colors"
+            >
+              Browse more →
+            </button>
+          </div>
+          <ul className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {recent.map((r) => {
+              const pack = packBySlug.get(r.slug);
+              return (
+                <li key={`${r.slug}-${r.installedAt}`}>
+                  <button
+                    type="button"
+                    onClick={() => pack && onOpenPack(pack)}
+                    disabled={!pack}
+                    className="w-full text-left rounded-lg border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 overflow-hidden hover:border-[var(--color-accent-soft)]/40 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
+                      <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/40 text-[10px] tracking-[0.2em] uppercase">
+                        no cover
+                      </div>
+                      <CoverImage
+                        src={pack?.coverImage}
+                        className="absolute inset-0 w-full h-full object-cover"
+                      />
+                    </div>
+                    <div className="px-3 py-2">
+                      <div className="text-[12px] font-medium text-[var(--color-text-bright)] truncate">
+                        {r.name}
+                      </div>
+                      <div className="text-[10px] text-[var(--color-text-dim)] font-mono mt-0.5">
+                        v{r.version}
+                      </div>
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Settings — placeholder for now. Surfaces the auth chip's
+// info inline + sign-out button, since the rail's auth menu is
+// the only formal sign-out path today. Future iterations: API
+// URL toggle, default install dest override, theme picker.
+function SettingsView({
+  auth,
+  onSignOut,
+}: {
+  auth: AuthState;
+  onSignOut: () => void;
+}) {
+  return (
+    <div className="px-6 py-8 max-w-2xl">
+      <div className="mb-6">
+        <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
+        <p className="text-xs text-[var(--color-text-dim)] mt-1">
+          More options land here as the launcher grows — API URL toggle,
+          default install path, theme. Today: account.
+        </p>
+      </div>
+
+      <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+        <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
+          Account
+        </h2>
+        {auth.kind === "signedIn" ? (
+          <div className="space-y-2">
+            <div className="text-sm text-[var(--color-text-bright)]">
+              Signed in as{" "}
+              <span className="font-medium">{auth.user.displayName}</span>
+            </div>
+            <div className="text-[11px] text-[var(--color-text-dim)] uppercase tracking-wide">
+              {auth.user.role.replace("_", " ")} · {auth.user.plan} plan
+            </div>
+            <button
+              type="button"
+              onClick={onSignOut}
+              className="mt-3 inline-flex items-center px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-status-danger)]/50 hover:text-[var(--color-status-danger)] text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase transition-colors"
+            >
+              Sign out
+            </button>
+          </div>
+        ) : (
+          <p className="text-sm text-[var(--color-text-dim)]">
+            Sign in via the chip at the bottom of the left rail to save
+            your library + servers to your packrelay.cloud account.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Persistent status strip at the bottom of the window. v0 is
+// hard-coded — once we have a status API on packrelay.cloud the
+// "All Systems Operational" pill becomes live.
+function FooterStrip() {
+  return (
+    <footer className="shrink-0 border-t border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm px-6 py-2 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
+      <div className="inline-flex items-center gap-1.5">
+        <span className="size-1.5 rounded-full bg-[var(--color-status-success)] shadow-[0_0_6px_rgba(80,200,120,0.7)]" />
+        <span className="tracking-wide">All systems operational</span>
+      </div>
+      <div className="tracking-[0.14em] uppercase">
+        PackRelay Launcher · v0.1
+      </div>
+      <div className="tracking-wide">Connected to PackRelay Network</div>
+    </footer>
+  );
+}
+
+/* ---------- Rail glyphs ---------- */
+// Light-touch line icons sized to the 16-unit RailItem slot.
+// Pure SVG, currentColor for stroke so the active/inactive theme
+// flows from the parent without per-icon overrides.
+
+function HomeGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <path d="M3 7l5-4 5 4v6a1 1 0 0 1-1 1h-2v-4H6v4H4a1 1 0 0 1-1-1V7z" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function PackGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <path d="M8 1.5 2.5 4 8 6.5 13.5 4 8 1.5z" strokeLinejoin="round" />
+      <path d="M2.5 4v7.5L8 14l5.5-2.5V4" strokeLinejoin="round" />
+      <path d="M8 6.5V14" />
+    </svg>
+  );
+}
+
+function ServerGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2.5" y="3" width="11" height="4" rx="0.8" />
+      <rect x="2.5" y="9" width="11" height="4" rx="0.8" />
+      <circle cx="5" cy="5" r="0.7" fill="currentColor" />
+      <circle cx="5" cy="11" r="0.7" fill="currentColor" />
+    </svg>
+  );
+}
+
+function LibraryGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2.5" y="2.5" width="2.5" height="11" rx="0.6" />
+      <rect x="6.5" y="2.5" width="2.5" height="11" rx="0.6" />
+      <path d="M11.2 3.5l2.4.6-2 9-2.4-.6 2-9z" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function SettingsGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <circle cx="8" cy="8" r="2" />
+      <path d="M8 1.5v2M8 12.5v2M14.5 8h-2M3.5 8h-2M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4M12.6 12.6l-1.4-1.4M4.8 4.8L3.4 3.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function DiscordGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+      <path d="M4.5 4.5C5.5 4 6.7 3.7 8 3.7s2.5.3 3.5.8c1.5 2 2 4.3 1.8 6.5-.9.7-1.8 1.1-2.7 1.4l-.6-1c.4-.2.8-.4 1.2-.7-.1-.1-.2-.1-.3-.2-2 .9-4.2.9-6.2 0-.1.1-.2.1-.3.2.4.3.8.5 1.2.7l-.6 1c-.9-.3-1.8-.7-2.7-1.4-.2-2.2.3-4.5 1.8-6.5z" strokeLinejoin="round" />
+      <ellipse cx="6.2" cy="8.5" rx="0.8" ry="1" fill="currentColor" />
+      <ellipse cx="9.8" cy="8.5" rx="0.8" ry="1" fill="currentColor" />
+    </svg>
+  );
+}
+
+function NewsGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="11" height="9" rx="0.8" />
+      <path d="M4.5 6h5M4.5 8h5M4.5 10h3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function SupportGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <circle cx="8" cy="8" r="5.5" />
+      <path d="M6.3 6.5a1.8 1.8 0 1 1 2.5 1.7c-.5.2-.8.6-.8 1.1V10" strokeLinecap="round" />
+      <circle cx="8" cy="11.6" r="0.5" fill="currentColor" />
     </svg>
   );
 }
