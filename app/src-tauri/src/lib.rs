@@ -743,10 +743,154 @@ async fn launch_game(
         }
     }
 
+    // Preferred path: direct exe spawn with the connect args
+    // baked into the argv. Bypasses Steam's URI-argument stripping
+    // entirely. Only attempted when we actually have a connect
+    // address — bare-launch goes through Steam so the user lands
+    // on the main menu with Steam's launch flow intact.
+    if let Some(addr) = connect_address.as_deref() {
+        match try_spawn_seven_days(addr) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
+            }
+        }
+    }
+
     let url = build_launch_url(connect_address.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))
+}
+
+/// Try to spawn 7DaysToDie.exe directly with `-connecttoip` /
+/// `-connecttoport`. Direct spawn dodges Steam URI's habit of
+/// silently stripping args — we hand the game its arg vector and
+/// the OS, not Steam's URI parser, decides what reaches it.
+///
+/// Returns Ok(()) if the spawn succeeded (the game is now its own
+/// process; we don't wait on it). Returns Err with a message if
+/// we couldn't find the exe or the spawn itself failed — caller
+/// then falls back to the Steam URI path.
+///
+/// Steam still needs to be running for the client's session
+/// validation; in the common case Steam was the thing that
+/// installed 7DTD so it's already up. If not the user sees
+/// 7DTD's own "Steam is required" prompt rather than us
+/// silently failing.
+fn try_spawn_seven_days(connect_address: &str) -> Result<(), String> {
+    let Some(exe) = find_seven_days_exe() else {
+        return Err("client install not located".to_string());
+    };
+    let (host, port) = parse_connect_address(connect_address);
+    if host.is_empty() || !is_safe_host(&host) {
+        return Err("connect address didn't pass safety check".to_string());
+    }
+
+    // cwd matters — 7DTD looks for sibling _Data dir at startup.
+    let cwd = exe.parent().ok_or_else(|| "exe has no parent dir".to_string())?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.current_dir(cwd)
+        .arg(format!("-connecttoip={host}"))
+        .arg(format!("-connecttoport={port}"));
+
+    // Detach the child so closing the launcher doesn't take 7DTD
+    // down with it. On Windows DETACHED_PROCESS gives the child
+    // no console; CREATE_NEW_PROCESS_GROUP keeps Ctrl-C in the
+    // parent from propagating.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    cmd.spawn().map(|_| ()).map_err(|e| format!("spawn: {e}"))
+}
+
+/// Locate 7DaysToDie.exe by walking every Steam library on the
+/// machine. Steam stores library paths in
+/// `<steam>/steamapps/libraryfolders.vdf`; we parse it loosely
+/// (find every `"path" "<value>"` entry) and probe the canonical
+/// `steamapps/common/7 Days To Die/7DaysToDie.exe` subpath in
+/// each. Returns the first hit.
+///
+/// We don't cache the result — call sites fire on user click
+/// (rare), and an install can move between calls (e.g. Steam
+/// rebalances libraries). The whole probe is a few stats; cheap.
+fn find_seven_days_exe() -> Option<PathBuf> {
+    let mut steam_roots: Vec<PathBuf> = Vec::new();
+    if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
+        steam_roots.push(PathBuf::from(pf86).join("Steam"));
+    }
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        steam_roots.push(PathBuf::from(pf).join("Steam"));
+    }
+
+    let mut libraries: Vec<PathBuf> = Vec::new();
+    for root in &steam_roots {
+        // Default Steam install also IS a library — include it
+        // even if libraryfolders.vdf doesn't list it.
+        libraries.push(root.clone());
+        let vdf = root.join("steamapps").join("libraryfolders.vdf");
+        if let Ok(raw) = std::fs::read_to_string(&vdf) {
+            libraries.extend(parse_vdf_library_paths(&raw));
+        }
+    }
+
+    // Dedup with a HashSet so a path that appears in multiple
+    // Steam VDFs isn't probed twice.
+    let mut seen = std::collections::HashSet::new();
+    for lib in libraries {
+        if !seen.insert(lib.clone()) {
+            continue;
+        }
+        let exe = lib
+            .join("steamapps")
+            .join("common")
+            .join("7 Days To Die")
+            .join("7DaysToDie.exe");
+        if exe.exists() {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// Pull every `"path" "<value>"` quoted-string pair out of a
+/// libraryfolders.vdf. We don't try to fully parse the Valve
+/// KeyValues format — only the path entries matter, and they
+/// always sit on a single line in the format Steam writes.
+fn parse_vdf_library_paths(raw: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        // Each library entry has `"path"   "<value>"` on its own
+        // line — be tolerant about the variable whitespace between
+        // the key and value, and accept the rare uppercase key
+        // that older Steam versions wrote.
+        let Some(rest) = line
+            .strip_prefix("\"path\"")
+            .or_else(|| line.strip_prefix("\"Path\""))
+        else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        // VDF escapes backslashes — "C:\\Program Files\\Steam".
+        // Unescape so the resulting PathBuf round-trips back to
+        // a usable Windows path.
+        let unescaped = rest[..end].replace("\\\\", "\\");
+        out.push(PathBuf::from(unescaped));
+    }
+    out
 }
 
 /// Build the Steam URI we open to launch 7DTD. Without a connect
