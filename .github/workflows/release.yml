@@ -113,6 +113,25 @@ jobs:
           # publish but in-app auto-update is a no-op.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS notarization — see docs/NOTARIZATION.md for the
+          # one-time cert export + secrets walkthrough. When ALL
+          # six secrets below are set, tauri-action:
+          #   1. Imports the .p12 cert into a temporary keychain
+          #      using APPLE_SIGNING_IDENTITY as the codesign-find key.
+          #   2. Codesigns the .app + .dmg bundles.
+          #   3. Submits to Apple's notary service via notarytool
+          #      using APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID.
+          #   4. Staples the notarization ticket to the .dmg.
+          # When any are unset, codesign + notarize skip silently
+          # and macOS users get the "right-click → Open" warning
+          # on first launch (the existing pre-notarization state).
+          # Linux + Windows jobs ignore these env vars regardless.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           # The Tauri app lives in app/, not at the repo root, so
           # the action needs the project path to find tauri.conf.json.
@@ -132,9 +151,10 @@ jobs:
             this release is built by GitHub Actions directly from
             this repo's source.
 
-            **macOS users:** the .app isn't notarized yet either, so
-            you'll need to right-click → Open the first time
-            instead of double-clicking.
+            **macOS users:** the .dmg is signed + notarized — open
+            normally. (If you happen to land on an older v0.1.x
+            release that pre-dates this, you'll need to right-click
+            → Open the first time.)
 
             See the README for what's in this release.
           # Mark every release as a draft so we get a chance to
