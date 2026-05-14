@@ -526,6 +526,117 @@ async fn sign_out(app: AppHandle) -> Result<AuthState, String> {
     Ok(AuthState::SignedOut)
 }
 
+// ---------- Favorites ----------
+
+/// Wire shape the launcher consumes from /api/v1/me/favorites.
+/// Two slug sets the React side merges client-side with the
+/// catalog list to render filled vs hollow hearts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyFavorites {
+    pub packs: Vec<String>,
+    pub servers: Vec<String>,
+}
+
+/// Wire shape returned by the toggle endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteToggleResult {
+    pub favorited: bool,
+    pub count: i64,
+}
+
+/// Read the persisted auth token from disk. The favorites
+/// endpoints all require it — un-signed-in users see the page
+/// without filled hearts and toggling is disabled in the UI, so
+/// the command surface fails fast with a clear error rather than
+/// hitting the cloud and returning 401.
+async fn require_auth_token(app: &AppHandle) -> Result<String, String> {
+    match load_stored_token(app).await {
+        Ok(Some(token)) => Ok(token),
+        Ok(None) => Err("Sign in to favorite packs and servers.".to_string()),
+        Err(e) => Err(format!("reading saved token: {e:#}")),
+    }
+}
+
+/// Fetch the signed-in user's full favorites set in one round-trip.
+/// Launcher calls this on boot + after every successful toggle so
+/// the UI's heart state stays in sync.
+#[tauri::command]
+async fn fetch_my_favorites(app: AppHandle) -> Result<MyFavorites, String> {
+    let token = require_auth_token(&app).await?;
+    let http = reqwest::Client::builder()
+        .user_agent(user_agent_string())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{DEFAULT_API_URL}/api/v1/me/favorites");
+    let res = http
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Your token was rejected — sign in again.".to_string());
+    }
+    if !res.status().is_success() {
+        return Err(format!(
+            "fetching favorites failed: HTTP {}",
+            res.status()
+        ));
+    }
+    res.json::<MyFavorites>()
+        .await
+        .map_err(|e| format!("parsing favorites: {e}"))
+}
+
+#[tauri::command]
+async fn toggle_pack_favorite(
+    app: AppHandle,
+    slug: String,
+) -> Result<FavoriteToggleResult, String> {
+    let token = require_auth_token(&app).await?;
+    toggle_favorite_impl(&token, &format!("/api/v1/packs/{slug}/favorite")).await
+}
+
+#[tauri::command]
+async fn toggle_server_favorite(
+    app: AppHandle,
+    slug: String,
+) -> Result<FavoriteToggleResult, String> {
+    let token = require_auth_token(&app).await?;
+    toggle_favorite_impl(&token, &format!("/api/v1/servers/{slug}/favorite")).await
+}
+
+async fn toggle_favorite_impl(
+    token: &str,
+    path: &str,
+) -> Result<FavoriteToggleResult, String> {
+    let http = reqwest::Client::builder()
+        .user_agent(user_agent_string())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{DEFAULT_API_URL}{path}");
+    let res = http
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Your token was rejected — sign in again.".to_string());
+    }
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err("That pack or server no longer exists.".to_string());
+    }
+    if !res.status().is_success() {
+        return Err(format!("favorite toggle failed: HTTP {}", res.status()));
+    }
+    res.json::<FavoriteToggleResult>()
+        .await
+        .map_err(|e| format!("parsing toggle response: {e}"))
+}
+
 /// One entry in a pack's "what's inside" overview. Each top-level
 /// directory in the manifest's file list is one mod, by 7DTD's
 /// pack-on-disk convention (Mods/<ModName>/ModInfo.xml).
@@ -1064,7 +1175,10 @@ pub fn run() {
             profile_snapshot_active,
             profile_list_snapshots,
             profile_restore_snapshot,
-            fetch_pack_overview
+            fetch_pack_overview,
+            fetch_my_favorites,
+            toggle_pack_favorite,
+            toggle_server_favorite
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

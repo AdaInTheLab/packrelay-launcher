@@ -20,6 +20,7 @@ type CatalogPack = {
   fileCount: number;
   totalSizeBytes: number;
   downloadCount: number;
+  favoriteCount: number;
   createdAt: string;
 };
 
@@ -48,6 +49,7 @@ type CatalogServer = {
   createdAt: string;
   online: boolean;
   uptimePct: number;
+  favoriteCount: number;
   attachedPack: AttachedPack | null;
 };
 
@@ -404,6 +406,164 @@ function App() {
   const [auth, setAuth] = useState<AuthState>({ kind: "signedOut" });
   const [showSignIn, setShowSignIn] = useState(false);
 
+  // Favorites: two Sets of slugs the signed-in user has hearted.
+  // Sourced from /api/v1/me/favorites, refreshed after every
+  // toggle so the heart state stays in sync across views without
+  // per-card auth roundtrips. Null when we haven't fetched yet
+  // (uninitialized vs "empty set" — matters for first-paint).
+  const [packFavs, setPackFavs] = useState<Set<string> | null>(null);
+  const [serverFavs, setServerFavs] = useState<Set<string> | null>(null);
+
+  const refreshFavorites = useCallback(async () => {
+    try {
+      const f = await invoke<{ packs: string[]; servers: string[] }>(
+        "fetch_my_favorites"
+      );
+      setPackFavs(new Set(f.packs));
+      setServerFavs(new Set(f.servers));
+    } catch {
+      // Signed out, network blip, etc — leave state as-is. UI
+      // gracefully degrades to "no filled hearts" rather than
+      // surfacing an error banner for a non-essential signal.
+    }
+  }, []);
+
+  // Toggle a single pack heart, optimistically updating local
+  // state and rolling back if the network call fails. Bumps the
+  // catalog's favoriteCount in place too so cards re-render
+  // without a full list_packs refetch.
+  const togglePackFavorite = useCallback(async (slug: string) => {
+    let previous: { wasFavorited: boolean; previousCount: number } | null =
+      null;
+    setPackFavs((curr) => {
+      const next = new Set(curr ?? []);
+      previous = {
+        wasFavorited: next.has(slug),
+        previousCount: 0, // populated below from packs state
+      };
+      if (next.has(slug)) next.delete(slug);
+      else next.add(slug);
+      return next;
+    });
+    setPacks((curr) => {
+      if (!curr) return curr;
+      return curr.map((p) => {
+        if (p.slug !== slug) return p;
+        if (previous) previous.previousCount = p.favoriteCount;
+        return {
+          ...p,
+          favoriteCount: previous?.wasFavorited
+            ? Math.max(0, p.favoriteCount - 1)
+            : p.favoriteCount + 1,
+        };
+      });
+    });
+    try {
+      const result = await invoke<{ favorited: boolean; count: number }>(
+        "toggle_pack_favorite",
+        { slug }
+      );
+      // Reconcile against the authoritative server count in case
+      // we and the server disagreed (e.g. parallel toggles from
+      // another device).
+      setPacks((curr) =>
+        curr
+          ? curr.map((p) =>
+              p.slug === slug ? { ...p, favoriteCount: result.count } : p
+            )
+          : curr
+      );
+      setPackFavs((curr) => {
+        const next = new Set(curr ?? []);
+        if (result.favorited) next.add(slug);
+        else next.delete(slug);
+        return next;
+      });
+    } catch {
+      // Roll back the optimistic update.
+      if (previous) {
+        const prev: { wasFavorited: boolean; previousCount: number } =
+          previous;
+        setPackFavs((curr) => {
+          const next = new Set(curr ?? []);
+          if (prev.wasFavorited) next.add(slug);
+          else next.delete(slug);
+          return next;
+        });
+        setPacks((curr) =>
+          curr
+            ? curr.map((p) =>
+                p.slug === slug ? { ...p, favoriteCount: prev.previousCount } : p
+              )
+            : curr
+        );
+      }
+    }
+  }, []);
+
+  // Same shape for servers.
+  const toggleServerFavorite = useCallback(async (slug: string) => {
+    let previous: { wasFavorited: boolean; previousCount: number } | null =
+      null;
+    setServerFavs((curr) => {
+      const next = new Set(curr ?? []);
+      previous = { wasFavorited: next.has(slug), previousCount: 0 };
+      if (next.has(slug)) next.delete(slug);
+      else next.add(slug);
+      return next;
+    });
+    setServers((curr) => {
+      if (!curr) return curr;
+      return curr.map((s) => {
+        if (s.slug !== slug) return s;
+        if (previous) previous.previousCount = s.favoriteCount;
+        return {
+          ...s,
+          favoriteCount: previous?.wasFavorited
+            ? Math.max(0, s.favoriteCount - 1)
+            : s.favoriteCount + 1,
+        };
+      });
+    });
+    try {
+      const result = await invoke<{ favorited: boolean; count: number }>(
+        "toggle_server_favorite",
+        { slug }
+      );
+      setServers((curr) =>
+        curr
+          ? curr.map((s) =>
+              s.slug === slug ? { ...s, favoriteCount: result.count } : s
+            )
+          : curr
+      );
+      setServerFavs((curr) => {
+        const next = new Set(curr ?? []);
+        if (result.favorited) next.add(slug);
+        else next.delete(slug);
+        return next;
+      });
+    } catch {
+      if (previous) {
+        const prev: { wasFavorited: boolean; previousCount: number } =
+          previous;
+        setServerFavs((curr) => {
+          const next = new Set(curr ?? []);
+          if (prev.wasFavorited) next.add(slug);
+          else next.delete(slug);
+          return next;
+        });
+        setServers((curr) =>
+          curr
+            ? curr.map((s) =>
+                s.slug === slug ? { ...s, favoriteCount: prev.previousCount } : s
+              )
+            : curr
+        );
+      }
+    }
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
@@ -434,12 +594,27 @@ function App() {
       try {
         const state = await invoke<AuthState>("get_auth_state");
         setAuth(state);
+        // If we're signed in on boot, prefetch the favorites
+        // set so hearts render filled immediately on first paint.
+        if (state.kind === "signedIn") void refreshFavorites();
       } catch {
         // Token validation network error etc — stay signed out;
         // the user can re-paste when they want.
       }
     })();
-  }, []);
+  }, [refreshFavorites]);
+
+  // After sign-in flow lands, refresh favorites so the cards
+  // start rendering filled hearts without waiting for a manual
+  // page refresh.
+  useEffect(() => {
+    if (auth.kind === "signedIn") {
+      void refreshFavorites();
+    } else {
+      setPackFavs(null);
+      setServerFavs(null);
+    }
+  }, [auth.kind, refreshFavorites]);
 
   const handleSignOut = useCallback(async () => {
     try {
@@ -633,6 +808,10 @@ function App() {
         <DetailView
           pack={selectedPack}
           installedRecord={installedRecord}
+          favorited={packFavs?.has(selectedPack.slug) ?? false}
+          signedIn={auth.kind === "signedIn"}
+          onToggleFavorite={() => togglePackFavorite(selectedPack.slug)}
+          onSignInRequest={() => setShowSignIn(true)}
           onBack={() => setSelectedPack(null)}
           onInstall={() => setPackView("install")}
         />
@@ -657,6 +836,10 @@ function App() {
             : null
         }
         installedRecord={attachedInstalled}
+        favorited={serverFavs?.has(selectedServer.slug) ?? false}
+        signedIn={auth.kind === "signedIn"}
+        onToggleFavorite={() => toggleServerFavorite(selectedServer.slug)}
+        onSignInRequest={() => setShowSignIn(true)}
         onBack={() => setSelectedServer(null)}
         onInstall={(pack) => openPackInstall(pack)}
       />
@@ -1846,7 +2029,14 @@ function BrowseView({
                     </div>
                   )}
                   <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
-                    <span>{p.fileCount.toLocaleString()} files</span>
+                    <span className="inline-flex items-center gap-1">
+                      <HeartGlyph filled={false} />
+                      <span className="tabular-nums">
+                        {p.favoriteCount.toLocaleString()}
+                      </span>
+                      <span className="text-[var(--color-bg-raised)]">·</span>
+                      <span>{p.fileCount.toLocaleString()} files</span>
+                    </span>
                     <span>{formatBytes(p.totalSizeBytes)}</span>
                   </div>
                 </div>
@@ -2240,11 +2430,19 @@ type PackDirEntry = {
 function DetailView({
   pack,
   installedRecord,
+  favorited,
+  signedIn,
+  onToggleFavorite,
+  onSignInRequest,
   onBack,
   onInstall,
 }: {
   pack: CatalogPack;
   installedRecord: InstallRecord | null;
+  favorited: boolean;
+  signedIn: boolean;
+  onToggleFavorite: () => void;
+  onSignInRequest: () => void;
   onBack: () => void;
   onInstall: () => void;
 }) {
@@ -2308,13 +2506,22 @@ function DetailView({
 
   return (
     <div className="px-6 py-8 max-w-3xl mx-auto">
-      <button
-        type="button"
-        onClick={onBack}
-        className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] mb-4"
-      >
-        ← BROWSE
-      </button>
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)]"
+        >
+          ← BROWSE
+        </button>
+        <HeartButton
+          count={pack.favoriteCount}
+          favorited={favorited}
+          signedIn={signedIn}
+          onToggle={onToggleFavorite}
+          onSignInRequest={onSignInRequest}
+        />
+      </div>
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
         <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
@@ -2752,8 +2959,19 @@ function ServerCard({
         )}
       </div>
       <div className="p-4">
-        <div className="font-medium text-[var(--color-text-bright)] truncate mb-1">
-          {s.name}
+        <div className="flex items-center gap-2 mb-1">
+          <span className="font-medium text-[var(--color-text-bright)] truncate flex-1 min-w-0">
+            {s.name}
+          </span>
+          {s.favoriteCount > 0 && (
+            <span
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] text-[var(--color-text-dim)] tabular-nums"
+              title={`${s.favoriteCount} favorite${s.favoriteCount === 1 ? "" : "s"}`}
+            >
+              <HeartGlyph filled={false} />
+              {s.favoriteCount.toLocaleString()}
+            </span>
+          )}
         </div>
         {s.attachedPack ? (
           <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
@@ -2809,6 +3027,10 @@ function ServerDetailView({
   server,
   attachedPack,
   installedRecord,
+  favorited,
+  signedIn,
+  onToggleFavorite,
+  onSignInRequest,
   onBack,
   onInstall,
 }: {
@@ -2821,6 +3043,10 @@ function ServerDetailView({
    *  the bottom-card variant — "Connect" when versions align,
    *  "Update & connect" when we're behind, "Install" otherwise. */
   installedRecord: InstallRecord | null;
+  favorited: boolean;
+  signedIn: boolean;
+  onToggleFavorite: () => void;
+  onSignInRequest: () => void;
   onBack: () => void;
   onInstall: (pack: CatalogPack) => void;
 }) {
@@ -2847,13 +3073,22 @@ function ServerDetailView({
   })();
   return (
     <div className="px-6 py-8 max-w-2xl mx-auto">
-      <button
-        type="button"
-        onClick={onBack}
-        className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] mb-4"
-      >
-        ← SERVERS
-      </button>
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)]"
+        >
+          ← SERVERS
+        </button>
+        <HeartButton
+          count={server.favoriteCount}
+          favorited={favorited}
+          signedIn={signedIn}
+          onToggle={onToggleFavorite}
+          onSignInRequest={onSignInRequest}
+        />
+      </div>
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
         <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
@@ -3027,6 +3262,68 @@ function ServerDetailView({
 // publishers control coverImage URLs — the launcher shouldn't show
 // the browser's torn-corner glyph if a publisher's CDN is down or
 // the seed data points at a missing asset.
+// Heart toggle used on pack + server detail pages. Three visual
+// states:
+//   signed out  → outline heart, disabled, tooltip "sign in to
+//                 favorite". Count is still shown.
+//   not favorited → outline heart, clickable.
+//   favorited   → filled accent-soft heart, clickable to remove.
+//
+// The toggle itself happens at App level via togglePackFavorite
+// / toggleServerFavorite; this component is purely presentational.
+function HeartButton({
+  count,
+  favorited,
+  signedIn,
+  onToggle,
+  onSignInRequest,
+  size = "md",
+}: {
+  count: number;
+  favorited: boolean;
+  signedIn: boolean;
+  onToggle: () => void;
+  onSignInRequest: () => void;
+  size?: "sm" | "md";
+}) {
+  const padding = size === "sm" ? "px-2 py-1" : "px-3 py-1.5";
+  const fontSize = size === "sm" ? "text-[10px]" : "text-[11px]";
+  return (
+    <button
+      type="button"
+      onClick={signedIn ? onToggle : onSignInRequest}
+      title={signedIn ? (favorited ? "Remove from favorites" : "Add to favorites") : "Sign in to favorite"}
+      className={`inline-flex items-center gap-1.5 ${padding} rounded-md border tracking-wide transition-colors ${fontSize} tabular-nums ${
+        favorited
+          ? "border-[var(--color-accent-soft)]/50 bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] hover:bg-[var(--color-accent)]/25"
+          : "border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 text-[var(--color-text-dim)] hover:border-[var(--color-accent-soft)]/30 hover:text-[var(--color-accent-soft)]"
+      }`}
+    >
+      <HeartGlyph filled={favorited} />
+      {count.toLocaleString()}
+    </button>
+  );
+}
+
+function HeartGlyph({ filled }: { filled: boolean }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill={filled ? "currentColor" : "none"}
+      stroke="currentColor"
+      strokeWidth="1.5"
+      aria-hidden="true"
+    >
+      <path
+        d="M8 13.5s-5.5-3.4-5.5-7A2.8 2.8 0 0 1 5.3 3.7c1 0 1.9.5 2.7 1.4.8-.9 1.7-1.4 2.7-1.4a2.8 2.8 0 0 1 2.8 2.8c0 3.6-5.5 7-5.5 7z"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function CoverImage({
   src,
   className,
