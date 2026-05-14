@@ -639,6 +639,15 @@ function App() {
       );
     }
   } else if (selectedServer) {
+    // Look up the attached pack's install state so the detail
+    // view can swap between "Install" / "Update" / "Connect"
+    // depending on what's already on disk vs what the server's
+    // pinned to.
+    const attachedSlug = selectedServer.attachedPack?.slug;
+    const attachedInstalled =
+      attachedSlug != null
+        ? history.find((r) => r.slug === attachedSlug) ?? null
+        : null;
     mainContent = (
       <ServerDetailView
         server={selectedServer}
@@ -647,6 +656,7 @@ function App() {
             ? packBySlug.get(selectedServer.attachedPack.slug) ?? null
             : null
         }
+        installedRecord={attachedInstalled}
         onBack={() => setSelectedServer(null)}
         onInstall={(pack) => openPackInstall(pack)}
       />
@@ -2729,6 +2739,7 @@ function ServerCard({
 function ServerDetailView({
   server,
   attachedPack,
+  installedRecord,
   onBack,
   onInstall,
 }: {
@@ -2737,10 +2748,34 @@ function ServerDetailView({
    *  has no pack OR the catalog hasn't loaded yet (we can't install
    *  what we don't have full metadata for). */
   attachedPack: CatalogPack | null;
+  /** Install-history record for the attached pack, if any. Drives
+   *  the bottom-card variant — "Connect" when versions align,
+   *  "Update & connect" when we're behind, "Install" otherwise. */
+  installedRecord: InstallRecord | null;
   onBack: () => void;
   onInstall: (pack: CatalogPack) => void;
 }) {
   const cover = server.attachedPack?.coverImage;
+
+  // Three-state truth table for the bottom card:
+  //   not-installed → install (existing behavior)
+  //   needs-update  → user has the pack but at the wrong version
+  //   current       → the installed version is correct; offer
+  //                   direct Connect.
+  //
+  // "Wrong version" prefers the server's pinned attachedVersion
+  // (what THIS server is running). When the server hasn't pinned
+  // a version we fall back to the catalog's latest — the server
+  // probably auto-updates to it.
+  const targetVersion =
+    server.attachedPack?.attachedVersion ?? attachedPack?.latestVersion ?? null;
+  const installState: "not-installed" | "needs-update" | "current" = (() => {
+    if (!installedRecord) return "not-installed";
+    if (targetVersion && installedRecord.version !== targetVersion) {
+      return "needs-update";
+    }
+    return "current";
+  })();
   return (
     <div className="px-6 py-8 max-w-2xl mx-auto">
       <button
@@ -2808,7 +2843,11 @@ function ServerDetailView({
         attachedPack ? (
           <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
             <div className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-2">
-              Install the pack
+              {installState === "current"
+                ? "Ready to play"
+                : installState === "needs-update"
+                  ? "Update available"
+                  : "Install the pack"}
             </div>
             <div className="flex items-start gap-3 mb-4">
               <div className="size-14 rounded-md bg-[var(--color-bg-raised)] shrink-0 relative overflow-hidden">
@@ -2818,11 +2857,25 @@ function ServerDetailView({
                 />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium text-[var(--color-text-bright)] truncate">
+                <div className="text-sm font-medium text-[var(--color-text-bright)] truncate flex items-center gap-1.5 flex-wrap">
                   {attachedPack.name}
-                  {attachedPack.latestVersion && (
-                    <span className="font-mono text-[11px] text-[var(--color-text-dim)] ml-1.5">
-                      v{attachedPack.latestVersion}
+                  {targetVersion && (
+                    <span className="font-mono text-[11px] text-[var(--color-text-dim)]">
+                      v{targetVersion}
+                    </span>
+                  )}
+                  {installState === "current" && (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] tracking-[0.14em] uppercase font-medium bg-[var(--color-status-success)]/15 text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40">
+                      <span className="size-1 rounded-full bg-[var(--color-status-success)]" />
+                      Installed
+                    </span>
+                  )}
+                  {installState === "needs-update" && installedRecord && (
+                    <span
+                      title={`Installed v${installedRecord.version}`}
+                      className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] tracking-[0.14em] uppercase font-medium bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
+                    >
+                      v{installedRecord.version} → v{targetVersion}
                     </span>
                   )}
                 </div>
@@ -2833,18 +2886,32 @@ function ServerDetailView({
                 </div>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => onInstall(attachedPack)}
-              className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
-            >
-              Install pack & get connect address
-            </button>
-            <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-              We&apos;ll lay down the pack files, then surface the
-              direct-connect address so you can paste it into the
-              7DTD launcher.
-            </p>
+
+            {installState === "current" && server.connectAddress ? (
+              // Already installed at the right version: skip the
+              // install flow entirely and offer one-click connect.
+              // The button copies the address (clipboard fallback)
+              // and asks launch_game to spawn the client directly
+              // into the server.
+              <ConnectButton address={server.connectAddress} />
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onInstall(attachedPack)}
+                  className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
+                >
+                  {installState === "needs-update"
+                    ? `Update to v${targetVersion ?? "?"} & connect`
+                    : "Install pack & get connect address"}
+                </button>
+                <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+                  {installState === "needs-update"
+                    ? "Smart update only refetches the changed files. We'll surface the direct-connect address when it lands."
+                    : "We'll lay down the pack files, then surface the direct-connect address so you can paste it into the 7DTD launcher."}
+                </p>
+              </>
+            )}
           </div>
         ) : (
           <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5 text-sm text-[var(--color-text-dim)]">
@@ -2934,6 +3001,78 @@ function ConnectCopy({ address }: { address: string }) {
       >
         {copied ? "Copied" : "Copy"}
       </button>
+    </div>
+  );
+}
+
+// Single-button "Connect" affordance used in the ServerDetailView
+// when the attached pack is already installed at the correct
+// version — at that point the install card is just noise and what
+// the user wants is to jump straight into the server.
+//
+// Same launch_game invocation as LaunchPanel under the hood (so
+// it picks up the direct-spawn-with-args fast path when we can
+// find 7DaysToDie.exe, and falls through to the Steam URI when
+// we can't). The address is also primed to clipboard before the
+// launch so any arg-stripping at the Steam layer still leaves
+// the user one paste away from joining.
+function ConnectButton({ address }: { address: string }) {
+  const [state, setState] = useState<
+    | { kind: "idle" }
+    | { kind: "launching" }
+    | { kind: "launched" }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  const connect = useCallback(async () => {
+    setState({ kind: "launching" });
+    try {
+      await navigator.clipboard.writeText(address);
+    } catch {
+      // Non-fatal — address stays visible in the Connect Address
+      // card above. The user can manually copy if needed.
+    }
+    try {
+      await invoke("launch_game", { connectAddress: address });
+      setState({ kind: "launched" });
+    } catch (e) {
+      setState({ kind: "error", message: String(e) });
+    }
+  }, [address]);
+
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        onClick={connect}
+        disabled={state.kind === "launching"}
+        className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+      >
+        {state.kind === "launching" ? "Launching…" : "Connect"}
+      </button>
+      {state.kind === "idle" && (
+        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+          Launches 7DTD and joins this server. If the auto-connect
+          drops you on the main menu, the address is on your
+          clipboard for a manual paste.
+        </p>
+      )}
+      {state.kind === "launched" && (
+        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+          7DTD is launching with the connect args. If the menu
+          loads instead of the server, paste the address into{" "}
+          <span className="text-[var(--color-text-bright)]">
+            Join a Game → Connect to IP
+          </span>
+          .
+        </p>
+      )}
+      {state.kind === "error" && (
+        <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed break-words">
+          Couldn&apos;t launch 7DTD: {state.message}. Address is on
+          your clipboard for a manual launch.
+        </p>
+      )}
     </div>
   );
 }
