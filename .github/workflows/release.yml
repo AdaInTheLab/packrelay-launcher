@@ -66,23 +66,24 @@ jobs:
 
       - name: Install Linux system deps
         if: matrix.platform == 'ubuntu-22.04'
-        # Tauri's Linux runtime deps. Versions tracked to whatever
-        # ubuntu-22.04 ships; bump alongside Tauri's prerequisites
-        # doc when we upgrade the framework.
+        # Tauri 2's Linux runtime deps. Keep the ayatana fork — the
+        # older libappindicator3-dev *conflicts* with it (one is the
+        # GTK upstream, the other the Ubuntu/Mate fork), so listing
+        # both made apt refuse the whole install. Ayatana is what
+        # Tauri actually compiles against.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
             build-essential \
             curl \
             wget \
             file \
-            libssl-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+            libssl-dev
 
       - name: Setup Node
         uses: actions/setup-node@v4
