@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import "./App.css";
 
@@ -43,10 +44,27 @@ type InstallState =
   | { kind: "done"; report: InstallReport }
   | { kind: "error"; message: string };
 
-const PACKRELAY_DEFAULT_DEST =
-  navigator.platform.toLowerCase().includes("win")
-    ? "C:\\7DaysToDie\\Mods"
-    : "/opt/7DaysToDie/Mods";
+/** A row in the local install-history list. Stored in localStorage
+ *  as a JSON array under HISTORY_STORAGE_KEY. */
+type InstallRecord = {
+  slug: string;
+  name: string;
+  version: string;
+  dest: string;
+  totalBytes: number;
+  fileCount: number;
+  /** ISO timestamp of when the install completed. */
+  installedAt: string;
+};
+
+const HISTORY_STORAGE_KEY = "packrelay.installHistory.v1";
+const HISTORY_MAX_ENTRIES = 50;
+
+const PACKRELAY_DEFAULT_DEST = navigator.platform
+  .toLowerCase()
+  .includes("win")
+  ? "C:\\7DaysToDie\\Mods"
+  : "/opt/7DaysToDie/Mods";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -55,10 +73,41 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+function formatRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  const deltaSec = Math.max(0, (Date.now() - then) / 1000);
+  if (deltaSec < 60) return "just now";
+  if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}m ago`;
+  if (deltaSec < 86400) return `${Math.floor(deltaSec / 3600)}h ago`;
+  return `${Math.floor(deltaSec / 86400)}d ago`;
+}
+
+function loadHistory(): InstallRecord[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed as InstallRecord[];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(entries: InstallRecord[]): void {
+  try {
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries));
+  } catch {
+    // Storage quota or private-mode disabled. History is a nice-to-
+    // have, not a critical feature — skip silently.
+  }
+}
+
 function App() {
   const [packs, setPacks] = useState<CatalogPack[] | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [selected, setSelected] = useState<CatalogPack | null>(null);
+  const [history, setHistory] = useState<InstallRecord[]>(() => loadHistory());
 
   useEffect(() => {
     (async () => {
@@ -71,27 +120,73 @@ function App() {
     })();
   }, []);
 
+  const recordInstall = useCallback(
+    (pack: CatalogPack, report: InstallReport) => {
+      const entry: InstallRecord = {
+        slug: pack.slug,
+        name: report.displayName,
+        version: report.version,
+        dest: report.dest,
+        totalBytes: report.totalBytes,
+        fileCount: report.fileCount,
+        installedAt: new Date().toISOString(),
+      };
+      setHistory((prev) => {
+        // Dedup: drop any prior entry for the same slug — the latest
+        // install of a pack is what matters; older entries for the
+        // same slug just clutter the sidebar.
+        const next = [entry, ...prev.filter((r) => r.slug !== pack.slug)];
+        const trimmed = next.slice(0, HISTORY_MAX_ENTRIES);
+        saveHistory(trimmed);
+        return trimmed;
+      });
+    },
+    []
+  );
+
+  const reinstallFromHistory = useCallback(
+    (record: InstallRecord) => {
+      // If the catalog has a matching pack, drill into InstallView
+      // with it pre-selected. Otherwise the pack was removed since;
+      // surface a soft error by ignoring the click.
+      const match = packs?.find((p) => p.slug === record.slug);
+      if (match) setSelected(match);
+    },
+    [packs]
+  );
+
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
-      <main className="flex-1 overflow-y-auto">
-        {selected ? (
-          <InstallView pack={selected} onBack={() => setSelected(null)} />
-        ) : (
-          <BrowseView
-            packs={packs}
-            error={catalogError}
-            onSelect={setSelected}
-          />
-        )}
-      </main>
+      <div className="flex-1 flex min-h-0">
+        <HistorySidebar
+          history={history}
+          onPick={reinstallFromHistory}
+          catalogReady={packs !== null}
+        />
+        <main className="flex-1 overflow-y-auto">
+          {selected ? (
+            <InstallView
+              pack={selected}
+              onBack={() => setSelected(null)}
+              onInstalled={(report) => recordInstall(selected, report)}
+            />
+          ) : (
+            <BrowseView
+              packs={packs}
+              error={catalogError}
+              onSelect={setSelected}
+            />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
 
 function Header() {
   return (
-    <header className="border-b border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm">
+    <header className="border-b border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm shrink-0">
       <div className="px-6 py-4 flex items-center justify-between">
         <div className="flex items-baseline gap-3">
           <span className="font-bold tracking-tight text-base">
@@ -103,6 +198,55 @@ function Header() {
         </div>
       </div>
     </header>
+  );
+}
+
+function HistorySidebar({
+  history,
+  onPick,
+  catalogReady,
+}: {
+  history: InstallRecord[];
+  onPick: (r: InstallRecord) => void;
+  catalogReady: boolean;
+}) {
+  return (
+    <aside className="w-64 shrink-0 border-r border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 overflow-y-auto">
+      <div className="px-4 py-4 border-b border-[var(--color-bg-raised)]">
+        <h2 className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)]">
+          Recent installs
+        </h2>
+      </div>
+      {history.length === 0 ? (
+        <div className="px-4 py-5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+          Packs you install land here. Click an entry later to jump
+          back to its page.
+        </div>
+      ) : (
+        <ul className="px-2 py-2">
+          {history.map((r) => (
+            <li key={`${r.slug}-${r.installedAt}`}>
+              <button
+                type="button"
+                onClick={() => onPick(r)}
+                disabled={!catalogReady}
+                className="w-full text-left rounded-md px-3 py-2 mb-0.5 hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                <div className="text-xs font-medium text-[var(--color-text-bright)] truncate">
+                  {r.name}
+                </div>
+                <div className="text-[10px] text-[var(--color-text-dim)] mt-0.5 flex items-center justify-between gap-2">
+                  <span className="font-mono truncate">v{r.version}</span>
+                  <span className="shrink-0">
+                    {formatRelativeTime(r.installedAt)}
+                  </span>
+                </div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </aside>
   );
 }
 
@@ -204,9 +348,11 @@ function BrowseView({
 function InstallView({
   pack,
   onBack,
+  onInstalled,
 }: {
   pack: CatalogPack;
   onBack: () => void;
+  onInstalled: (report: InstallReport) => void;
 }) {
   const [dest, setDest] = useState(PACKRELAY_DEFAULT_DEST);
   const [state, setState] = useState<InstallState>({ kind: "idle" });
@@ -226,6 +372,21 @@ function InstallView({
     };
   }, []);
 
+  async function pickFolder() {
+    try {
+      const picked = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Pick your 7DTD Mods/ directory",
+      });
+      if (typeof picked === "string" && picked) {
+        setDest(picked);
+      }
+    } catch {
+      // User cancelled, or dialog isn't available — leave dest as-is.
+    }
+  }
+
   async function startInstall() {
     setState({ kind: "running", progress: null });
     try {
@@ -234,6 +395,7 @@ function InstallView({
         dest,
       });
       setState({ kind: "done", report });
+      onInstalled(report);
     } catch (e) {
       setState({
         kind: "error",
@@ -299,16 +461,28 @@ function InstallView({
         >
           Install to
         </label>
-        <input
-          id="dest"
-          type="text"
-          value={dest}
-          onChange={(e) => setDest(e.currentTarget.value)}
-          disabled={running}
-          className="w-full rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
-          placeholder="Path to your 7DTD Mods/ directory"
-          spellCheck={false}
-        />
+        <div className="flex gap-2">
+          <input
+            id="dest"
+            type="text"
+            value={dest}
+            onChange={(e) => setDest(e.currentTarget.value)}
+            disabled={running}
+            className="flex-1 min-w-0 rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
+            placeholder="Path to your 7DTD Mods/ directory"
+            spellCheck={false}
+          />
+          <button
+            type="button"
+            onClick={pickFolder}
+            disabled={running}
+            className="shrink-0 inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Open a folder picker"
+          >
+            <FolderGlyph />
+            Browse…
+          </button>
+        </div>
         <p className="mt-1.5 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
           The pack folder lands inside this directory. On Windows the
           standard path is{" "}
@@ -381,6 +555,25 @@ function InstallView({
         </div>
       </div>
     </div>
+  );
+}
+
+function FolderGlyph() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      aria-hidden="true"
+    >
+      <path
+        d="M2 5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5z"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 
