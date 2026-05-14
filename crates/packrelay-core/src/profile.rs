@@ -585,11 +585,103 @@ async fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// where we want the destination's old contents gone.
 async fn replace_dir(dst: &Path, src: &Path) -> Result<()> {
     if fs::metadata(dst).await.is_ok() {
-        fs::remove_dir_all(dst)
+        remove_dir_all_safe(dst)
             .await
             .with_context(|| format!("clearing {}", dst.display()))?;
     }
     copy_dir_all(src, dst).await
+}
+
+/// Recursive delete that never traverses into reparse points
+/// (Windows junctions, OneDrive cloud placeholders, etc.). On
+/// Windows, `std::fs::remove_dir_all` *should* skip reparse points
+/// but has historically blown up with ERROR_REPARSE_POINT_ENCOUNTERED
+/// (os error 4395) on specific reparse tag types — most commonly
+/// OneDrive's `IO_REPARSE_TAG_CLOUD` for files-on-demand. Walking
+/// manually with `symlink_metadata` (which never follows links)
+/// avoids the entire class of failure.
+///
+/// Reparse-point entries themselves get unlinked via `remove_file`,
+/// which on Windows removes the link itself without touching the
+/// target. If the user has set up a junction inside their Saves/
+/// pointing at another drive, we're going to remove that junction
+/// here — which is the right behavior for "switching profiles
+/// clears this slot," not a data-loss bug.
+async fn remove_dir_all_safe(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat {}", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        // The top of our tree is itself a reparse point. Just
+        // unlink it — no recursion.
+        return fs::remove_file(path)
+            .await
+            .with_context(|| format!("unlinking reparse {}", path.display()));
+    }
+    if meta.is_file() {
+        return fs::remove_file(path)
+            .await
+            .with_context(|| format!("removing {}", path.display()));
+    }
+
+    // Directory walk: pop deepest-first so children are gone
+    // before we hit their parent.
+    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+    let mut to_remove: Vec<PathBuf> = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading {}", dir.display()));
+            }
+        };
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .with_context(|| format!("iter {}", dir.display()))?
+        {
+            // file_type() from DirEntry on Windows doesn't follow
+            // reparse points — that's the property we need.
+            let ft = entry
+                .file_type()
+                .await
+                .with_context(|| format!("file_type {}", entry.path().display()))?;
+            let p = entry.path();
+            if ft.is_symlink() {
+                // Reparse point of any flavor — unlink without
+                // recursing.
+                fs::remove_file(&p)
+                    .await
+                    .with_context(|| format!("unlinking reparse {}", p.display()))?;
+            } else if ft.is_dir() {
+                stack.push(p.clone());
+                to_remove.push(p);
+            } else {
+                fs::remove_file(&p)
+                    .await
+                    .with_context(|| format!("removing {}", p.display()))?;
+            }
+        }
+    }
+    // Deepest-first so we don't try to delete a non-empty parent.
+    to_remove.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    for d in to_remove {
+        match fs::remove_dir(&d).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("removing dir {}", d.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn dir_size(path: &Path) -> Result<u64> {
