@@ -1056,17 +1056,13 @@ function BrowseView({
               className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
             >
               <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
-                {p.coverImage ? (
-                  <img
-                    src={p.coverImage}
-                    alt=""
-                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                  />
-                ) : (
-                  <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
-                    no cover
-                  </div>
-                )}
+                <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+                  no cover
+                </div>
+                <CoverImage
+                  src={p.coverImage}
+                  className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                />
                 <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
               </div>
               <div className="p-4">
@@ -1232,13 +1228,13 @@ function InstallView({
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
         <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
-          {pack.coverImage && (
-            <img
-              src={pack.coverImage}
-              alt=""
-              className="w-full h-full object-cover"
-            />
-          )}
+          <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/40 text-xs tracking-[0.2em] uppercase">
+            no cover
+          </div>
+          <CoverImage
+            src={pack.coverImage}
+            className="absolute inset-0 w-full h-full object-cover"
+          />
           <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-[var(--color-bg-panel)]/40 to-transparent" />
           <div className="absolute bottom-4 left-5 right-5">
             <div className="text-xl font-semibold drop-shadow-lg">
@@ -1495,17 +1491,13 @@ function DetailView({
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
         <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
-          {pack.coverImage ? (
-            <img
-              src={pack.coverImage}
-              alt=""
-              className="w-full h-full object-cover"
-            />
-          ) : (
-            <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/40 text-xs tracking-[0.2em] uppercase">
-              no cover
-            </div>
-          )}
+          <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/40 text-xs tracking-[0.2em] uppercase">
+            no cover
+          </div>
+          <CoverImage
+            src={pack.coverImage}
+            className="absolute inset-0 w-full h-full object-cover"
+          />
           <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-[var(--color-bg-panel)]/30 to-transparent" />
           <div className="absolute bottom-5 left-6 right-6">
             <div className="text-2xl font-semibold drop-shadow-lg">
@@ -1645,94 +1637,300 @@ function ServerBrowseView({
     );
   }
 
+  return <ServerBrowseLoaded servers={servers} onSelect={onSelect} />;
+}
+
+// All the regions the catalog supports; "" means "any region" in
+// the filter state. Order matches the website's /servers page so
+// users moving between launcher and web see the same list.
+const FILTER_REGIONS: { value: string; label: string }[] = [
+  { value: "", label: "All regions" },
+  { value: "na_east", label: "NA East" },
+  { value: "na_west", label: "NA West" },
+  { value: "eu", label: "Europe" },
+  { value: "as", label: "Asia" },
+  { value: "oc", label: "Oceania" },
+  { value: "sa", label: "South America" },
+  { value: "af", label: "Africa" },
+];
+
+function ServerBrowseLoaded({
+  servers,
+  onSelect,
+}: {
+  servers: CatalogServer[];
+  onSelect: (s: CatalogServer) => void;
+}) {
+  // Filter state is local to this component — it resets if the
+  // user leaves the Servers tab and comes back, which is fine for
+  // v1. Hoist to App if cross-navigation persistence becomes a need.
+  const [region, setRegion] = useState<string>("");
+  const [onlineOnly, setOnlineOnly] = useState(false);
+  const [notFull, setNotFull] = useState(false);
+
+  const filtered = servers.filter((s) => {
+    if (region && s.region !== region) return false;
+    if (onlineOnly && !s.online) return false;
+    if (notFull && s.currentPlayers >= s.maxPlayers) return false;
+    return true;
+  });
+  const hasFilters = !!region || onlineOnly || notFull;
+  const clearFilters = () => {
+    setRegion("");
+    setOnlineOnly(false);
+    setNotFull(false);
+  };
+
   return (
     <div className="px-6 py-8">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight">Browse servers</h1>
-        <p className="text-xs text-[var(--color-text-dim)] mt-1">
-          Click a server to install its attached pack and grab the
-          connect address.
-        </p>
+      <div className="mb-5 flex items-end justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Browse servers</h1>
+          <p className="text-xs text-[var(--color-text-dim)] mt-1">
+            Click a server to install its attached pack and grab the
+            connect address.
+          </p>
+        </div>
+        <div className="text-[11px] text-[var(--color-text-dim)] tabular-nums">
+          {hasFilters
+            ? `${filtered.length} of ${servers.length} servers`
+            : `${servers.length} servers`}
+        </div>
       </div>
-      <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        {servers.map((s) => (
-          <li key={s.slug}>
-            <button
-              type="button"
-              onClick={() => onSelect(s)}
-              className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
-            >
-              <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
-                {s.attachedPack?.coverImage ? (
-                  <img
-                    src={s.attachedPack.coverImage}
-                    alt=""
-                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                  />
-                ) : (
-                  <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
-                    no pack
-                  </div>
-                )}
-                <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
-                {/* Region pill */}
-                <span className="absolute top-2 left-2 inline-flex items-center text-[10px] tracking-[0.14em] uppercase px-2 py-0.5 rounded bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[var(--color-text-bright)]/90 ring-1 ring-[var(--color-bg-raised)]/40">
-                  {REGION_LABEL[s.region] ?? s.region}
-                </span>
-                {/* Glowy online pill, top-right */}
-                {s.online ? (
-                  <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-status-success)]/15 backdrop-blur-sm text-[10px] font-medium text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40 shadow-[0_0_14px_rgba(80,200,120,0.45)]">
-                    <span className="size-1.5 rounded-full bg-[var(--color-status-success)] animate-pulse shadow-[0_0_6px_rgba(80,200,120,0.9)]" />
-                    Online
-                  </span>
-                ) : (
-                  <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[10px] text-[var(--color-text-dim)] ring-1 ring-[var(--color-bg-raised)]/40">
-                    <span className="size-1.5 rounded-full bg-[var(--color-text-dim)]/70" />
-                    Offline
-                  </span>
-                )}
-              </div>
-              <div className="p-4">
-                <div className="font-medium text-[var(--color-text-bright)] truncate mb-1">
-                  {s.name}
-                </div>
-                {s.attachedPack ? (
-                  <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
-                    Running{" "}
-                    <span className="text-[var(--color-accent-soft)]">
-                      {s.attachedPack.name}
-                    </span>
-                    {s.attachedPack.attachedVersion && (
-                      <span className="font-mono">
-                        {" "}
-                        · v{s.attachedPack.attachedVersion}
-                      </span>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-[10px] text-[var(--color-text-dim)] mb-2 italic">
-                    No pack attached
-                  </div>
-                )}
-                <p className="text-xs text-[var(--color-text-dim)] leading-relaxed line-clamp-2 min-h-[2.5em]">
-                  {s.summary ?? ""}
-                </p>
-                <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
-                  <span>
-                    {s.online
-                      ? s.currentPlayers >= s.maxPlayers
-                        ? "Full"
-                        : `${s.currentPlayers}/${s.maxPlayers}`
-                      : "—"}
-                  </span>
-                  <span>{s.uptimePct.toFixed(0)}% uptime</span>
-                </div>
-              </div>
-            </button>
-          </li>
-        ))}
-      </ul>
+
+      <div className="mb-5 flex flex-wrap items-center gap-2">
+        <label className="text-[11px] text-[var(--color-text-dim)] mr-1">
+          Region
+        </label>
+        <select
+          value={region}
+          onChange={(e) => setRegion(e.currentTarget.value)}
+          className="rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-2.5 py-1.5 text-xs text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors hover:border-[var(--color-accent-soft)]/40"
+        >
+          {FILTER_REGIONS.map((r) => (
+            <option key={r.value} value={r.value}>
+              {r.label}
+            </option>
+          ))}
+        </select>
+        <span className="mx-1 text-[var(--color-bg-raised)]">·</span>
+        <FilterChip
+          active={onlineOnly}
+          onClick={() => setOnlineOnly((v) => !v)}
+          dotColor="success"
+        >
+          Online only
+        </FilterChip>
+        <FilterChip
+          active={notFull}
+          onClick={() => setNotFull((v) => !v)}
+          dotColor="accent"
+        >
+          Not full
+        </FilterChip>
+        {hasFilters && (
+          <button
+            type="button"
+            onClick={clearFilters}
+            className="ml-auto text-[10px] tracking-[0.14em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] transition-colors"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 px-6 py-10 text-center">
+          <div className="text-sm text-[var(--color-text-bright)] font-medium mb-1">
+            No servers match these filters
+          </div>
+          <p className="text-xs text-[var(--color-text-dim)] mb-4">
+            Try a different region, or drop a filter.
+          </p>
+          <button
+            type="button"
+            onClick={clearFilters}
+            className="inline-flex items-center px-3.5 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs"
+          >
+            Clear filters
+          </button>
+        </div>
+      ) : (
+        <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filtered.map((s) => (
+            <li key={s.slug}>
+              <ServerCard server={s} onSelect={onSelect} />
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
+  );
+}
+
+// Toggle chip used in the server filter bar. Two visual states:
+// active = accent-tinted, inactive = subdued border. The colored
+// dot signals which kind of filter it is (success for liveness,
+// accent for availability).
+function FilterChip({
+  active,
+  onClick,
+  dotColor,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  dotColor: "success" | "accent";
+  children: React.ReactNode;
+}) {
+  const dotClass =
+    dotColor === "success"
+      ? active
+        ? "bg-[var(--color-status-success)]"
+        : "bg-[var(--color-text-dim)]/60"
+      : active
+        ? "bg-[var(--color-accent-soft)]"
+        : "bg-[var(--color-text-dim)]/60";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[11px] tracking-wide uppercase transition-colors ${
+        active
+          ? "border-[var(--color-accent-soft)]/50 bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)]"
+          : "border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 text-[var(--color-text-dim)] hover:border-[var(--color-accent-soft)]/30 hover:text-[var(--color-text-bright)]"
+      }`}
+    >
+      <span className={`size-1.5 rounded-full ${dotClass}`} />
+      {children}
+    </button>
+  );
+}
+
+// Uptime-tier color: ≥90 green, ≥50 neutral-bright, else warning.
+// Matches the website's /servers card so the same server reads the
+// same in both places.
+function uptimeTier(pct: number): {
+  bg: string;
+  text: string;
+  ring: string;
+} {
+  if (pct >= 90) {
+    return {
+      bg: "bg-[var(--color-status-success)]/10",
+      text: "text-[var(--color-status-success)]",
+      ring: "ring-[var(--color-status-success)]/40",
+    };
+  }
+  if (pct >= 50) {
+    return {
+      bg: "bg-[var(--color-bg-raised)]/40",
+      text: "text-[var(--color-text-bright)]/85",
+      ring: "ring-[var(--color-bg-raised)]",
+    };
+  }
+  return {
+    bg: "bg-[var(--color-status-warning)]/10",
+    text: "text-[var(--color-status-warning)]",
+    ring: "ring-[var(--color-status-warning)]/40",
+  };
+}
+
+// One card in the server grid. Extracted so the filter logic in
+// ServerBrowseLoaded stays readable, and so we can color-code the
+// players + uptime indicators in one place.
+function ServerCard({
+  server: s,
+  onSelect,
+}: {
+  server: CatalogServer;
+  onSelect: (s: CatalogServer) => void;
+}) {
+  const ut = uptimeTier(s.uptimePct);
+  const isFull = s.online && s.currentPlayers >= s.maxPlayers;
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(s)}
+      className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
+    >
+      <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
+        <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+          no pack
+        </div>
+        <CoverImage
+          src={s.attachedPack?.coverImage}
+          className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+        />
+        <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
+        {/* Region pill */}
+        <span className="absolute top-2 left-2 inline-flex items-center text-[10px] tracking-[0.14em] uppercase px-2 py-0.5 rounded bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[var(--color-text-bright)]/90 ring-1 ring-[var(--color-bg-raised)]/40">
+          {REGION_LABEL[s.region] ?? s.region}
+        </span>
+        {/* Glowy online pill, top-right */}
+        {s.online ? (
+          <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-status-success)]/15 backdrop-blur-sm text-[10px] font-medium text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40 shadow-[0_0_14px_rgba(80,200,120,0.45)]">
+            <span className="size-1.5 rounded-full bg-[var(--color-status-success)] animate-pulse shadow-[0_0_6px_rgba(80,200,120,0.9)]" />
+            Online
+          </span>
+        ) : (
+          <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[10px] text-[var(--color-text-dim)] ring-1 ring-[var(--color-bg-raised)]/40">
+            <span className="size-1.5 rounded-full bg-[var(--color-text-dim)]/70" />
+            Offline
+          </span>
+        )}
+      </div>
+      <div className="p-4">
+        <div className="font-medium text-[var(--color-text-bright)] truncate mb-1">
+          {s.name}
+        </div>
+        {s.attachedPack ? (
+          <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
+            Running{" "}
+            <span className="text-[var(--color-accent-soft)]">
+              {s.attachedPack.name}
+            </span>
+            {s.attachedPack.attachedVersion && (
+              <span className="font-mono">
+                {" "}
+                · v{s.attachedPack.attachedVersion}
+              </span>
+            )}
+          </div>
+        ) : (
+          <div className="text-[10px] text-[var(--color-text-dim)] mb-2 italic">
+            No pack attached
+          </div>
+        )}
+        <p className="text-xs text-[var(--color-text-dim)] leading-relaxed line-clamp-2 min-h-[2.5em]">
+          {s.summary ?? ""}
+        </p>
+        <div className="mt-3 flex items-center justify-between gap-2">
+          {/* Players: warning-tinted when full, neutral otherwise.
+              Plain text when offline (no live count is meaningful). */}
+          <span
+            className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium tabular-nums ring-1 ${
+              !s.online
+                ? "bg-transparent text-[var(--color-text-dim)] ring-[var(--color-bg-raised)]"
+                : isFull
+                  ? "bg-[var(--color-status-warning)]/10 text-[var(--color-status-warning)] ring-[var(--color-status-warning)]/40"
+                  : "bg-[var(--color-bg-raised)]/40 text-[var(--color-text-bright)]/85 ring-[var(--color-bg-raised)]"
+            }`}
+          >
+            {s.online
+              ? isFull
+                ? "Full"
+                : `${s.currentPlayers}/${s.maxPlayers} players`
+              : "Offline"}
+          </span>
+          <span
+            className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium tabular-nums ring-1 ${ut.bg} ${ut.text} ${ut.ring}`}
+          >
+            {s.uptimePct.toFixed(0)}% uptime
+          </span>
+        </div>
+      </div>
+    </button>
   );
 }
 
@@ -1763,13 +1961,13 @@ function ServerDetailView({
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
         <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
-          {cover ? (
-            <img src={cover} alt="" className="w-full h-full object-cover" />
-          ) : (
-            <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
-              no pack
-            </div>
-          )}
+          <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+            no pack
+          </div>
+          <CoverImage
+            src={cover}
+            className="absolute inset-0 w-full h-full object-cover"
+          />
           <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-[var(--color-bg-panel)]/40 to-transparent" />
           <span className="absolute top-3 left-3 inline-flex items-center text-[10px] tracking-[0.14em] uppercase px-2 py-1 rounded bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[var(--color-text-bright)]/90 ring-1 ring-[var(--color-bg-raised)]/40">
             {REGION_LABEL[server.region] ?? server.region}
@@ -1821,13 +2019,12 @@ function ServerDetailView({
               Install the pack
             </div>
             <div className="flex items-start gap-3 mb-4">
-              {attachedPack.coverImage && (
-                <img
+              <div className="size-14 rounded-md bg-[var(--color-bg-raised)] shrink-0 relative overflow-hidden">
+                <CoverImage
                   src={attachedPack.coverImage}
-                  alt=""
-                  className="size-14 rounded-md object-cover shrink-0"
+                  className="absolute inset-0 w-full h-full object-cover"
                 />
-              )}
+              </div>
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium text-[var(--color-text-bright)] truncate">
                   {attachedPack.name}
@@ -1894,6 +2091,32 @@ function ServerDetailView({
         </div>
       )}
     </div>
+  );
+}
+
+// Image wrapper that swallows broken-URL errors and falls back to
+// whatever placeholder the parent renders behind it. Catalog
+// publishers control coverImage URLs — the launcher shouldn't show
+// the browser's torn-corner glyph if a publisher's CDN is down or
+// the seed data points at a missing asset.
+function CoverImage({
+  src,
+  className,
+  alt = "",
+}: {
+  src: string | null | undefined;
+  className?: string;
+  alt?: string;
+}) {
+  const [errored, setErrored] = useState(false);
+  if (!src || errored) return null;
+  return (
+    <img
+      src={src}
+      alt={alt}
+      className={className}
+      onError={() => setErrored(true)}
+    />
   );
 }
 
