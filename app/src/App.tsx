@@ -240,6 +240,14 @@ function App() {
   const [packs, setPacks] = useState<CatalogPack[] | null>(null);
   const [packsError, setPacksError] = useState<string | null>(null);
   const [selectedPack, setSelectedPack] = useState<CatalogPack | null>(null);
+  // Whether the selected pack is currently in detail or install
+  // mode. Browse cards land in "detail"; server/history shortcuts
+  // skip straight to "install".
+  const [packView, setPackView] = useState<"detail" | "install">("detail");
+  // Whether InstallView's Back button should fall back to
+  // DetailView (true, set by browse) or close the pack entirely
+  // (false, set by server / history shortcuts).
+  const [canReturnToDetail, setCanReturnToDetail] = useState(false);
 
   const [servers, setServers] = useState<CatalogServer[] | null>(null);
   const [serversError, setServersError] = useState<string | null>(null);
@@ -287,6 +295,27 @@ function App() {
     // on the browse view of the tab they picked.
     setSelectedPack(null);
     setSelectedServer(null);
+    setPackView("detail");
+    setCanReturnToDetail(false);
+  }, []);
+
+  // From browse: card click opens the rich detail page; Install is
+  // a second click. This is the route the launcher's pitch surfaces.
+  const openPackDetail = useCallback((pack: CatalogPack) => {
+    setSelectedPack(pack);
+    setPackView("detail");
+    setCanReturnToDetail(true);
+  }, []);
+
+  // From server/history: skip detail and go straight to install. The
+  // user came in with intent — server-detail already shows the
+  // context, history rows are by definition things you've installed
+  // before. canReturnToDetail stays false so InstallView's Back
+  // closes the pack rather than rebounding through DetailView.
+  const openPackInstall = useCallback((pack: CatalogPack) => {
+    setSelectedPack(pack);
+    setPackView("install");
+    setCanReturnToDetail(false);
   }, []);
 
   const recordInstall = useCallback(
@@ -367,10 +396,10 @@ function App() {
       if (match) {
         setTab("packs");
         setSelectedServer(null);
-        setSelectedPack(match);
+        openPackInstall(match);
       }
     },
-    [packs]
+    [packs, openPackInstall]
   );
 
   // Pre-compute the slug → latest catalog version map once per
@@ -394,9 +423,10 @@ function App() {
   );
 
   /** What's rendered in the main pane. Precedence:
-   *  1. selectedPack (from any path) → InstallView
-   *  2. selectedServer → ServerDetailView
-   *  3. active tab's browse
+   *  1. selectedPack + packView === "install" → InstallView
+   *  2. selectedPack + packView === "detail"  → DetailView
+   *  3. selectedServer → ServerDetailView
+   *  4. active tab's browse
    */
   let mainContent: React.ReactNode;
   if (selectedPack) {
@@ -407,18 +437,41 @@ function App() {
     // smart-update manifest diff actually applies.
     const installedRecord =
       history.find((r) => r.slug === selectedPack.slug) ?? null;
-    mainContent = (
-      <InstallView
-        pack={selectedPack}
-        defaultDest={installedRecord?.dest ?? defaultDest}
-        installedRecord={installedRecord}
-        connectAddress={backToServer?.connectAddress ?? null}
-        backLabel={backToServer ? backToServer.name.toUpperCase() : "BROWSE"}
-        onBack={() => setSelectedPack(null)}
-        onInstalled={(report) => recordInstall(selectedPack.slug, report)}
-        onUpdated={(report) => recordUpdate(selectedPack.slug, report)}
-      />
-    );
+    if (packView === "install") {
+      mainContent = (
+        <InstallView
+          pack={selectedPack}
+          defaultDest={installedRecord?.dest ?? defaultDest}
+          installedRecord={installedRecord}
+          connectAddress={backToServer?.connectAddress ?? null}
+          backLabel={
+            backToServer
+              ? backToServer.name.toUpperCase()
+              : canReturnToDetail
+                ? "DETAILS"
+                : "BROWSE"
+          }
+          onBack={() => {
+            if (canReturnToDetail) {
+              setPackView("detail");
+            } else {
+              setSelectedPack(null);
+            }
+          }}
+          onInstalled={(report) => recordInstall(selectedPack.slug, report)}
+          onUpdated={(report) => recordUpdate(selectedPack.slug, report)}
+        />
+      );
+    } else {
+      mainContent = (
+        <DetailView
+          pack={selectedPack}
+          installedRecord={installedRecord}
+          onBack={() => setSelectedPack(null)}
+          onInstall={() => setPackView("install")}
+        />
+      );
+    }
   } else if (selectedServer) {
     mainContent = (
       <ServerDetailView
@@ -429,7 +482,7 @@ function App() {
             : null
         }
         onBack={() => setSelectedServer(null)}
-        onInstall={(pack) => setSelectedPack(pack)}
+        onInstall={(pack) => openPackInstall(pack)}
       />
     );
   } else if (tab === "packs") {
@@ -437,7 +490,7 @@ function App() {
       <BrowseView
         packs={packs}
         error={packsError}
-        onSelect={setSelectedPack}
+        onSelect={openPackDetail}
       />
     );
   } else {
@@ -1377,6 +1430,183 @@ function InstallView({
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Rich pack page — what Browse cards land on. Deliberately slower-
+// paced than InstallView: scrollable description, full tag list,
+// stats, and the install button as a single deliberate CTA at the
+// bottom (mirroring the eventual InstallView mode label so the
+// user isn't surprised on the next screen).
+function DetailView({
+  pack,
+  installedRecord,
+  onBack,
+  onInstall,
+}: {
+  pack: CatalogPack;
+  installedRecord: InstallRecord | null;
+  onBack: () => void;
+  onInstall: () => void;
+}) {
+  // Mirrors the mode-detection in InstallView so the action button
+  // here reads the same as what'll show on the next screen.
+  const mode: InstallMode = (() => {
+    if (!installedRecord) return "install";
+    if (
+      pack.latestVersion &&
+      semverIsNewer(pack.latestVersion, installedRecord.version)
+    ) {
+      return "update";
+    }
+    return "reinstall";
+  })();
+  const actionLabel =
+    mode === "update"
+      ? `Update to v${pack.latestVersion ?? "?"}`
+      : mode === "reinstall"
+        ? "Re-install"
+        : "Install pack";
+
+  const ageDays = (() => {
+    const dt = new Date(pack.createdAt).getTime();
+    return Math.max(0, Math.floor((Date.now() - dt) / 86_400_000));
+  })();
+  const ageLabel =
+    ageDays < 1
+      ? "Today"
+      : ageDays < 30
+        ? `${ageDays}d ago`
+        : ageDays < 365
+          ? `${Math.floor(ageDays / 30)}mo ago`
+          : `${Math.floor(ageDays / 365)}y ago`;
+
+  return (
+    <div className="px-6 py-8 max-w-3xl mx-auto">
+      <button
+        type="button"
+        onClick={onBack}
+        className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] mb-4"
+      >
+        ← BROWSE
+      </button>
+
+      <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
+        <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
+          {pack.coverImage ? (
+            <img
+              src={pack.coverImage}
+              alt=""
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/40 text-xs tracking-[0.2em] uppercase">
+              no cover
+            </div>
+          )}
+          <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-[var(--color-bg-panel)]/30 to-transparent" />
+          <div className="absolute bottom-5 left-6 right-6">
+            <div className="text-2xl font-semibold drop-shadow-lg">
+              {pack.name}
+            </div>
+            <div className="text-xs text-[var(--color-text-bright)]/85 mt-1">
+              by {pack.publisherName}
+              {pack.latestVersion && (
+                <>
+                  <span className="text-[var(--color-text-dim)]"> · </span>
+                  <span className="font-mono">v{pack.latestVersion}</span>
+                </>
+              )}
+              {installedRecord && (
+                <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-status-success)]/15 text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40 align-middle">
+                  installed v{installedRecord.version}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {pack.summary && (
+        <p className="text-base text-[var(--color-text-bright)]/90 leading-relaxed mb-5">
+          {pack.summary}
+        </p>
+      )}
+
+      {pack.tags.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-6">
+          {pack.tags.map((t) => (
+            <span
+              key={t}
+              className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] tracking-wide uppercase font-medium bg-[var(--color-bg-raised)]/60 text-[var(--color-text-bright)]/85 border border-[var(--color-bg-raised)]"
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+        <StatCard label="Files" value={pack.fileCount.toLocaleString()} />
+        <StatCard label="Size" value={formatBytes(pack.totalSizeBytes)} />
+        <StatCard
+          label="Downloads"
+          value={pack.downloadCount.toLocaleString()}
+        />
+        <StatCard label="Published" value={ageLabel} />
+      </div>
+
+      {pack.description && (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 px-5 py-5 mb-6">
+          <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
+            About this pack
+          </h2>
+          {/* Render description as preformatted text so newlines and
+              paragraph breaks survive. Future iteration: parse as
+              Markdown if publishers want links/headings/lists. */}
+          <p className="text-sm text-[var(--color-text-bright)]/85 leading-relaxed whitespace-pre-wrap">
+            {pack.description}
+          </p>
+        </div>
+      )}
+
+      <div className="sticky bottom-4 mt-8 rounded-xl border border-[var(--color-accent-soft)]/30 bg-[var(--color-bg-panel)]/90 backdrop-blur-sm px-5 py-4 flex items-center justify-between gap-4 shadow-lg">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-[var(--color-text-bright)] truncate">
+            {pack.name}
+            {pack.latestVersion && (
+              <span className="font-mono text-[11px] text-[var(--color-text-dim)] ml-1.5">
+                v{pack.latestVersion}
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] text-[var(--color-text-dim)] mt-0.5">
+            {pack.fileCount.toLocaleString()} files ·{" "}
+            {formatBytes(pack.totalSizeBytes)}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onInstall}
+          className="shrink-0 inline-flex items-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
+        >
+          {actionLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 px-3 py-2.5">
+      <div className="text-[9px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-dim)] mb-1">
+        {label}
+      </div>
+      <div className="text-sm font-medium text-[var(--color-text-bright)] tabular-nums">
+        {value}
       </div>
     </div>
   );
