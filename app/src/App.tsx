@@ -91,6 +91,20 @@ type UpdateReport = {
   dest: string;
 };
 
+// Mirrors packrelay-core auth::MeResponse + AuthState. Internally-
+// tagged enum so React can switch on `kind`.
+type MeResponse = {
+  id: string;
+  displayName: string;
+  role: string;
+  plan: string;
+  image: string | null;
+};
+
+type AuthState =
+  | { kind: "signedOut" }
+  | { kind: "signedIn"; token: string; user: MeResponse };
+
 // Which flavour of the "install" action we're rendering. Affects
 // the button label, the destination input (locked for update so
 // the manifest diff actually applies), and the done-state copy.
@@ -261,6 +275,13 @@ function App() {
   // type or even pick a folder for the common case.
   const [defaultDest, setDefaultDest] = useState<string>(FALLBACK_DEFAULT_DEST);
 
+  // Auth state — resolved on startup from the persisted token (if
+  // any). When signedIn the Header chip shows the user's name; the
+  // SignInModal opens via setShowSignIn(true) from the chip click
+  // when out, or from the menu when in.
+  const [auth, setAuth] = useState<AuthState>({ kind: "signedOut" });
+  const [showSignIn, setShowSignIn] = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
@@ -287,6 +308,25 @@ function App() {
         // mode and on platforms without a canonical path.
       }
     })();
+    (async () => {
+      try {
+        const state = await invoke<AuthState>("get_auth_state");
+        setAuth(state);
+      } catch {
+        // Token validation network error etc — stay signed out;
+        // the user can re-paste when they want.
+      }
+    })();
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    try {
+      const next = await invoke<AuthState>("sign_out");
+      setAuth(next);
+    } catch {
+      // Local-only operation; failure here is exceedingly rare
+      // (filesystem write). Leaving the chip as-is is acceptable.
+    }
   }, []);
 
   const handleTabChange = useCallback((next: Tab) => {
@@ -505,7 +545,13 @@ function App() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header tab={tab} onTabChange={handleTabChange} />
+      <Header
+        tab={tab}
+        onTabChange={handleTabChange}
+        auth={auth}
+        onSignInClick={() => setShowSignIn(true)}
+        onSignOut={handleSignOut}
+      />
       <div className="flex-1 flex min-h-0">
         <HistorySidebar
           history={history}
@@ -516,6 +562,15 @@ function App() {
         />
         <main className="flex-1 overflow-y-auto">{mainContent}</main>
       </div>
+      {showSignIn && (
+        <SignInModal
+          onClose={() => setShowSignIn(false)}
+          onSignedIn={(next) => {
+            setAuth(next);
+            setShowSignIn(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -523,9 +578,15 @@ function App() {
 function Header({
   tab,
   onTabChange,
+  auth,
+  onSignInClick,
+  onSignOut,
 }: {
   tab: Tab;
   onTabChange: (next: Tab) => void;
+  auth: AuthState;
+  onSignInClick: () => void;
+  onSignOut: () => void;
 }) {
   return (
     <header className="border-b border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm shrink-0">
@@ -552,8 +613,230 @@ function Header({
             Servers
           </TabButton>
         </nav>
+        <AuthChip
+          auth={auth}
+          onSignInClick={onSignInClick}
+          onSignOut={onSignOut}
+        />
       </div>
     </header>
+  );
+}
+
+// Header pill on the far right of the chrome. Two states:
+// signedOut renders a subtle "Sign in" button; signedIn renders
+// the user's display name with a small avatar tile and exposes
+// sign-out via a click-toggled menu.
+function AuthChip({
+  auth,
+  onSignInClick,
+  onSignOut,
+}: {
+  auth: AuthState;
+  onSignInClick: () => void;
+  onSignOut: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  if (auth.kind === "signedOut") {
+    return (
+      <button
+        type="button"
+        onClick={onSignInClick}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase transition-colors"
+      >
+        Sign in
+      </button>
+    );
+  }
+
+  const initial = auth.user.displayName.slice(0, 1).toUpperCase();
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setMenuOpen((v) => !v)}
+        className="inline-flex items-center gap-2 px-2 py-1 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 transition-colors"
+      >
+        <span className="size-6 rounded-full bg-[var(--color-accent)]/30 text-[var(--color-accent-soft)] text-[11px] font-semibold flex items-center justify-center overflow-hidden">
+          {auth.user.image ? (
+            <img
+              src={auth.user.image}
+              alt=""
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            initial
+          )}
+        </span>
+        <span className="text-[12px] font-medium text-[var(--color-text-bright)] max-w-[10rem] truncate">
+          {auth.user.displayName}
+        </span>
+      </button>
+      {menuOpen && (
+        <>
+          {/* Click-away catcher so the menu closes on any outside click */}
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setMenuOpen(false)}
+          />
+          <div className="absolute right-0 top-full mt-1 z-50 min-w-[180px] rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] shadow-lg overflow-hidden">
+            <div className="px-3 py-2 border-b border-[var(--color-bg-raised)]/60">
+              <div className="text-[11px] text-[var(--color-text-bright)] font-medium truncate">
+                {auth.user.displayName}
+              </div>
+              <div className="text-[10px] text-[var(--color-text-dim)] uppercase tracking-wide mt-0.5">
+                {auth.user.role.replace("_", " ")} · {auth.user.plan}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMenuOpen(false);
+                onSignOut();
+              }}
+              className="w-full text-left px-3 py-2 text-[11px] tracking-[0.14em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-status-danger)] hover:bg-[var(--color-bg-raised)]/40 transition-colors"
+            >
+              Sign out
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Modal that drives the launcher's sign-in. Two steps in a single
+// dialog: a "go mint a token" link out to packrelay.cloud, then a
+// paste field that invokes sign_in. The Rust side handles validation
+// + storage; we just relay the result.
+function SignInModal({
+  onClose,
+  onSignedIn,
+}: {
+  onClose: () => void;
+  onSignedIn: (next: AuthState) => void;
+}) {
+  const [token, setToken] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const openTokensPage = useCallback(async () => {
+    try {
+      // Frontend opener works fine for https:// — the default
+      // capability scope covers web URLs without extra config.
+      // We dynamically import so the bundle doesn't ship the plugin
+      // glue at module-load time.
+      const mod = await import("@tauri-apps/plugin-opener");
+      await mod.openUrl("https://packrelay.cloud/account/tokens");
+    } catch {
+      setError(
+        "Couldn't open packrelay.cloud — copy this URL into your browser instead: https://packrelay.cloud/account/tokens"
+      );
+    }
+  }, []);
+
+  const submit = useCallback(async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const next = await invoke<AuthState>("sign_in", { token });
+      onSignedIn(next);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [token, onSignedIn]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center px-6"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-[var(--color-bg-raised)]/60 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-[var(--color-text-bright)]">
+            Sign in to PackRelay
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] text-lg leading-none"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="px-5 py-5 space-y-4">
+          <ol className="text-[11px] text-[var(--color-text-dim)] leading-relaxed space-y-1.5 list-decimal list-inside">
+            <li>
+              Open your{" "}
+              <button
+                type="button"
+                onClick={openTokensPage}
+                className="text-[var(--color-accent-soft)] hover:underline inline"
+              >
+                API tokens page
+              </button>{" "}
+              on packrelay.cloud.
+            </li>
+            <li>Mint a token named e.g. &ldquo;Launcher — laptop&rdquo;.</li>
+            <li>Paste it below.</li>
+          </ol>
+          <div>
+            <label
+              htmlFor="auth-token"
+              className="block text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1.5"
+            >
+              API token
+            </label>
+            <input
+              id="auth-token"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.currentTarget.value)}
+              placeholder="pr_……"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={submitting}
+              className="w-full rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && token.trim() && !submitting) {
+                  void submit();
+                }
+              }}
+            />
+          </div>
+          {error && (
+            <div className="rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)] break-words">
+              {error}
+            </div>
+          )}
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="inline-flex items-center px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={submit}
+              disabled={submitting || !token.trim()}
+              className="inline-flex items-center px-4 py-1.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-[11px] tracking-[0.14em] uppercase font-medium"
+            >
+              {submitting ? "Checking…" : "Sign in"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -9,6 +9,8 @@
 // Browse/install logic itself lives in packrelay-core — both the
 // CLI and this GUI just decorate the same primitives differently.
 
+mod auth;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
 
+use crate::auth::{
+    clear_stored_token, load_stored_token, save_token, validate_token, AuthState,
+};
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallReport, ProgressEvent};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
@@ -398,6 +403,63 @@ async fn uninstall_pack(dest: String) -> Result<UninstallReport, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Resolve current auth state on startup (and any time the frontend
+/// wants to refresh). Reads the stored token from app-data, asks
+/// the cloud who it belongs to, and returns SignedOut when either
+/// step fails. A failed validation auto-clears the stored token so
+/// a revoked token doesn't stick around forever.
+#[tauri::command]
+async fn get_auth_state(app: AppHandle) -> Result<AuthState, String> {
+    let token = match load_stored_token(&app).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(AuthState::SignedOut),
+        Err(e) => return Err(format!("{e:#}")),
+    };
+    match validate_token(DEFAULT_API_URL, &token).await {
+        Ok(user) => Ok(AuthState::SignedIn { token, user }),
+        Err(_) => {
+            // Token failed validation — most likely revoked from the
+            // website. Drop it so the user sees a clean sign-in state
+            // instead of repeated 401s.
+            let _ = clear_stored_token(&app).await;
+            Ok(AuthState::SignedOut)
+        }
+    }
+}
+
+/// Validate a pasted token, persist it on success, return the user
+/// profile so the frontend can render "Welcome back, X" immediately.
+/// On bad token the saved state is left untouched — the user might
+/// have mis-pasted and we don't want to evict their previous session.
+#[tauri::command]
+async fn sign_in(app: AppHandle, token: String) -> Result<AuthState, String> {
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Paste a token to sign in.".to_string());
+    }
+    let user = validate_token(DEFAULT_API_URL, &trimmed)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    save_token(&app, &trimmed)
+        .await
+        .map_err(|e| format!("saving token: {e:#}"))?;
+    Ok(AuthState::SignedIn {
+        token: trimmed,
+        user,
+    })
+}
+
+/// Clear the persisted token. We don't bother revoking it on the
+/// cloud here — that's the website's job via /account/tokens. This
+/// is a local "forget me on this machine."
+#[tauri::command]
+async fn sign_out(app: AppHandle) -> Result<AuthState, String> {
+    clear_stored_token(&app)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(AuthState::SignedOut)
+}
+
 /// Open 7DTD via the Steam protocol. We deliberately don't pass a
 /// connect address through — 7DTD's client doesn't accept one
 /// cleanly from the command line, and our copy-to-clipboard flow
@@ -425,7 +487,10 @@ pub fn run() {
             verify_pack,
             repair_pack,
             uninstall_pack,
-            update_pack
+            update_pack,
+            get_auth_state,
+            sign_in,
+            sign_out
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
