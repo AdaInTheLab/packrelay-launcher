@@ -23,6 +23,46 @@ type CatalogPack = {
   createdAt: string;
 };
 
+// Mirrors the Rust CatalogServer struct.
+type AttachedPack = {
+  slug: string;
+  name: string;
+  coverImage: string | null;
+  latestVersion: string | null;
+  attachedVersion: string | null;
+};
+
+type CatalogServer = {
+  slug: string;
+  name: string;
+  summary: string | null;
+  description: string | null;
+  region: string;
+  connectAddress: string | null;
+  discordUrl: string | null;
+  websiteUrl: string | null;
+  tags: string[];
+  currentPlayers: number;
+  maxPlayers: number;
+  lastSeenAt: string | null;
+  createdAt: string;
+  online: boolean;
+  uptimePct: number;
+  attachedPack: AttachedPack | null;
+};
+
+type Tab = "packs" | "servers";
+
+const REGION_LABEL: Record<string, string> = {
+  na_east: "NA East",
+  na_west: "NA West",
+  eu: "Europe",
+  as: "Asia",
+  oc: "Oceania",
+  sa: "South America",
+  af: "Africa",
+};
+
 type InstallReport = {
   displayName: string;
   version: string;
@@ -131,9 +171,18 @@ function saveHistory(entries: InstallRecord[]): void {
 }
 
 function App() {
+  const [tab, setTab] = useState<Tab>("packs");
+
   const [packs, setPacks] = useState<CatalogPack[] | null>(null);
-  const [catalogError, setCatalogError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<CatalogPack | null>(null);
+  const [packsError, setPacksError] = useState<string | null>(null);
+  const [selectedPack, setSelectedPack] = useState<CatalogPack | null>(null);
+
+  const [servers, setServers] = useState<CatalogServer[] | null>(null);
+  const [serversError, setServersError] = useState<string | null>(null);
+  const [selectedServer, setSelectedServer] = useState<CatalogServer | null>(
+    null
+  );
+
   const [history, setHistory] = useState<InstallRecord[]>(() => loadHistory());
   // OS-canonical 7DTD Mods/ path, fetched once on mount. The
   // InstallView uses it as the initial destination so users don't
@@ -146,7 +195,15 @@ function App() {
         const list = await invoke<CatalogPack[]>("list_packs");
         setPacks(list);
       } catch (e) {
-        setCatalogError(typeof e === "string" ? e : `${e}`);
+        setPacksError(typeof e === "string" ? e : `${e}`);
+      }
+    })();
+    (async () => {
+      try {
+        const list = await invoke<CatalogServer[]>("list_servers");
+        setServers(list);
+      } catch (e) {
+        setServersError(typeof e === "string" ? e : `${e}`);
       }
     })();
     (async () => {
@@ -160,10 +217,18 @@ function App() {
     })();
   }, []);
 
+  const handleTabChange = useCallback((next: Tab) => {
+    setTab(next);
+    // Reset selections when switching tabs so the user always lands
+    // on the browse view of the tab they picked.
+    setSelectedPack(null);
+    setSelectedServer(null);
+  }, []);
+
   const recordInstall = useCallback(
-    (pack: CatalogPack, report: InstallReport) => {
+    (slug: string, report: InstallReport) => {
       const entry: InstallRecord = {
-        slug: pack.slug,
+        slug,
         name: report.displayName,
         version: report.version,
         dest: report.dest,
@@ -175,7 +240,7 @@ function App() {
         // Dedup: drop any prior entry for the same slug — the latest
         // install of a pack is what matters; older entries for the
         // same slug just clutter the sidebar.
-        const next = [entry, ...prev.filter((r) => r.slug !== pack.slug)];
+        const next = [entry, ...prev.filter((r) => r.slug !== slug)];
         const trimmed = next.slice(0, HISTORY_MAX_ENTRIES);
         saveHistory(trimmed);
         return trimmed;
@@ -190,7 +255,11 @@ function App() {
       // with it pre-selected. Otherwise the pack was removed since;
       // surface a soft error by ignoring the click.
       const match = packs?.find((p) => p.slug === record.slug);
-      if (match) setSelected(match);
+      if (match) {
+        setTab("packs");
+        setSelectedServer(null);
+        setSelectedPack(match);
+      }
     },
     [packs]
   );
@@ -206,9 +275,67 @@ function App() {
       .map((p) => [p.slug, p.latestVersion])
   );
 
+  // Lookup table: server attached-pack slug → full CatalogPack.
+  // Used when the user clicks "Install pack" on a server detail
+  // page — we need the full pack record (file count, total size,
+  // cover) to drive InstallView even though the server endpoint
+  // only embeds a thin AttachedPack reference.
+  const packBySlug = new Map<string, CatalogPack>(
+    (packs ?? []).map((p) => [p.slug, p])
+  );
+
+  /** What's rendered in the main pane. Precedence:
+   *  1. selectedPack (from any path) → InstallView
+   *  2. selectedServer → ServerDetailView
+   *  3. active tab's browse
+   */
+  let mainContent: React.ReactNode;
+  if (selectedPack) {
+    const backToServer = selectedServer ?? null;
+    mainContent = (
+      <InstallView
+        pack={selectedPack}
+        defaultDest={defaultDest}
+        connectAddress={backToServer?.connectAddress ?? null}
+        backLabel={backToServer ? backToServer.name.toUpperCase() : "BROWSE"}
+        onBack={() => setSelectedPack(null)}
+        onInstalled={(report) => recordInstall(selectedPack.slug, report)}
+      />
+    );
+  } else if (selectedServer) {
+    mainContent = (
+      <ServerDetailView
+        server={selectedServer}
+        attachedPack={
+          selectedServer.attachedPack
+            ? packBySlug.get(selectedServer.attachedPack.slug) ?? null
+            : null
+        }
+        onBack={() => setSelectedServer(null)}
+        onInstall={(pack) => setSelectedPack(pack)}
+      />
+    );
+  } else if (tab === "packs") {
+    mainContent = (
+      <BrowseView
+        packs={packs}
+        error={packsError}
+        onSelect={setSelectedPack}
+      />
+    );
+  } else {
+    mainContent = (
+      <ServerBrowseView
+        servers={servers}
+        error={serversError}
+        onSelect={setSelectedServer}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
-      <Header />
+      <Header tab={tab} onTabChange={handleTabChange} />
       <div className="flex-1 flex min-h-0">
         <HistorySidebar
           history={history}
@@ -216,31 +343,22 @@ function App() {
           onPick={reinstallFromHistory}
           catalogReady={packs !== null}
         />
-        <main className="flex-1 overflow-y-auto">
-          {selected ? (
-            <InstallView
-              pack={selected}
-              defaultDest={defaultDest}
-              onBack={() => setSelected(null)}
-              onInstalled={(report) => recordInstall(selected, report)}
-            />
-          ) : (
-            <BrowseView
-              packs={packs}
-              error={catalogError}
-              onSelect={setSelected}
-            />
-          )}
-        </main>
+        <main className="flex-1 overflow-y-auto">{mainContent}</main>
       </div>
     </div>
   );
 }
 
-function Header() {
+function Header({
+  tab,
+  onTabChange,
+}: {
+  tab: Tab;
+  onTabChange: (next: Tab) => void;
+}) {
   return (
     <header className="border-b border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 backdrop-blur-sm shrink-0">
-      <div className="px-6 py-4 flex items-center justify-between">
+      <div className="px-6 py-3 flex items-center justify-between gap-4">
         <div className="flex items-baseline gap-3">
           <span className="font-bold tracking-tight text-base">
             PACKRELAY
@@ -249,8 +367,46 @@ function Header() {
             launcher · v0.1
           </span>
         </div>
+        <nav className="flex gap-1 text-[11px] tracking-[0.14em] uppercase">
+          <TabButton
+            active={tab === "packs"}
+            onClick={() => onTabChange("packs")}
+          >
+            Packs
+          </TabButton>
+          <TabButton
+            active={tab === "servers"}
+            onClick={() => onTabChange("servers")}
+          >
+            Servers
+          </TabButton>
+        </nav>
       </div>
     </header>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`px-3 py-1.5 rounded-md transition-colors ${
+        active
+          ? "bg-[var(--color-accent)]/15 text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40"
+          : "text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -426,11 +582,20 @@ function BrowseView({
 function InstallView({
   pack,
   defaultDest,
+  connectAddress,
+  backLabel,
   onBack,
   onInstalled,
 }: {
   pack: CatalogPack;
   defaultDest: string;
+  /** When the install was launched from a server detail page, the
+   *  server's connect address gets surfaced under the "done" state
+   *  with a copy button — the actual point of "one-click join." */
+  connectAddress: string | null;
+  /** What the back button reads — "BROWSE" for pack browse,
+   *  the server's name when launched from a server detail page. */
+  backLabel: string;
   onBack: () => void;
   onInstalled: (report: InstallReport) => void;
 }) {
@@ -499,7 +664,7 @@ function InstallView({
         disabled={running}
         className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] mb-4 disabled:opacity-40 disabled:cursor-not-allowed"
       >
-        ← BROWSE
+        ← {backLabel}
       </button>
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
@@ -606,15 +771,25 @@ function InstallView({
             </div>
           )}
           {state.kind === "done" && (
-            <div className="rounded-md border border-[var(--color-status-success)]/40 bg-[var(--color-status-success)]/10 px-4 py-3 text-sm">
-              <div className="font-medium mb-1">
-                ✓ {state.report.displayName} v{state.report.version} installed
+            <div className="space-y-3">
+              <div className="rounded-md border border-[var(--color-status-success)]/40 bg-[var(--color-status-success)]/10 px-4 py-3 text-sm">
+                <div className="font-medium mb-1">
+                  ✓ {state.report.displayName} v{state.report.version} installed
+                </div>
+                <div className="text-xs text-[var(--color-text-dim)]">
+                  {state.report.fileCount} files,{" "}
+                  {formatBytes(state.report.totalBytes)} →{" "}
+                  <code className="font-mono">{state.report.dest}</code>
+                </div>
               </div>
-              <div className="text-xs text-[var(--color-text-dim)]">
-                {state.report.fileCount} files,{" "}
-                {formatBytes(state.report.totalBytes)} →{" "}
-                <code className="font-mono">{state.report.dest}</code>
-              </div>
+              {connectAddress && (
+                <div className="rounded-md border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/10 px-4 py-3">
+                  <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
+                    Now connect in 7DTD
+                  </div>
+                  <ConnectCopy address={connectAddress} />
+                </div>
+              )}
             </div>
           )}
           {state.kind === "error" && (
@@ -634,6 +809,317 @@ function InstallView({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function ServerBrowseView({
+  servers,
+  error,
+  onSelect,
+}: {
+  servers: CatalogServer[] | null;
+  error: string | null;
+  onSelect: (s: CatalogServer) => void;
+}) {
+  if (error) {
+    return (
+      <div className="px-6 py-12">
+        <div className="rounded-lg border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-4 py-3 text-sm">
+          Couldn&apos;t reach the server catalog: {error}
+        </div>
+      </div>
+    );
+  }
+  if (servers === null) {
+    return (
+      <div className="px-6 py-12 text-sm text-[var(--color-text-dim)]">
+        Loading servers…
+      </div>
+    );
+  }
+  if (servers.length === 0) {
+    return (
+      <div className="px-6 py-12 text-sm text-[var(--color-text-dim)]">
+        No active servers right now.
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-6 py-8">
+      <div className="mb-6">
+        <h1 className="text-xl font-semibold tracking-tight">Browse servers</h1>
+        <p className="text-xs text-[var(--color-text-dim)] mt-1">
+          Click a server to install its attached pack and grab the
+          connect address.
+        </p>
+      </div>
+      <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {servers.map((s) => (
+          <li key={s.slug}>
+            <button
+              type="button"
+              onClick={() => onSelect(s)}
+              className="w-full text-left rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] hover:border-[var(--color-accent-soft)]/40 transition-colors overflow-hidden group"
+            >
+              <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative overflow-hidden">
+                {s.attachedPack?.coverImage ? (
+                  <img
+                    src={s.attachedPack.coverImage}
+                    alt=""
+                    className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+                    no pack
+                  </div>
+                )}
+                <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
+                {/* Region pill */}
+                <span className="absolute top-2 left-2 inline-flex items-center text-[10px] tracking-[0.14em] uppercase px-2 py-0.5 rounded bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[var(--color-text-bright)]/90 ring-1 ring-[var(--color-bg-raised)]/40">
+                  {REGION_LABEL[s.region] ?? s.region}
+                </span>
+                {/* Glowy online pill, top-right */}
+                {s.online ? (
+                  <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-status-success)]/15 backdrop-blur-sm text-[10px] font-medium text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40 shadow-[0_0_14px_rgba(80,200,120,0.45)]">
+                    <span className="size-1.5 rounded-full bg-[var(--color-status-success)] animate-pulse shadow-[0_0_6px_rgba(80,200,120,0.9)]" />
+                    Online
+                  </span>
+                ) : (
+                  <span className="absolute top-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[10px] text-[var(--color-text-dim)] ring-1 ring-[var(--color-bg-raised)]/40">
+                    <span className="size-1.5 rounded-full bg-[var(--color-text-dim)]/70" />
+                    Offline
+                  </span>
+                )}
+              </div>
+              <div className="p-4">
+                <div className="font-medium text-[var(--color-text-bright)] truncate mb-1">
+                  {s.name}
+                </div>
+                {s.attachedPack ? (
+                  <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
+                    Running{" "}
+                    <span className="text-[var(--color-accent-soft)]">
+                      {s.attachedPack.name}
+                    </span>
+                    {s.attachedPack.attachedVersion && (
+                      <span className="font-mono">
+                        {" "}
+                        · v{s.attachedPack.attachedVersion}
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-[10px] text-[var(--color-text-dim)] mb-2 italic">
+                    No pack attached
+                  </div>
+                )}
+                <p className="text-xs text-[var(--color-text-dim)] leading-relaxed line-clamp-2 min-h-[2.5em]">
+                  {s.summary ?? ""}
+                </p>
+                <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
+                  <span>
+                    {s.online
+                      ? s.currentPlayers >= s.maxPlayers
+                        ? "Full"
+                        : `${s.currentPlayers}/${s.maxPlayers}`
+                      : "—"}
+                  </span>
+                  <span>{s.uptimePct.toFixed(0)}% uptime</span>
+                </div>
+              </div>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ServerDetailView({
+  server,
+  attachedPack,
+  onBack,
+  onInstall,
+}: {
+  server: CatalogServer;
+  /** Full CatalogPack for the attached pack — null if the server
+   *  has no pack OR the catalog hasn't loaded yet (we can't install
+   *  what we don't have full metadata for). */
+  attachedPack: CatalogPack | null;
+  onBack: () => void;
+  onInstall: (pack: CatalogPack) => void;
+}) {
+  const cover = server.attachedPack?.coverImage;
+  return (
+    <div className="px-6 py-8 max-w-2xl mx-auto">
+      <button
+        type="button"
+        onClick={onBack}
+        className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] mb-4"
+      >
+        ← SERVERS
+      </button>
+
+      <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)] overflow-hidden mb-6">
+        <div className="aspect-[16/9] bg-[var(--color-bg-raised)] relative">
+          {cover ? (
+            <img src={cover} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center text-[var(--color-text-dim)]/50 text-xs tracking-[0.2em] uppercase">
+              no pack
+            </div>
+          )}
+          <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-[var(--color-bg-panel)]/40 to-transparent" />
+          <span className="absolute top-3 left-3 inline-flex items-center text-[10px] tracking-[0.14em] uppercase px-2 py-1 rounded bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[var(--color-text-bright)]/90 ring-1 ring-[var(--color-bg-raised)]/40">
+            {REGION_LABEL[server.region] ?? server.region}
+          </span>
+          {server.online ? (
+            <span className="absolute top-3 right-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--color-status-success)]/15 backdrop-blur-sm text-[11px] font-medium text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40 shadow-[0_0_18px_rgba(80,200,120,0.45)]">
+              <span className="size-1.5 rounded-full bg-[var(--color-status-success)] animate-pulse shadow-[0_0_6px_rgba(80,200,120,0.9)]" />
+              Online
+            </span>
+          ) : (
+            <span className="absolute top-3 right-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--color-bg-page)]/70 backdrop-blur-sm text-[11px] text-[var(--color-text-dim)] ring-1 ring-[var(--color-bg-raised)]/40">
+              <span className="size-1.5 rounded-full bg-[var(--color-text-dim)]/70" />
+              Offline
+            </span>
+          )}
+          <div className="absolute bottom-4 left-5 right-5">
+            <div className="text-xl font-semibold drop-shadow-lg">
+              {server.name}
+            </div>
+            <div className="text-xs text-[var(--color-text-dim)] mt-1">
+              {server.online
+                ? `${server.currentPlayers}/${server.maxPlayers} players`
+                : "Offline"}
+              {" · "}
+              {server.uptimePct.toFixed(0)}% uptime (7d)
+            </div>
+          </div>
+        </div>
+        {server.summary && (
+          <p className="px-5 py-4 text-sm text-[var(--color-text-bright)]/85 leading-relaxed border-t border-[var(--color-bg-raised)]">
+            {server.summary}
+          </p>
+        )}
+      </div>
+
+      {server.connectAddress && (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5 mb-4">
+          <div className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-2">
+            Connect address
+          </div>
+          <ConnectCopy address={server.connectAddress} />
+        </div>
+      )}
+
+      {server.attachedPack ? (
+        attachedPack ? (
+          <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+            <div className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-2">
+              Install the pack
+            </div>
+            <div className="flex items-start gap-3 mb-4">
+              {attachedPack.coverImage && (
+                <img
+                  src={attachedPack.coverImage}
+                  alt=""
+                  className="size-14 rounded-md object-cover shrink-0"
+                />
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-[var(--color-text-bright)] truncate">
+                  {attachedPack.name}
+                  {attachedPack.latestVersion && (
+                    <span className="font-mono text-[11px] text-[var(--color-text-dim)] ml-1.5">
+                      v{attachedPack.latestVersion}
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] text-[var(--color-text-dim)] mt-0.5">
+                  {attachedPack.fileCount.toLocaleString()} files ·{" "}
+                  {formatBytes(attachedPack.totalSizeBytes)} · by{" "}
+                  {attachedPack.publisherName}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onInstall(attachedPack)}
+              className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
+            >
+              Install pack & get connect address
+            </button>
+            <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+              We&apos;ll lay down the pack files, then surface the
+              direct-connect address so you can paste it into the
+              7DTD launcher.
+            </p>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5 text-sm text-[var(--color-text-dim)]">
+            Loading pack metadata…
+          </div>
+        )
+      ) : (
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5 text-sm text-[var(--color-text-dim)]">
+          This server doesn&apos;t have a pack attached — connect to
+          it directly with the address above.
+        </div>
+      )}
+
+      {(server.discordUrl || server.websiteUrl) && (
+        <div className="mt-4 flex gap-2">
+          {server.discordUrl && (
+            <a
+              href={server.discordUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs transition-colors"
+            >
+              Discord ↗
+            </a>
+          )}
+          {server.websiteUrl && (
+            <a
+              href={server.websiteUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs transition-colors"
+            >
+              Website ↗
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConnectCopy({ address }: { address: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <code className="font-mono text-sm text-[var(--color-text-bright)] break-all">
+        {address}
+      </code>
+      <button
+        type="button"
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(address);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          } catch {
+            // Clipboard API not available — visible text is still selectable.
+          }
+        }}
+        className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] tracking-wide uppercase border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-accent-soft)] text-[var(--color-text-dim)] transition-colors"
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
     </div>
   );
 }

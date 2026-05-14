@@ -49,6 +49,45 @@ struct CatalogResponse {
     packs: Vec<CatalogPack>,
 }
 
+/// Mirrors GET /api/v1/servers's response shape. Tauri serializes
+/// this back to the React frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogServer {
+    pub slug: String,
+    pub name: String,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub region: String,
+    pub connect_address: Option<String>,
+    pub discord_url: Option<String>,
+    pub website_url: Option<String>,
+    pub tags: Vec<String>,
+    pub current_players: i64,
+    pub max_players: i64,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+    pub online: bool,
+    pub uptime_pct: f64,
+    pub attached_pack: Option<AttachedPack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedPack {
+    pub slug: String,
+    pub name: String,
+    pub cover_image: Option<String>,
+    pub latest_version: Option<String>,
+    pub attached_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServersResponse {
+    servers: Vec<CatalogServer>,
+}
+
 /// Payload emitted to the frontend on install progress. We track a
 /// running byte total in atomics inside the command so the frontend
 /// can render a single bar instead of accumulating deltas itself.
@@ -122,13 +161,14 @@ fn canonical_mods_path() -> Option<PathBuf> {
     None
 }
 
+fn user_agent_string() -> String {
+    format!("packrelay-launcher/{}", env!("CARGO_PKG_VERSION"))
+}
+
 #[tauri::command]
 async fn list_packs() -> Result<Vec<CatalogPack>, String> {
     let http = reqwest::Client::builder()
-        .user_agent(concat!(
-            "packrelay-launcher/",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(user_agent_string())
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -146,6 +186,29 @@ async fn list_packs() -> Result<Vec<CatalogPack>, String> {
         .await
         .map_err(|e| format!("parsing catalog: {e}"))?;
     Ok(body.packs)
+}
+
+#[tauri::command]
+async fn list_servers() -> Result<Vec<CatalogServer>, String> {
+    let http = reqwest::Client::builder()
+        .user_agent(user_agent_string())
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("{DEFAULT_API_URL}/api/v1/servers");
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("network error: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("server catalog fetch failed: HTTP {}", resp.status()));
+    }
+    let body: ServersResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parsing server catalog: {e}"))?;
+    Ok(body.servers)
 }
 
 #[tauri::command]
@@ -225,6 +288,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_packs,
+            list_servers,
             install_pack,
             default_install_dest
         ])
