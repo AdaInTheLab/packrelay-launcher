@@ -104,8 +104,13 @@ toward earlier in the session.
   or a real search service.
 - **Pagination**: catalog endpoints cap at `?limit=100` today.
   Need cursor-based paging once we cross that.
-- **Webhooks**: publishers want notification when a downstream
-  consumer (server) pins their pack. Webhook-out from the cloud.
+- ~~**Webhooks**~~ — shipped: publishers register endpoints at
+  `/account/webhooks`, receive HMAC-SHA256-signed POSTs from the
+  cloud on event triggers. v0 fires `pack.version_published` on
+  every successful version publish; payload is event-tagged so
+  more event types extend additively. Per-row signing secret is
+  shown once at creation (api-token-style), management page shows
+  last-delivery status + a "Send test" button.
 - **Rate limiting**: catalog endpoints are unauthenticated +
   uncached past their stale-while-revalidate window. Add a
   per-IP token bucket if abuse becomes a thing.
