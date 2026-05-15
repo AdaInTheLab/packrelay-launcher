@@ -138,6 +138,16 @@ type InstallState =
   | { kind: "done"; result: DoneResult }
   | { kind: "error"; message: string };
 
+// Lives at the App level so the bottom-of-LeftRail dock can show
+// progress even when the user has navigated away from InstallView.
+// InstallView toggles this on enter-running / clear-on-exit, and
+// App.tsx's global install://progress listener fills progress in.
+type ActiveInstall = {
+  pack: CatalogPack;
+  mode: InstallMode;
+  progress: InstallProgress | null;
+};
+
 // Mirrors packrelay-core's VerifyReport / VerifyFailure / RepairReport
 // (#[serde(rename_all = "camelCase")], internally-tagged enum).
 type VerifyFailure =
@@ -410,6 +420,33 @@ function App() {
   // InstallView uses it as the initial destination so users don't
   // type or even pick a folder for the common case.
   const [defaultDest, setDefaultDest] = useState<string>(FALLBACK_DEFAULT_DEST);
+
+  // Hoisted out of InstallView so the active-downloads dock at the
+  // bottom of LeftRail can render — and keep rendering — even when
+  // the user clicks away to Browse / Profiles / Settings mid-install.
+  // The Rust task keeps running regardless; we just need to follow
+  // its events from a component that lives above the view switch.
+  const [activeInstall, setActiveInstall] = useState<ActiveInstall | null>(
+    null
+  );
+
+  // Single global subscription to install://progress so the dock
+  // updates even when InstallView is unmounted. InstallView ALSO
+  // listens locally (for its own card progress UI); both can coexist
+  // — Tauri broadcasts events to every listener.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<InstallProgress>("install://progress", (e) => {
+        setActiveInstall((prev) =>
+          prev ? { ...prev, progress: e.payload } : prev
+        );
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // Filter state hoisted out of the views so it survives both
   // intra-app navigation (clicking a pack and coming back) and
@@ -807,6 +844,14 @@ function App() {
     const installedRecord =
       history.find((r) => r.slug === selectedPack.slug) ?? null;
     if (packView === "install") {
+      // If an install is already running for THIS pack (user
+      // navigated away mid-install and came back), seed the
+      // InstallView with that state so it shows the live progress
+      // bar immediately instead of restarting at "idle".
+      const seededActive =
+        activeInstall && activeInstall.pack.slug === selectedPack.slug
+          ? activeInstall
+          : null;
       mainContent = (
         <InstallView
           pack={selectedPack}
@@ -820,6 +865,8 @@ function App() {
                 ? "DETAILS"
                 : "BROWSE"
           }
+          seededActive={seededActive}
+          onActiveChange={setActiveInstall}
           onBack={() => {
             if (canReturnToDetail) {
               setPackView("detail");
@@ -930,6 +977,18 @@ function App() {
           auth={auth}
           onSignInClick={() => setShowSignIn(true)}
           onSignOut={handleSignOut}
+          activeInstall={activeInstall}
+          onJumpToActiveInstall={() => {
+            // Re-enter InstallView for the running pack. Bypasses
+            // the catalog click path so we use the already-known
+            // pack object even if it's been filtered out of the
+            // current catalog.
+            if (activeInstall) {
+              setSelectedPack(activeInstall.pack);
+              setPackView("install");
+              setCanReturnToDetail(false);
+            }
+          }}
         />
         <main className="flex-1 overflow-y-auto">{mainContent}</main>
       </div>
@@ -973,12 +1032,19 @@ function LeftRail({
   auth,
   onSignInClick,
   onSignOut,
+  activeInstall,
+  onJumpToActiveInstall,
 }: {
   view: ViewKey;
   onViewChange: (next: ViewKey) => void;
   auth: AuthState;
   onSignInClick: () => void;
   onSignOut: () => void;
+  /** If non-null, the dock at the bottom of the rail surfaces the
+   *  in-flight install so it's visible from any view. */
+  activeInstall: ActiveInstall | null;
+  /** Clicking the dock re-enters InstallView for the running pack. */
+  onJumpToActiveInstall: () => void;
 }) {
   return (
     <aside className="w-56 shrink-0 border-r border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 flex flex-col">
@@ -1064,6 +1130,13 @@ function LeftRail({
         </RailExternal>
       </nav>
 
+      {activeInstall && (
+        <ActiveDownloadsDock
+          active={activeInstall}
+          onJump={onJumpToActiveInstall}
+        />
+      )}
+
       <div className="px-3 pb-3 pt-2 border-t border-[var(--color-bg-raised)]">
         <AuthChip
           auth={auth}
@@ -1072,6 +1145,74 @@ function LeftRail({
         />
       </div>
     </aside>
+  );
+}
+
+// Live install strip at the bottom of the rail. Visible from any
+// view so the user always knows the launcher is doing something —
+// click it to jump back to the InstallView for live byte counters
+// and the cancel affordance. Mode label flips between Installing
+// / Updating / Reinstalling so the user can tell which flow they're
+// in even when they're three views away from the install card.
+function ActiveDownloadsDock({
+  active,
+  onJump,
+}: {
+  active: ActiveInstall;
+  onJump: () => void;
+}) {
+  const { pack, mode, progress } = active;
+  const pct =
+    progress && progress.totalBytes > 0
+      ? Math.min(100, (progress.bytesSoFar / progress.totalBytes) * 100)
+      : 0;
+  const modeLabel =
+    mode === "update"
+      ? "Updating"
+      : mode === "reinstall"
+        ? "Reinstalling"
+        : "Installing";
+
+  return (
+    <button
+      type="button"
+      onClick={onJump}
+      className="w-full text-left px-3 pt-3 pb-2 border-t border-[var(--color-bg-raised)] hover:bg-[var(--color-bg-raised)]/30 transition-colors group"
+      title="Jump to install progress"
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        {/* Pulsing dot — accent-soft so it doesn't fight with the
+            green "online" / red "danger" semantics elsewhere. */}
+        <span className="relative size-1.5 shrink-0">
+          <span className="absolute inset-0 rounded-full bg-[var(--color-accent-soft)] animate-ping opacity-60" />
+          <span className="absolute inset-0 rounded-full bg-[var(--color-accent-soft)]" />
+        </span>
+        <span className="text-[9px] tracking-[0.18em] uppercase font-medium text-[var(--color-accent-soft)]">
+          {modeLabel}
+        </span>
+        <span className="ml-auto text-[10px] tabular-nums text-[var(--color-text-dim)] group-hover:text-[var(--color-text-bright)]">
+          {pct.toFixed(0)}%
+        </span>
+      </div>
+      <div
+        className="text-[11px] text-[var(--color-text-bright)] truncate font-medium"
+        title={pack.name}
+      >
+        {pack.name}
+      </div>
+      <div className="mt-1.5 h-1 rounded-full bg-[var(--color-bg-raised)] overflow-hidden">
+        <div
+          className="h-full bg-[var(--color-accent-soft)] transition-[width] duration-150 ease-linear"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {/* Per-file detail when we have it. Falls through to a
+          generic line when progress hasn't ticked yet so the
+          dock doesn't collapse height on first render. */}
+      <div className="mt-1 text-[10px] text-[var(--color-text-dim)] truncate">
+        {progress?.lastCompletedFile ?? "Preparing…"}
+      </div>
+    </button>
   );
 }
 
@@ -2159,6 +2300,8 @@ function InstallView({
   installedRecord,
   connectAddress,
   backLabel,
+  seededActive,
+  onActiveChange,
   onBack,
   onInstalled,
   onUpdated,
@@ -2177,6 +2320,16 @@ function InstallView({
   /** What the back button reads — "BROWSE" for pack browse,
    *  the server's name when launched from a server detail page. */
   backLabel: string;
+  /** If an install for THIS pack is already running (user navigated
+   *  away mid-install and came back via the dock), App passes it in
+   *  here so the view re-mounts straight into the running state
+   *  with the most recent progress. Null when no active install
+   *  matches. */
+  seededActive: ActiveInstall | null;
+  /** App-level hoisted activeInstall setter — InstallView calls it
+   *  with the new state on enter-running, and null on transition out
+   *  (done/error). Drives the bottom-of-LeftRail downloads dock. */
+  onActiveChange: (next: ActiveInstall | null) => void;
   onBack: () => void;
   onInstalled: (report: InstallReport) => void;
   onUpdated: (report: UpdateReport) => void;
@@ -2198,7 +2351,14 @@ function InstallView({
   const destLocked = mode === "update";
 
   const [dest, setDest] = useState(defaultDest);
-  const [state, setState] = useState<InstallState>({ kind: "idle" });
+  // If App says there's a live install for this pack (user came back
+  // via the dock), pre-populate as "running" with the latest progress
+  // so the view doesn't flash an "idle" form before re-engaging.
+  const [state, setState] = useState<InstallState>(() =>
+    seededActive
+      ? { kind: "running", progress: seededActive.progress }
+      : { kind: "idle" }
+  );
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -2232,6 +2392,10 @@ function InstallView({
 
   async function startInstall() {
     setState({ kind: "running", progress: null });
+    // Tell App "an install is now active for this pack" so the
+    // bottom-of-LeftRail dock can render. progress starts null and
+    // gets filled by App's own install://progress listener.
+    onActiveChange({ pack, mode, progress: null });
     try {
       if (mode === "update") {
         const report = await invoke<UpdateReport>("update_pack", {
@@ -2253,6 +2417,11 @@ function InstallView({
         kind: "error",
         message: typeof e === "string" ? e : `${e}`,
       });
+    } finally {
+      // Done OR error → clear the dock either way. The InstallView
+      // itself shows the success/failure card to the user; the dock
+      // is for "is anything happening right now."
+      onActiveChange(null);
     }
   }
 
