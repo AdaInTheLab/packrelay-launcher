@@ -237,6 +237,12 @@ type InstallRecord = {
   fileCount: number;
   /** ISO timestamp of when the install completed. */
   installedAt: string;
+  /** Cover image URL captured at install time. The library card
+   *  prefers this over the catalog match so removed-from-catalog
+   *  packs (publisher took it down, made it private, catalog is
+   *  unreachable) still render their cover from history. Older
+   *  records may not have this — loadHistory() backfills `null`. */
+  coverImage: string | null;
 };
 
 const HISTORY_STORAGE_KEY = "packrelay.installHistory.v1";
@@ -297,7 +303,14 @@ function loadHistory(): InstallRecord[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed as InstallRecord[];
+    // Backfill coverImage on older records that pre-date the field.
+    // The library row falls back to the catalog match, so the worst
+    // case for these legacy rows is the same "no cover" placeholder
+    // they had before; new installs will capture it.
+    return parsed.map((r: InstallRecord & { coverImage?: string | null }) => ({
+      ...r,
+      coverImage: r.coverImage ?? null,
+    }));
   } catch {
     return [];
   }
@@ -722,7 +735,7 @@ function App() {
   }, []);
 
   const recordInstall = useCallback(
-    (slug: string, report: InstallReport) => {
+    (slug: string, report: InstallReport, coverImage: string | null) => {
       const entry: InstallRecord = {
         slug,
         name: report.displayName,
@@ -731,6 +744,7 @@ function App() {
         totalBytes: report.totalBytes,
         fileCount: report.fileCount,
         installedAt: new Date().toISOString(),
+        coverImage,
       };
       setHistory((prev) => {
         // Dedup: drop any prior entry for the same slug — the latest
@@ -750,7 +764,7 @@ function App() {
   // don't dedupe-to-top here because the sort order already reflects
   // recency, and re-installing keeps the same slug→one-row invariant.
   const recordUpdate = useCallback(
-    (slug: string, report: UpdateReport) => {
+    (slug: string, report: UpdateReport, coverImage: string | null) => {
       setHistory((prev) => {
         const next = prev.map((r) =>
           r.slug === slug
@@ -758,6 +772,9 @@ function App() {
                 ...r,
                 version: report.toVersion,
                 installedAt: new Date().toISOString(),
+                // Refresh the captured cover too — publishers
+                // sometimes rev artwork between versions.
+                coverImage,
                 // fileCount/totalBytes aren't reported by update —
                 // we don't bother stale-stamping them; the values
                 // are only used for the recent-installs sidebar
@@ -874,8 +891,12 @@ function App() {
               setSelectedPack(null);
             }
           }}
-          onInstalled={(report) => recordInstall(selectedPack.slug, report)}
-          onUpdated={(report) => recordUpdate(selectedPack.slug, report)}
+          onInstalled={(report) =>
+            recordInstall(selectedPack.slug, report, selectedPack.coverImage)
+          }
+          onUpdated={(report) =>
+            recordUpdate(selectedPack.slug, report, selectedPack.coverImage)
+          }
         />
       );
     } else {
@@ -1696,7 +1717,7 @@ function LibraryTile({
             no cover
           </div>
           <CoverImage
-            src={catalogPack?.coverImage}
+            src={catalogPack?.coverImage ?? record.coverImage}
             className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
           />
           <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
