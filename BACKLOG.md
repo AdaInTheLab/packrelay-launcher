@@ -71,9 +71,12 @@ features.
 These are tracked against the all-up Dashboard mockup we worked
 toward earlier in the session.
 
-- **Active-downloads dock** at the bottom of the LeftRail showing
-  in-flight install progress. Needs InstallView state hoisted to
-  App.
+- ~~**Active-downloads dock**~~ — shipped: bottom-of-LeftRail strip
+  surfaces in-flight installs from any view (pulsing dot, mode
+  label, pack name, percentage, last completed file). Click
+  jumps back to InstallView. `activeInstall` state hoisted to
+  App; global `install://progress` listener feeds the dock so it
+  keeps updating even when InstallView is unmounted.
 - **Notifications surface** (the bell in the mockup's top-right).
   Requires a notifications/events store on the cloud — per-user
   push from publisher new-version events, server status changes,
