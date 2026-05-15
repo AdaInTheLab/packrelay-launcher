@@ -3876,6 +3876,10 @@ type CacheStats = {
   referencedBlobs: number;
   unreferencedBlobs: number;
   reclaimableBytes: number;
+  // RFC3339; null when the launcher has never swept this cache.
+  // Set by both the manual "Clean cache" button and the weekly
+  // background sweep that fires from app::setup.
+  lastSweepAt: string | null;
 };
 type GcResult = {
   blobsRemoved: number;
@@ -3916,15 +3920,26 @@ function CacheSection() {
 
   return (
     <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
-      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1">
-        Cache
-      </h2>
+      <div className="flex items-baseline justify-between gap-3 mb-1">
+        <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85">
+          Cache
+        </h2>
+        {stats?.lastSweepAt && (
+          <span
+            className="text-[10px] text-[var(--color-text-dim)] tabular-nums"
+            title={`Last cleaned at ${stats.lastSweepAt}`}
+          >
+            Last cleaned {formatRelativeTime(stats.lastSweepAt)}
+          </span>
+        )}
+      </div>
       <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed mb-4">
         Every file you install is content-addressed and stored once
         in a shared blob cache — that&apos;s how profile switching
         stays fast (hardlinks, not copies). Uninstalled packs and
         older pack versions stick around here until a deliberate
-        sweep, so switching back never has to re-download.
+        sweep, so switching back never has to re-download. The
+        launcher also auto-sweeps weekly in the background.
       </p>
 
       {stats === null && error === null && (

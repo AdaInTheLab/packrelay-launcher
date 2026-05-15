@@ -857,9 +857,13 @@ async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 async fn cache_stats(app: AppHandle) -> Result<CacheStats, String> {
     let layout = store_layout(&app)?;
-    blob_cache::cache_stats(&layout.cache_dir(), &layout.profiles_dir())
-        .await
-        .map_err(|e| format!("{e:#}"))
+    blob_cache::cache_stats(
+        &layout.cache_dir(),
+        &layout.profiles_dir(),
+        Some(&layout.cache_gc_state_path()),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Delete every blob in the cache that no profile sidecar still
@@ -868,10 +872,25 @@ async fn cache_stats(app: AppHandle) -> Result<CacheStats, String> {
 #[tauri::command]
 async fn cache_gc(app: AppHandle) -> Result<GcResult, String> {
     let layout = store_layout(&app)?;
-    blob_cache::gc_cache(&layout.cache_dir(), &layout.profiles_dir())
-        .await
-        .map_err(|e| format!("{e:#}"))
+    blob_cache::gc_cache(
+        &layout.cache_dir(),
+        &layout.profiles_dir(),
+        &layout.cache_gc_state_path(),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
+
+/// How long the launcher waits between automatic cache sweeps.
+/// Weekly is the right cadence for a desktop app — long enough
+/// that the disk walk + delete is unnoticeable amortized, short
+/// enough that uninstalls don't linger forever.
+const BACKGROUND_GC_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Delay before kicking off the startup sweep. Lets the UI bring
+/// itself up + the user start clicking before we burn CPU walking
+/// the cache. 60s feels invisible in practice.
+const BACKGROUND_GC_STARTUP_DELAY_SECS: u64 = 60;
 
 #[tauri::command]
 async fn profile_clone(
@@ -1199,6 +1218,37 @@ pub fn run() {
         // CI secrets.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Background blob-cache GC: weekly sweep on startup so disk
+        // usage doesn't grow forever. Best-effort — failures stay
+        // silent so a hiccup here never blocks the UI.
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    BACKGROUND_GC_STARTUP_DELAY_SECS,
+                ))
+                .await;
+                let Ok(layout) = store_layout(&handle) else {
+                    return;
+                };
+                match blob_cache::gc_if_due(
+                    &layout.cache_dir(),
+                    &layout.profiles_dir(),
+                    &layout.cache_gc_state_path(),
+                    BACKGROUND_GC_INTERVAL_SECS,
+                )
+                .await
+                {
+                    Ok(Some(r)) => eprintln!(
+                        "[cache-gc] auto-swept: removed {} blob(s), freed {} bytes",
+                        r.blobs_removed, r.bytes_freed
+                    ),
+                    Ok(None) => {} // not yet due — quiet
+                    Err(e) => eprintln!("[cache-gc] auto-sweep failed: {e:#}"),
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_packs,
             list_servers,

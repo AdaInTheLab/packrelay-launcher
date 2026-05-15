@@ -74,6 +74,12 @@ impl StoreLayout {
     pub fn active_pointer(&self) -> PathBuf {
         self.root.join("active.json")
     }
+    /// Where the blob-cache GC stores its `last_sweep_at` timestamp.
+    /// Lives next to `active.json` so all per-launcher state is in
+    /// one directory.
+    pub fn cache_gc_state_path(&self) -> PathBuf {
+        self.root.join("cache_gc_state.json")
+    }
 }
 
 // ---------- Wire types ----------

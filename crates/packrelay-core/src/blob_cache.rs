@@ -20,10 +20,11 @@
 // (or sidecar) references.
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
@@ -228,6 +229,20 @@ pub struct CacheStats {
     pub referenced_blobs: u64,
     pub unreferenced_blobs: u64,
     pub reclaimable_bytes: u64,
+    /// RFC3339 timestamp of the most recent successful sweep (manual
+    /// or auto). None if the launcher has never swept this cache.
+    /// Surfaced in Settings so the user knows the background sweep
+    /// is alive even when there's nothing to clean.
+    pub last_sweep_at: Option<String>,
+}
+
+/// Persisted alongside the cache so the background sweep can gate
+/// itself on a minimum interval (don't burn CPU walking the cache
+/// on every app launch). Lives at `<store-root>/cache_gc_state.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheGcState {
+    pub last_sweep_at: Option<String>,
 }
 
 /// What a GC pass actually removed.
@@ -241,12 +256,22 @@ pub struct GcResult {
 /// Compute cache stats without modifying anything. Cheap dry-run
 /// for the Settings page so the user can see "X MB reclaimable"
 /// before clicking the button.
+///
+/// `state_path` is the persisted GC state (last sweep timestamp)
+/// used purely to surface "Last cleaned" in the UI — pass `None`
+/// if the caller doesn't care.
 pub async fn cache_stats(
     cache_root: &Path,
     profiles_dir: &Path,
+    state_path: Option<&Path>,
 ) -> Result<CacheStats> {
     let referenced = collect_referenced_hashes(profiles_dir).await?;
     let blobs = walk_blobs(cache_root).await?;
+
+    let last_sweep_at = match state_path {
+        Some(p) => read_gc_state(p).await.unwrap_or_default().last_sweep_at,
+        None => None,
+    };
 
     let mut stats = CacheStats {
         total_blobs: 0,
@@ -254,6 +279,7 @@ pub async fn cache_stats(
         referenced_blobs: 0,
         unreferenced_blobs: 0,
         reclaimable_bytes: 0,
+        last_sweep_at,
     };
     for (hash, size, _path) in &blobs {
         stats.total_blobs += 1;
@@ -275,9 +301,16 @@ pub async fn cache_stats(
 /// We also opportunistically remove now-empty two-char prefix
 /// directories so the cache tree doesn't accumulate empty
 /// directories forever.
+///
+/// Writes `last_sweep_at = now` to `state_path` on completion (even
+/// if 0 blobs were removed — the user still asked us to sweep, and
+/// the background-sweep gate should respect that). Failures to
+/// write the state file are non-fatal: we already did the actual
+/// work, the worst case is that the next launch sweeps again.
 pub async fn gc_cache(
     cache_root: &Path,
     profiles_dir: &Path,
+    state_path: &Path,
 ) -> Result<GcResult> {
     let referenced = collect_referenced_hashes(profiles_dir).await?;
     let blobs = walk_blobs(cache_root).await?;
@@ -319,7 +352,130 @@ pub async fn gc_cache(
         }
     }
 
+    // Persist last_sweep_at. Best-effort: if the write fails the
+    // next launch just sweeps again, which is harmless.
+    let _ = write_gc_state(
+        state_path,
+        &CacheGcState {
+            last_sweep_at: Some(now_rfc3339()),
+        },
+    )
+    .await;
+
     Ok(result)
+}
+
+/// Run [`gc_cache`] only if the cache has gone too long without
+/// being swept. Returns `Ok(Some(result))` if we ran, `Ok(None)` if
+/// we skipped because the last sweep is recent enough. Used by the
+/// launcher startup task — "auto-clean once a week" behaviour.
+///
+/// `min_interval_secs` is the gap required between sweeps (e.g.
+/// `7 * 24 * 60 * 60` for weekly).
+pub async fn gc_if_due(
+    cache_root: &Path,
+    profiles_dir: &Path,
+    state_path: &Path,
+    min_interval_secs: u64,
+) -> Result<Option<GcResult>> {
+    let state = read_gc_state(state_path).await.unwrap_or_default();
+    let due = match state.last_sweep_at.as_deref() {
+        None => true,
+        Some(ts) => match parse_rfc3339_to_unix(ts) {
+            Some(prev) => now_unix().saturating_sub(prev) >= min_interval_secs,
+            None => true, // unparseable timestamp → treat as never-swept
+        },
+    };
+    if !due {
+        return Ok(None);
+    }
+    let result = gc_cache(cache_root, profiles_dir, state_path).await?;
+    Ok(Some(result))
+}
+
+async fn read_gc_state(state_path: &Path) -> Result<CacheGcState> {
+    match fs::read_to_string(state_path).await {
+        Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CacheGcState::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", state_path.display())),
+    }
+}
+
+async fn write_gc_state(state_path: &Path, state: &CacheGcState) -> Result<()> {
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(state_path, serde_json::to_string_pretty(state)?).await?;
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_rfc3339() -> String {
+    // Mirrors profile.rs::now_rfc3339 — keeping the format consistent
+    // across the launcher's state files. Duplicated rather than
+    // shared to avoid making profile's tiny helper module pub.
+    let secs = now_unix();
+    let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Inverse of `now_rfc3339` for the subset of RFC3339 we actually
+/// emit (`YYYY-MM-DDTHH:MM:SSZ`). Returns None on anything weirder
+/// so the caller falls back to "never swept".
+fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
+    // Bail fast on the wrong shape — we control the producer, so
+    // we don't try to be lenient about timezones or sub-second
+    // precision.
+    let b = s.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
+        || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
+    {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: u32 = s.get(5..7)?.parse().ok()?;
+    let d: u32 = s.get(8..10)?.parse().ok()?;
+    let h: u64 = s.get(11..13)?.parse().ok()?;
+    let mi: u64 = s.get(14..16)?.parse().ok()?;
+    let se: u64 = s.get(17..19)?.parse().ok()?;
+    // Days from civil (Hinnant inverse).
+    let y_adj = if mo <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = (y_adj - era * 400) as u64;
+    let m = mo as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86400 + h * 3600 + mi * 60 + se)
+}
+
+fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64 + era * 400) as u32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, h, mi, s)
 }
 
 /// Walk all profile sidecars and gather the SHA-256s of every file
