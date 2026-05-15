@@ -19,12 +19,9 @@ features.
   on the packs table, manually flipped by an admin. Shows up at
   the top of the catalog. Lets us curate before there's organic
   signal.
-- **Sort selector on Browse Servers** — the pack browse has
-  Popular / Newest / Favorites chips; the server browse only has
-  region + boolean filters. Add a sort selector mirroring the
-  cloud's three modes (Players / Newest / Favorites). Needs
-  list_servers to take a sort param + the filter state to gain
-  a `sort` field with persistence.
+- ~~**Sort selector on Browse Servers**~~ — shipped: client-side
+  Players / Newest / Favorites chips mirroring the pack browse,
+  persisted into the filter state.
 
 ## Profiles / library
 

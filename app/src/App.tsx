@@ -304,10 +304,17 @@ function saveHistory(entries: InstallRecord[]): void {
 // link could share the same shape.
 type PackSort = "popular" | "new" | "favorites";
 type PackFilters = { q: string; tag: string; sort: PackSort };
+// Server-browse sort modes mirror the cloud's /servers page so
+// users moving between web and launcher see the same options:
+//   players   — currentPlayers desc (busiest server first)
+//   new       — createdAt desc
+//   favorites — favoriteCount desc
+type ServerSort = "players" | "new" | "favorites";
 type ServerFilters = {
   region: string;
   onlineOnly: boolean;
   notFull: boolean;
+  sort: ServerSort;
 };
 
 const PACK_FILTERS_KEY = "packrelay.packFilters.v1";
@@ -318,6 +325,7 @@ const DEFAULT_SERVER_FILTERS: ServerFilters = {
   region: "",
   onlineOnly: false,
   notFull: false,
+  sort: "players",
 };
 
 function loadPackFilters(): PackFilters {
@@ -349,6 +357,15 @@ function loadServerFilters(): ServerFilters {
       region: typeof parsed.region === "string" ? parsed.region : "",
       onlineOnly: !!parsed.onlineOnly,
       notFull: !!parsed.notFull,
+      // Stored as a string but validate against the union — guards
+      // against a saved value from a future version that has a
+      // mode we don't recognize anymore.
+      sort:
+        parsed.sort === "new"
+          ? "new"
+          : parsed.sort === "favorites"
+            ? "favorites"
+            : "players",
     };
   } catch {
     return DEFAULT_SERVER_FILTERS;
@@ -2786,20 +2803,49 @@ function ServerBrowseLoaded({
   filters: ServerFilters;
   onFiltersChange: (next: ServerFilters) => void;
 }) {
-  const { region, onlineOnly, notFull } = filters;
+  const { region, onlineOnly, notFull, sort } = filters;
   const setRegion = (v: string) => onFiltersChange({ ...filters, region: v });
   const setOnlineOnly = (v: boolean) =>
     onFiltersChange({ ...filters, onlineOnly: v });
   const setNotFull = (v: boolean) =>
     onFiltersChange({ ...filters, notFull: v });
+  const setSort = (v: ServerSort) =>
+    onFiltersChange({ ...filters, sort: v });
 
-  const filtered = servers.filter((s) => {
-    if (region && s.region !== region) return false;
-    if (onlineOnly && !s.online) return false;
-    if (notFull && s.currentPlayers >= s.maxPlayers) return false;
-    return true;
-  });
-  const hasFilters = !!region || onlineOnly || notFull;
+  const filtered = servers
+    .filter((s) => {
+      if (region && s.region !== region) return false;
+      if (onlineOnly && !s.online) return false;
+      if (notFull && s.currentPlayers >= s.maxPlayers) return false;
+      return true;
+    })
+    .slice()
+    .sort((a, b) => {
+      // Three sort modes, all desc. Stable-ish on ties via slug
+      // tiebreaker so reorders during a poll don't shuffle the
+      // list visibly.
+      if (sort === "new") {
+        const ax = new Date(a.createdAt).getTime();
+        const bx = new Date(b.createdAt).getTime();
+        if (bx !== ax) return bx - ax;
+      } else if (sort === "favorites") {
+        if (b.favoriteCount !== a.favoriteCount) {
+          return b.favoriteCount - a.favoriteCount;
+        }
+      } else {
+        // "players" — busiest server first. Online servers always
+        // outrank offline ones in this mode (an offline server
+        // claiming "100 players" wouldn't be more interesting than
+        // a live one with 4).
+        if (a.online !== b.online) return a.online ? -1 : 1;
+        if (b.currentPlayers !== a.currentPlayers) {
+          return b.currentPlayers - a.currentPlayers;
+        }
+      }
+      return a.slug.localeCompare(b.slug);
+    });
+  const hasFilters =
+    !!region || onlineOnly || notFull || sort !== DEFAULT_SERVER_FILTERS.sort;
   const clearFilters = () => onFiltersChange(DEFAULT_SERVER_FILTERS);
 
   return (
@@ -2849,6 +2895,25 @@ function ServerBrowseLoaded({
         >
           Not full
         </FilterChip>
+        <span className="mx-1 text-[var(--color-bg-raised)]">·</span>
+        <span className="text-[11px] text-[var(--color-text-dim)] mr-1">
+          Sort
+        </span>
+        <SortChip
+          active={sort === "players"}
+          onClick={() => setSort("players")}
+        >
+          Players
+        </SortChip>
+        <SortChip active={sort === "new"} onClick={() => setSort("new")}>
+          Newest
+        </SortChip>
+        <SortChip
+          active={sort === "favorites"}
+          onClick={() => setSort("favorites")}
+        >
+          Favorites
+        </SortChip>
         {hasFilters && (
           <button
             type="button"
