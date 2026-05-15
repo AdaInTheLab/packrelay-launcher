@@ -34,9 +34,33 @@ features.
   cached blob not in that set. Empty prefix dirs get swept too.
   A background sweep also runs weekly from `tauri::Builder.setup`
   (`gc_if_due`, gated on `cache_gc_state.json#lastSweepAt`).
-- **`-userdatafolder` profile switching** — would make switching
-  instant (Mods/Saves/Worlds via launch arg instead of folder
-  copy). Need to confirm V2.6 client honors it.
+- ~~**`-userdatafolder` profile switching**~~ — investigated;
+  doesn't work for V2.6. The flag is a stock Unity arg that
+  remaps `Application.persistentDataPath`, but 7DTD's binary
+  doesn't use `persistentDataPath` for its userdata. It calls
+  `Environment.GetFolderPath(SpecialFolder.ApplicationData)` and
+  appends `7DaysToDie` directly — the Unity flag has no effect
+  on that path. 7DTD doesn't parse its own `-userdatafolder=`
+  arg either (literal string absent from
+  `Assembly-CSharp.dll`). The internal `UserDataFolder` property
+  exists with a recomputation method (`UpdateUserDataFolder-
+  DependentPaths`) but has no external setter, and a leftover
+  `UNUSED_UserDataFolder` field suggests the feature was
+  considered and abandoned.
+
+- **Junction-point profile switching** (the better idea) —
+  instead of copying Mods/Saves/GeneratedWorlds on every
+  switch, junction-link them: NTFS `mklink /J` on Windows,
+  `ln -s` on macOS/Linux. Profile switch becomes "delete
+  junction, recreate pointing at new profile dir" — a few
+  filesystem ops instead of multi-GB copies. 7DTD's file IO
+  traverses junctions transparently (Unity's `File.IO` calls
+  go through the OS layer that resolves them). The profile.rs
+  `replace_dir` flow we already have can swap-in a single
+  reparse-point delete + create at the top level. Saves +
+  GeneratedWorlds are user-editable so junction makes that
+  trivial; mods are pack-managed so a stale junction during
+  install is the only edge case to handle.
 - ~~**Clone profile**~~ — shipped: Duplicate (⎘) glyph on each
   ProfileCard forks mods + saves + worlds into a new profile
   named `<src> (copy)` (auto-bumped on collision). Pack binding
