@@ -93,6 +93,16 @@ pub struct CatalogPack {
     pub file_count: i64,
     pub total_size_bytes: i64,
     pub download_count: i64,
+    /// Mirrors the cloud's `favoriteCount`. The TS `Pack` type has
+    /// declared this since the hearts work landed (commit 0a3852c)
+    /// but the Rust side never declared the matching field — so
+    /// every catalog row arrived at the frontend with
+    /// `favoriteCount: undefined`, which crashed BrowseView's
+    /// render path silently (no error boundary → blank subtree).
+    /// `#[serde(default)]` keeps us tolerant of older API responses
+    /// that didn't include the field.
+    #[serde(default)]
+    pub favorite_count: i64,
     /// Admin-curated editor's pick. Featured packs always sort to
     /// the top of the catalog on both /browse and here. Defaults
     /// to false so older API responses (pre-0011 migration) still
