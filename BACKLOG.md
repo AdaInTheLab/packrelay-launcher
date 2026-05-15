@@ -15,8 +15,6 @@ features.
   `install_events` table on the cloud (or a `weekly_installs` column
   rolled by a weekly cron), then a `?sort=trending` query param on
   `/api/v1/packs`.
-- **"Updated recently" badge** when a pack published a new version
-  in the last N days. Tracks `latest_version` change date.
 - **Editor's picks / staff featured** — one boolean (`is_featured`)
   on the packs table, manually flipped by an admin. Shows up at
   the top of the catalog. Lets us curate before there's organic
