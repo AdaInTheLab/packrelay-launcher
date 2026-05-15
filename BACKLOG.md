@@ -15,8 +15,6 @@ features.
   `install_events` table on the cloud (or a `weekly_installs` column
   rolled by a weekly cron), then a `?sort=trending` query param on
   `/api/v1/packs`.
-- **"New" badge** on packs younger than ~30 days. Pure derived
-  field from `createdAt`. No schema change.
 - **"Updated recently" badge** when a pack published a new version
   in the last N days. Tracks `latest_version` change date.
 - **Editor's picks / staff featured** — one boolean (`is_featured`)
