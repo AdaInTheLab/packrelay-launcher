@@ -850,6 +850,22 @@ async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn profile_clone(
+    app: AppHandle,
+    id: String,
+    name: String,
+) -> Result<ProfileMeta, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    let layout = store_layout(&app)?;
+    profile::clone_profile(&layout, &id, &trimmed)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
 async fn profile_snapshot_active(
     app: AppHandle,
     label: Option<String>,
@@ -1180,6 +1196,7 @@ pub fn run() {
             profile_switch,
             profile_rename,
             profile_delete,
+            profile_clone,
             profile_snapshot_active,
             profile_list_snapshots,
             profile_restore_snapshot,

@@ -190,6 +190,71 @@ pub async fn import_current_as_profile(
     Ok(meta)
 }
 
+/// Duplicate an existing profile into a new one. The clone gets:
+///   - a fresh id (so source + clone coexist)
+///   - the supplied name (caller's choice; usually `"<src> (copy)"`)
+///   - the source's pack_slug + pack_version preserved — a fork
+///     usually wants to start from the same installed pack and
+///     drift from there
+///   - a brand-new created_at
+///   - last_played_at cleared (the clone hasn't been played yet)
+///   - true file copies of mods/, saves/, worlds/ — same approach
+///     as switch_profile rather than hardlinks, so edits to one
+///     profile don't bleed into the other
+///
+/// Snapshots are deliberately NOT copied: they're per-session
+/// safety nets tied to actual play history on that specific
+/// profile. A fresh clone gets a fresh snapshot history.
+///
+/// The active pointer is unchanged — cloning doesn't switch to
+/// the new profile. The user does that explicitly when they're
+/// ready.
+pub async fn clone_profile(
+    layout: &StoreLayout,
+    source_id: &str,
+    new_name: &str,
+) -> Result<ProfileMeta> {
+    let src_paths = ProfilePaths::from_root(&layout.profile_dir(source_id));
+    if !fs::metadata(&src_paths.meta).await.is_ok() {
+        anyhow::bail!("Source profile {source_id} not found.");
+    }
+    let src_meta = read_meta(&src_paths).await?;
+
+    let new_id = new_profile_id();
+    let dst_paths = ProfilePaths::from_root(&layout.profile_dir(&new_id));
+    fs::create_dir_all(&dst_paths.snapshots).await?;
+
+    // Copy the three user-data dirs. Source dirs are guaranteed
+    // to exist (create_profile makes them on every new profile)
+    // but we tolerate missing ones for forward-compatibility.
+    if fs::metadata(&src_paths.mods).await.is_ok() {
+        copy_dir_all(&src_paths.mods, &dst_paths.mods).await?;
+    } else {
+        fs::create_dir_all(&dst_paths.mods).await?;
+    }
+    if fs::metadata(&src_paths.saves).await.is_ok() {
+        copy_dir_all(&src_paths.saves, &dst_paths.saves).await?;
+    } else {
+        fs::create_dir_all(&dst_paths.saves).await?;
+    }
+    if fs::metadata(&src_paths.worlds).await.is_ok() {
+        copy_dir_all(&src_paths.worlds, &dst_paths.worlds).await?;
+    } else {
+        fs::create_dir_all(&dst_paths.worlds).await?;
+    }
+
+    let meta = ProfileMeta {
+        id: new_id,
+        name: new_name.trim().to_string(),
+        pack_slug: src_meta.pack_slug,
+        pack_version: src_meta.pack_version,
+        created_at: now_rfc3339(),
+        last_played_at: None,
+    };
+    write_meta(&dst_paths, &meta).await?;
+    Ok(meta)
+}
+
 /// List all profiles with computed summary stats. Per-profile dir
 /// sizes are stat'd lazily — fast for small libraries; gets slower
 /// linearly with profile count. Acceptable until users start

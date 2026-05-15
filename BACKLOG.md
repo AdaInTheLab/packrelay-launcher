@@ -32,9 +32,10 @@ features.
 - **`-userdatafolder` profile switching** — would make switching
   instant (Mods/Saves/Worlds via launch arg instead of folder
   copy). Need to confirm V2.6 client honors it.
-- **Clone profile** — "Duplicate this profile" action so a user
-  can fork Default into KitsuneDen with the same starting state,
-  then drift them independently.
+- ~~**Clone profile**~~ — shipped: Duplicate (⎘) glyph on each
+  ProfileCard forks mods + saves + worlds into a new profile
+  named `<src> (copy)` (auto-bumped on collision). Pack binding
+  is preserved; snapshot history starts fresh.
 
 ## Launcher chrome / mockup parity
 

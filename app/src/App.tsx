@@ -3983,6 +3983,35 @@ function ProfilesView() {
                   setError(typeof e === "string" ? e : `${e}`);
                 }
               }}
+              onClone={async () => {
+                // Default clone name: `<src> (copy)`, auto-bumping
+                // the suffix if a name collision exists. The user
+                // can rename right after via double-click — same
+                // edit flow as any other profile.
+                const baseName = `${p.name} (copy)`;
+                const existing = new Set(
+                  profiles?.map((x) => x.name) ?? []
+                );
+                let cloneName = baseName;
+                let n = 2;
+                while (existing.has(cloneName)) {
+                  cloneName = `${p.name} (copy ${n})`;
+                  n += 1;
+                }
+                setBusy(p.id);
+                setError(null);
+                try {
+                  await invoke("profile_clone", {
+                    id: p.id,
+                    name: cloneName,
+                  });
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                } finally {
+                  setBusy(null);
+                }
+              }}
               onDelete={async () => {
                 const ok = await ask(
                   `Delete profile "${p.name}"?\n\nRemoves the profile's mods, saves, worlds, and snapshots from disk. The live 7DTD files aren't touched (those belong to whichever profile is currently active).`,
@@ -4222,6 +4251,7 @@ function ProfileCard({
   busy,
   onSwitch,
   onRename,
+  onClone,
   onDelete,
   onShowSnapshots,
 }: {
@@ -4229,6 +4259,7 @@ function ProfileCard({
   busy: boolean;
   onSwitch: () => void;
   onRename: (newName: string) => Promise<void>;
+  onClone: () => void;
   onDelete: () => void;
   onShowSnapshots: () => void;
 }) {
@@ -4338,6 +4369,15 @@ function ProfileCard({
             title="Rename"
           >
             ✎
+          </button>
+          <button
+            type="button"
+            onClick={onClone}
+            disabled={busy}
+            className="inline-flex items-center px-2.5 py-1.5 rounded-md text-[10px] tracking-wide uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] hover:bg-[var(--color-bg-raised)]/40 disabled:opacity-50 transition-colors"
+            title="Duplicate (fork mods + saves + worlds into a new profile)"
+          >
+            ⎘
           </button>
           {!p.isActive && (
             <button
