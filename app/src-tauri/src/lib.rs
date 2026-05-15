@@ -138,6 +138,14 @@ pub struct CatalogServer {
     pub created_at: String,
     pub online: bool,
     pub uptime_pct: f64,
+    /// Same drift as CatalogPack.favorite_count — TS declared it,
+    /// Rust didn't. Server browse hides the row when count is 0,
+    /// and `undefined > 0` is `false`, so the visible crash was
+    /// dodged; but the heart-toggle optimistic math (NaN) and the
+    /// "favorites" sort comparator were both quietly broken.
+    /// `#[serde(default)]` for forward-compat with older APIs.
+    #[serde(default)]
+    pub favorite_count: i64,
     pub attached_pack: Option<AttachedPack>,
 }
 
