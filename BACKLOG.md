@@ -25,10 +25,12 @@ features.
 
 ## Profiles / library
 
-- **Per-file content cache GC** — the blob cache at
-  `<app-data>/store/blobs/` grows monotonically today. Add a
-  "Clean cache" action in Settings + a periodic background sweep
-  that removes blobs unreferenced by any profile sidecar.
+- ~~**Per-file content cache GC**~~ — shipped: Settings → Cache
+  section reads `cache_stats` (totals + reclaimable bytes) and
+  "Clean cache" runs `cache_gc` which walks profile sidecars to
+  collect referenced sha256s and removes every cached blob not
+  in that set. Empty prefix dirs get swept too. Background sweep
+  on launcher startup not yet wired — manual button only today.
 - **`-userdatafolder` profile switching** — would make switching
   instant (Mods/Saves/Worlds via launch arg instead of folder
   copy). Need to confirm V2.6 client honors it.

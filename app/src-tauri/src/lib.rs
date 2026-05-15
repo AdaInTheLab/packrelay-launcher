@@ -22,6 +22,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::auth::{
     clear_stored_token, load_stored_token, save_token, validate_token, AuthState,
 };
+use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::profile::{
@@ -849,6 +850,29 @@ async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Dry-run snapshot of what's in the blob cache + how much of it
+/// could be reclaimed. Backs the "Cache" section of the Settings
+/// page — the user sees the number BEFORE clicking the destructive
+/// Clean button.
+#[tauri::command]
+async fn cache_stats(app: AppHandle) -> Result<CacheStats, String> {
+    let layout = store_layout(&app)?;
+    blob_cache::cache_stats(&layout.cache_dir(), &layout.profiles_dir())
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Delete every blob in the cache that no profile sidecar still
+/// references. Reports how many blobs went away + how many bytes
+/// the user actually got back.
+#[tauri::command]
+async fn cache_gc(app: AppHandle) -> Result<GcResult, String> {
+    let layout = store_layout(&app)?;
+    blob_cache::gc_cache(&layout.cache_dir(), &layout.profiles_dir())
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 async fn profile_clone(
     app: AppHandle,
@@ -1197,6 +1221,8 @@ pub fn run() {
             profile_rename,
             profile_delete,
             profile_clone,
+            cache_stats,
+            cache_gc,
             profile_snapshot_active,
             profile_list_snapshots,
             profile_restore_snapshot,

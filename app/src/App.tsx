@@ -3823,12 +3823,12 @@ function SettingsView({
   onSignOut: () => void;
 }) {
   return (
-    <div className="px-6 py-8 max-w-2xl">
-      <div className="mb-6">
+    <div className="px-6 py-8 max-w-2xl space-y-4">
+      <div className="mb-2">
         <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
         <p className="text-xs text-[var(--color-text-dim)] mt-1">
           More options land here as the launcher grows — API URL toggle,
-          default install path, theme. Today: account.
+          default install path, theme.
         </p>
       </div>
 
@@ -3859,6 +3859,178 @@ function SettingsView({
             your library + servers to your packrelay.cloud account.
           </p>
         )}
+      </div>
+
+      <CacheSection />
+    </div>
+  );
+}
+
+// Wire types match blob_cache::{CacheStats, GcResult}. Numbers come
+// over the wire as JSON numbers — u64 fits inside JS's safe-integer
+// range for any plausible cache size (≈9 petabytes before precision
+// breaks), so number is fine here.
+type CacheStats = {
+  totalBlobs: number;
+  totalBytes: number;
+  referencedBlobs: number;
+  unreferencedBlobs: number;
+  reclaimableBytes: number;
+};
+type GcResult = {
+  blobsRemoved: number;
+  bytesFreed: number;
+};
+
+// Cache disk-usage card for the Settings page. Shows the totals
+// straight from packrelay-core's cache_stats command, plus a
+// destructive button to GC unreferenced blobs.
+//
+// "Unreferenced" = no profile sidecar lists that blob's hash. Blobs
+// that were installed and uninstalled accumulate here (uninstall
+// only clears the live 7DTD copy, never the cache) and so do blobs
+// from older pack versions that profiles no longer pin. Clicking
+// Clean cache walks the cache and removes everything not pinned.
+function CacheSection() {
+  const [stats, setStats] = useState<CacheStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [cleaning, setCleaning] = useState(false);
+  const [lastResult, setLastResult] = useState<GcResult | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await invoke<CacheStats>("cache_stats");
+      setStats(s);
+      setError(null);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const reclaimable = stats?.reclaimableBytes ?? 0;
+  const canClean = !!stats && stats.unreferencedBlobs > 0 && !cleaning;
+
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1">
+        Cache
+      </h2>
+      <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed mb-4">
+        Every file you install is content-addressed and stored once
+        in a shared blob cache — that&apos;s how profile switching
+        stays fast (hardlinks, not copies). Uninstalled packs and
+        older pack versions stick around here until a deliberate
+        sweep, so switching back never has to re-download.
+      </p>
+
+      {stats === null && error === null && (
+        <div className="text-[11px] text-[var(--color-text-dim)]">
+          Reading cache…
+        </div>
+      )}
+      {error && (
+        <div className="mb-3 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)]">
+          {error}
+        </div>
+      )}
+      {stats && (
+        <>
+          <div className="grid grid-cols-3 gap-2 mb-4 text-[11px]">
+            <CacheStat
+              label="On disk"
+              value={formatBytes(stats.totalBytes)}
+              sub={`${stats.totalBlobs} file${stats.totalBlobs === 1 ? "" : "s"}`}
+            />
+            <CacheStat
+              label="In use"
+              value={`${stats.referencedBlobs}`}
+              sub="pinned by a profile"
+            />
+            <CacheStat
+              label="Reclaimable"
+              value={formatBytes(stats.reclaimableBytes)}
+              sub={`${stats.unreferencedBlobs} unreferenced`}
+              highlight={stats.unreferencedBlobs > 0}
+            />
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              type="button"
+              disabled={!canClean}
+              onClick={async () => {
+                const ok = await ask(
+                  `Free ${formatBytes(reclaimable)} by removing ${stats.unreferencedBlobs} cached file${stats.unreferencedBlobs === 1 ? "" : "s"} no profile currently pins?\n\nProfiles you can still switch to keep all of their files. Removed files re-download on demand if you ever pin them again.`,
+                  { title: "Clean cache", kind: "warning" }
+                );
+                if (!ok) return;
+                setCleaning(true);
+                setError(null);
+                setLastResult(null);
+                try {
+                  const r = await invoke<GcResult>("cache_gc");
+                  setLastResult(r);
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                } finally {
+                  setCleaning(false);
+                }
+              }}
+              className="inline-flex items-center px-3 py-1.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-[11px] tracking-[0.14em] uppercase font-medium"
+            >
+              {cleaning ? "Cleaning…" : "Clean cache"}
+            </button>
+            {lastResult && (
+              <span className="text-[11px] text-[var(--color-status-success)]">
+                Freed {formatBytes(lastResult.bytesFreed)} ·{" "}
+                {lastResult.blobsRemoved} file
+                {lastResult.blobsRemoved === 1 ? "" : "s"} removed
+              </span>
+            )}
+            {stats.unreferencedBlobs === 0 && !lastResult && (
+              <span className="text-[11px] text-[var(--color-text-dim)]">
+                Nothing to clean — every cached file is pinned by a
+                profile.
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function CacheStat({
+  label,
+  value,
+  sub,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  sub: string;
+  highlight?: boolean;
+}) {
+  return (
+    <div className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-2.5 py-2">
+      <div className="text-[9px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-dim)]">
+        {label}
+      </div>
+      <div
+        className={`text-[13px] font-semibold tabular-nums mt-0.5 ${
+          highlight
+            ? "text-[var(--color-accent-soft)]"
+            : "text-[var(--color-text-bright)]"
+        }`}
+      >
+        {value}
+      </div>
+      <div className="text-[10px] text-[var(--color-text-dim)] mt-0.5">
+        {sub}
       </div>
     </div>
   );
