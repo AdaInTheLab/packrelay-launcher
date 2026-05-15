@@ -23,8 +23,6 @@ features.
   on the packs table, manually flipped by an admin. Shows up at
   the top of the catalog. Lets us curate before there's organic
   signal.
-- **Install-count pill** on browse cards — display `downloadCount`
-  inline next to file count. Data is already there; just unhidden.
 - **Sort selector on Browse Servers** — the pack browse has
   Popular / Newest / Favorites chips; the server browse only has
   region + boolean filters. Add a sort selector mirroring the

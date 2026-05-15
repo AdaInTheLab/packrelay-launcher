@@ -2059,10 +2059,23 @@ function BrowseView({
                     </div>
                   )}
                   <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--color-text-dim)]">
-                    <span className="inline-flex items-center gap-1">
+                    <span className="inline-flex items-center gap-1.5">
                       <HeartGlyph filled={false} />
                       <span className="tabular-nums">
                         {p.favoriteCount.toLocaleString()}
+                      </span>
+                      <span className="text-[var(--color-bg-raised)]">·</span>
+                      {/* Install count — derived from the catalog's
+                        * downloadCount column (signed-manifest fetches
+                        * count once per profile install). Sits between
+                        * favorites and files so it's visible at a
+                        * glance but doesn't dominate the row. */}
+                      <DownloadGlyph />
+                      <span
+                        className="tabular-nums"
+                        title={`${p.downloadCount.toLocaleString()} installs`}
+                      >
+                        {p.downloadCount.toLocaleString()}
                       </span>
                       <span className="text-[var(--color-bg-raised)]">·</span>
                       <span>{p.fileCount.toLocaleString()} files</span>
@@ -3350,6 +3363,35 @@ function HeartGlyph({ filled }: { filled: boolean }) {
         d="M8 13.5s-5.5-3.4-5.5-7A2.8 2.8 0 0 1 5.3 3.7c1 0 1.9.5 2.7 1.4.8-.9 1.7-1.4 2.7-1.4a2.8 2.8 0 0 1 2.8 2.8c0 3.6-5.5 7-5.5 7z"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+/**
+ * Down-arrow-into-tray glyph used next to install counts. Matches
+ * the visual weight + stroke of the HeartGlyph + the SVG glyphs
+ * over on the cloud's /browse page (DownloadGlyph there is the
+ * same shape).
+ */
+function DownloadGlyph() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {/* Arrow body */}
+      <path d="M8 2.5v8" />
+      {/* Arrow head */}
+      <path d="M4.75 7.25 8 10.5l3.25-3.25" />
+      {/* Tray */}
+      <path d="M2.75 12.5h10.5" />
     </svg>
   );
 }
