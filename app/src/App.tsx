@@ -7,6 +7,13 @@ import "./App.css";
 import { UpdateToast } from "./UpdateToast";
 import { useAutoUpdate } from "./useAutoUpdate";
 
+// Pull the version from package.json so the rail header + footer
+// strip always match the released binary — bumping the version in
+// one place (the release flow) flows through to the UI without us
+// hand-editing strings. Vite inlines the JSON at build time.
+import pkg from "../package.json";
+const APP_VERSION = pkg.version;
+
 // Mirrors the Rust CatalogPack struct in src-tauri/src/lib.rs.
 // Tauri's invoke serializes camelCase by default since the Rust
 // side annotates `#[serde(rename_all = "camelCase")]`.
@@ -1080,7 +1087,7 @@ function LeftRail({
           draggable={false}
         />
         <div className="text-[9px] tracking-[0.22em] uppercase text-[var(--color-text-dim)] text-center mt-1">
-          launcher · v0.1
+          launcher · v{APP_VERSION}
         </div>
       </div>
 
@@ -4954,7 +4961,7 @@ function FooterStrip() {
         <span className="tracking-wide">All systems operational</span>
       </div>
       <div className="tracking-[0.14em] uppercase">
-        PackRelay Launcher · v0.1
+        PackRelay Launcher · v{APP_VERSION}
       </div>
       <div className="tracking-wide">Connected to PackRelay Network</div>
     </footer>
