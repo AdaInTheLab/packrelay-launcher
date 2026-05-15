@@ -697,22 +697,39 @@ function App() {
   }, []);
 
   useEffect(() => {
-    (async () => {
+    let cancelled = false;
+    // Catalog refresh cadences. Server state (online/offline,
+    // current players, uptime) moves quickly because heartbeats fire
+    // every minute; packs change slowly because a publish is a
+    // human-driven event. Re-poll each on its own interval while
+    // the launcher stays open.
+    const SERVER_REFRESH_MS = 30 * 1000;
+    const PACK_REFRESH_MS = 5 * 60 * 1000;
+    async function refreshPacks() {
       try {
         const list = await invoke<CatalogPack[]>("list_packs");
-        setPacks(list);
+        if (!cancelled) setPacks(list);
       } catch (e) {
-        setPacksError(typeof e === "string" ? e : `${e}`);
+        if (!cancelled) {
+          setPacksError(typeof e === "string" ? e : `${e}`);
+        }
       }
-    })();
-    (async () => {
+    }
+    async function refreshServers() {
       try {
         const list = await invoke<CatalogServer[]>("list_servers");
-        setServers(list);
+        if (!cancelled) setServers(list);
       } catch (e) {
-        setServersError(typeof e === "string" ? e : `${e}`);
+        if (!cancelled) {
+          setServersError(typeof e === "string" ? e : `${e}`);
+        }
       }
-    })();
+    }
+    // Kick off the initial fetch immediately + set up polling.
+    void refreshPacks();
+    void refreshServers();
+    const packInterval = setInterval(refreshPacks, PACK_REFRESH_MS);
+    const serverInterval = setInterval(refreshServers, SERVER_REFRESH_MS);
     (async () => {
       try {
         const detected = await invoke<string | null>("default_install_dest");
@@ -734,6 +751,11 @@ function App() {
         // the user can re-paste when they want.
       }
     })();
+    return () => {
+      cancelled = true;
+      clearInterval(packInterval);
+      clearInterval(serverInterval);
+    };
   }, [refreshFavorites]);
 
   // After sign-in flow lands, refresh favorites so the cards
