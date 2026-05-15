@@ -17,3 +17,9 @@ Cargo.lock.bak
 # into tauri.conf.json. See docs/UPDATER.md.
 tauri-update.key
 tauri-update.key.password
+
+# macOS notarization — the base64'd Developer ID Application
+# .p12 used to seed the GitHub APPLE_CERTIFICATE secret. Treat
+# as the cert itself (which is what it contains). See
+# docs/NOTARIZATION.md.
+apple-cert.b64.txt
