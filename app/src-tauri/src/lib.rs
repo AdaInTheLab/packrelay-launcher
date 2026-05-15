@@ -93,6 +93,12 @@ pub struct CatalogPack {
     pub file_count: i64,
     pub total_size_bytes: i64,
     pub download_count: i64,
+    /// Admin-curated editor's pick. Featured packs always sort to
+    /// the top of the catalog on both /browse and here. Defaults
+    /// to false so older API responses (pre-0011 migration) still
+    /// parse without breaking.
+    #[serde(default)]
+    pub is_featured: bool,
     pub created_at: String,
 }
 

@@ -23,6 +23,10 @@ type CatalogPack = {
   totalSizeBytes: number;
   downloadCount: number;
   favoriteCount: number;
+  // Editor's pick — admin-curated, prepends to the catalog
+  // regardless of sort. Defaults to false on the Rust side via
+  // #[serde(default)] so older API responses still parse.
+  isFeatured: boolean;
   createdAt: string;
 };
 
@@ -2045,6 +2049,19 @@ function BrowseView({
                     className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                   />
                   <div className="absolute inset-0 bg-gradient-to-t from-[var(--color-bg-panel)] via-transparent to-transparent" />
+                  {p.isFeatured && (
+                    // Mirrors the cloud /browse "Featured" chip —
+                    // gold star + label, top-left of the cover.
+                    // Admin curation surface; publishers can't
+                    // self-pin.
+                    <span
+                      className="absolute top-2 left-2 inline-flex items-center gap-1 text-[9px] tracking-[0.18em] uppercase font-semibold text-[var(--color-bg-page)] bg-[var(--color-accent-soft)] px-1.5 py-0.5 rounded shadow-sm"
+                      title="Editor's pick"
+                    >
+                      <FeaturedStarGlyph />
+                      Featured
+                    </span>
+                  )}
                 </div>
                 <div className="p-4">
                   <div className="flex items-baseline gap-2 mb-1">
@@ -3438,6 +3455,22 @@ function HeartGlyph({ filled }: { filled: boolean }) {
  * over on the cloud's /browse page (DownloadGlyph there is the
  * same shape).
  */
+function FeaturedStarGlyph() {
+  // Matches the cloud /browse Featured chip — filled star icon
+  // sized to sit inside a 9px-line-height label without overflowing.
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M8 1.5l2.06 4.17 4.6.67-3.33 3.25.79 4.58L8 11.99l-4.12 2.17.79-4.58L1.34 6.34l4.6-.67L8 1.5z" />
+    </svg>
+  );
+}
+
 function DownloadGlyph() {
   return (
     <svg

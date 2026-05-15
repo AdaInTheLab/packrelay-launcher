@@ -15,10 +15,12 @@ features.
   `install_events` table on the cloud (or a `weekly_installs` column
   rolled by a weekly cron), then a `?sort=trending` query param on
   `/api/v1/packs`.
-- **Editor's picks / staff featured** — one boolean (`is_featured`)
-  on the packs table, manually flipped by an admin. Shows up at
-  the top of the catalog. Lets us curate before there's organic
-  signal.
+- ~~**Editor's picks / staff featured**~~ — shipped: admin-only
+  toggle on `/account/packs/[id]/edit` (gated by `canAdminister`)
+  flips a new `packs.is_featured` bool. The catalog API + cloud
+  `/browse` + launcher `BrowseView` all order featured first via
+  `desc(packs.isFeatured)` as primary key, then by the user's
+  chosen sort. A gold "Featured" chip surfaces on cards.
 - ~~**Sort selector on Browse Servers**~~ — shipped: client-side
   Players / Newest / Favorites chips mirroring the pack browse,
   persisted into the filter state.
