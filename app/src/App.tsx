@@ -272,6 +272,33 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/**
+ * Parse a `packrelay://` URL into an install request. Returns the
+ * pack slug for valid `packrelay://install/<slug>` URLs (with or
+ * without trailing slash/query), or null for anything else.
+ *
+ * The Rust side delivers the raw URL string verbatim; we don't
+ * trust it. Slug pattern matches the cloud's: ASCII lowercase
+ * alphanum + dashes, 1-64 chars.
+ */
+function parseDeepLinkInstallSlug(rawUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "packrelay:") return null;
+  // Expected shape: packrelay://install/<slug>. The "install" piece
+  // is what URL parses as host; the slug is the first pathname
+  // segment. Future verbs (e.g. packrelay://server/<slug>) can
+  // bolt on with the same parser.
+  if (url.host !== "install") return null;
+  const slug = url.pathname.replace(/^\/+/, "").split("/")[0] ?? "";
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return null;
+  return slug;
+}
+
 function formatRelativeTime(iso: string): string {
   const then = new Date(iso).getTime();
   const deltaSec = Math.max(0, (Date.now() - then) / 1000);
@@ -461,6 +488,26 @@ function App() {
         setActiveInstall((prev) =>
           prev ? { ...prev, progress: e.payload } : prev
         );
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Deep-link handoff from the cloud website. A URL like
+  // `packrelay://install/<slug>` lands as a "deeplink://incoming"
+  // event from the Rust side. We stash the slug into state and
+  // a separate effect resolves it once the catalog has loaded.
+  const [pendingInstallSlug, setPendingInstallSlug] = useState<string | null>(
+    null
+  );
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    (async () => {
+      unlisten = await listen<string>("deeplink://incoming", (e) => {
+        const slug = parseDeepLinkInstallSlug(e.payload);
+        if (slug) setPendingInstallSlug(slug);
       });
     })();
     return () => {
@@ -740,6 +787,21 @@ function App() {
     setPackView("install");
     setCanReturnToDetail(false);
   }, []);
+
+  // Resolve a pending deep-link install once the catalog is
+  // loaded. On cold-start (launcher was opened *via* the URL)
+  // the event fires before packs are ready, so we stash the
+  // slug and try again whenever (packs, pendingInstallSlug)
+  // changes. Clears the pending slot whether we found it or
+  // not — if the pack doesn't exist (private, withdrawn,
+  // misspelled), we drop the request silently rather than
+  // looping forever.
+  useEffect(() => {
+    if (!pendingInstallSlug || !packs) return;
+    const match = packs.find((p) => p.slug === pendingInstallSlug);
+    if (match) openPackInstall(match);
+    setPendingInstallSlug(null);
+  }, [packs, pendingInstallSlug, openPackInstall]);
 
   const recordInstall = useCallback(
     (slug: string, report: InstallReport, coverImage: string | null) => {

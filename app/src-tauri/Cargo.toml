@@ -36,4 +36,10 @@ tauri-plugin-updater = "2"
 # restart cleanly after the updater has swapped in the new binary.
 # Tauri's updater doesn't auto-restart on its own.
 tauri-plugin-process = "2"
+# Deep-link plugin — registers the `packrelay://` URL scheme so
+# the browser can hand off an install request to the launcher
+# via a single anchor click. Plugin handles per-platform scheme
+# registration: Windows registry, macOS Info.plist, Linux .desktop.
+# See https://v2.tauri.app/plugin/deep-link/ for the protocol.
+tauri-plugin-deep-link = "2"
 tokio.workspace = true

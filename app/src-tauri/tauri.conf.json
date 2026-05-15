@@ -41,6 +41,12 @@
       "endpoints": [
         "https://github.com/AdaInTheLab/packrelay-launcher/releases/latest/download/latest.json"
       ]
+    },
+    "deep-link": {
+      "mobile": [],
+      "desktop": {
+        "schemes": ["packrelay"]
+      }
     }
   }
 }

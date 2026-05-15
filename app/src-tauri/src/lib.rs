@@ -1242,10 +1242,32 @@ pub fn run() {
         // CI secrets.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Deep-link plugin — registers `packrelay://` so the
+        // cloud's pack page can hand off install requests via a
+        // single anchor click. URLs look like:
+        //   packrelay://install/<slug>?version=<v>
+        // The on_open_url handler in setup() below parses the URL
+        // and emits a `deeplink://install` event to the frontend.
+        .plugin(tauri_plugin_deep_link::init())
         // Background blob-cache GC: weekly sweep on startup so disk
         // usage doesn't grow forever. Best-effort — failures stay
-        // silent so a hiccup here never blocks the UI.
+        // silent so a hiccup here never blocks the UI. Also wires
+        // the deep-link handler (same setup pass).
         .setup(|app| {
+            // Deep-link handler. Fires for both cold-start
+            // (launcher was just opened via the URL) and
+            // already-running (URL clicked while launcher is
+            // open). We just forward the parsed URL up to the
+            // frontend; routing happens in App.tsx.
+            use tauri::Emitter;
+            use tauri_plugin_deep_link::DeepLinkExt;
+            let handle_for_dl = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    let _ = handle_for_dl.emit("deeplink://incoming", url.to_string());
+                }
+            });
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(

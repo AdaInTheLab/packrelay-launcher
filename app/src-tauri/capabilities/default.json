@@ -9,6 +9,7 @@
     "dialog:default",
     "dialog:allow-open",
     "updater:default",
-    "process:default"
+    "process:default",
+    "deep-link:default"
   ]
 }
