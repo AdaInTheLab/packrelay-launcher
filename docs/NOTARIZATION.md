@@ -48,6 +48,25 @@ You need to be enrolled in the Apple Developer Program
 11. Download the resulting `.cer` file.
 12. Double-click the `.cer` to install it into Keychain Access.
 
+> ⚠️ **Cert-type pitfall.** Apple's certificate dropdown also
+> offers **"Apple Development"** and **"Apple Distribution"** —
+> those are *different products* despite the similar names:
+>
+> | Cert type | Used for | What we want? |
+> |---|---|---|
+> | **Apple Development** | Running your app on YOUR dev devices via Xcode. | ❌ no |
+> | **Apple Distribution** | Submitting to the Mac App Store. | ❌ no |
+> | **Developer ID Application** | Distributing OUTSIDE the App Store (.dmg, direct download). | ✅ yes — pick this one |
+> | **Developer ID Installer** | Same but for .pkg installers. We don't ship .pkg. | ❌ no |
+>
+> If you accidentally pick "Apple Development" and export THAT
+> as your .p12, the CI build will fail with
+> `certificate ... does not match provided identity` — because
+> tauri-action looks for a cert whose Common Name starts with
+> "Developer ID Application:" and the import gave it a cert
+> starting with "Apple Development:". See the troubleshooting
+> section below.
+
 ### 1b — Export to .p12
 
 1. In Keychain Access, find the new certificate (it'll be named
@@ -70,6 +89,15 @@ security find-identity -v -p codesigning
 
 Look for the line that starts with `Developer ID Application:`.
 Copy the WHOLE quoted name, including the `(TEAMID)` suffix.
+
+> 🔑 **The Team ID is also literally in the cert name** — the
+> 10-character string in parentheses. Whatever value lands in
+> `APPLE_TEAM_ID` (step 2) MUST be the same Team ID that
+> appears in this string. If your Apple ID is on multiple teams
+> (personal + org, agency clients, etc.) it's easy to grab the
+> wrong one. When in doubt, copy the parenthesized ID from this
+> output verbatim — that's the source of truth for which team's
+> cert you actually exported.
 
 ## 2 — Get your Team ID
 
@@ -141,6 +169,44 @@ double-click instead of right-click-Open.
 
 ## Troubleshooting
 
+**`certificate from APPLE_CERTIFICATE "Apple Development: <Name> (<TEAMID>)" environment variable does not match provided identity "***"`**
+
+The .p12 you uploaded contains the *wrong* type of certificate.
+tauri-action imports whatever .p12 is in `APPLE_CERTIFICATE`,
+then asks codesign to find a cert whose Common Name matches
+`APPLE_SIGNING_IDENTITY` (which we set to start with
+`Developer ID Application:`). The error means the import gave
+it an "Apple Development:" cert instead — that's a dev/testing
+cert, not a distribution cert.
+
+**Fix:** Go back to step 1a and create a **Developer ID
+Application** certificate. The Apple Developer dashboard offers
+several cert types in the "+ Certificate" picker; only that
+specific one works for notarized .dmg distribution. See the
+table in step 1a for the full breakdown.
+
+Once the new cert is in Keychain, re-export to `.p12`, re-base64,
+and overwrite `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD`.
+
+**Same error but with `"Developer ID Application:"` on both sides
+(cert name and identity)**
+
+The cert IS the right type, but the Team IDs disagree. The
+parenthesized 10-char string in the cert's Common Name must
+match `APPLE_TEAM_ID` exactly. This happens when:
+
+- Your Apple ID is on multiple Developer teams (personal +
+  agency, for example) and `APPLE_TEAM_ID` was set from the
+  wrong team.
+- A previous cert from a different team is still in Keychain
+  and got picked up.
+
+**Fix:** Run `security find-identity -v -p codesigning` on
+your Mac and copy the parenthesized Team ID directly out of
+the cert label. Use *that* value for `APPLE_TEAM_ID` (and
+make sure `APPLE_SIGNING_IDENTITY` is the full string from
+that same line).
+
 **"unable to build chain to self-signed root for signer"**
 Your Developer ID cert isn't trusted by the macOS Apple Worldwide
 Developer Relations intermediate cert. tauri-action installs the
@@ -157,6 +223,18 @@ response in the log for the actual reason. Most common:
 
 **"asynchronously stapling"**
 Stapling can take ~30s. Not a failure unless followed by an error.
+
+**Notary submit hangs for 30+ minutes**
+Apple's notary service runs on a shared queue and can occasionally
+back up — submissions that normally finish in 5–15 minutes sometimes
+sit for an hour or more during heavy load (often correlated with
+new Xcode releases or WWDC week). Nothing's broken on our side; the
+job is literally waiting for `notarytool submit --wait` to return.
+
+The GitHub job timeout is 6 hours so you don't need to babysit it.
+If a run gets stuck and you want a green release without macOS:
+cancel just the macOS leg, the Linux + Windows artifacts are
+already uploaded.
 
 **"You are not a member of any teams"**
 APPLE_TEAM_ID is wrong, or the Apple ID isn't actually enrolled
