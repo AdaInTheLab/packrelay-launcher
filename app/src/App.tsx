@@ -2616,12 +2616,48 @@ function InstallView({
 
   async function startInstall() {
     setState({ kind: "running", progress: null });
+
+    // Pre-flight disk-presence probe. The chosen `mode` is derived
+    // from localStorage history alone — when history says "v0.2.0
+    // is installed here" but the user wiped the folder manually,
+    // 7DTD reinstalled over it, etc., entering the smart-update
+    // path crashes on "reading _packrelay-manifest.json: file not
+    // found." Same screenshot bug as the ServerDetailView pre-flight
+    // fixes, hit through a different entry point (Library row,
+    // browse → DetailView). Degrade to a fresh install when the
+    // sidecar's gone: same dest, same pin, no sidecar-diff
+    // assumption. Reinstall mode falls back the same way — the
+    // sidecar read in update.rs is what would fail either way.
+    let effectiveMode: InstallMode = mode;
+    if (mode === "update" || mode === "reinstall") {
+      try {
+        const probe = await invoke<PresenceReport>("check_pack_present", {
+          dest,
+        });
+        if (!probe.present) {
+          effectiveMode = "install";
+        }
+      } catch {
+        // Probe errored (Tauri unreachable, permission denied).
+        // Stay with the original mode so we don't mask a real
+        // unrelated failure. The smart-update error path is at
+        // least recoverable via the Retry button.
+      }
+    }
+
     // Tell App "an install is now active for this pack" so the
     // bottom-of-LeftRail dock can render. progress starts null and
-    // gets filled by App's own install://progress listener. We also
-    // hand off the pin so re-entering this view through the dock
-    // doesn't lose the version context.
-    onActiveChange({ pack, mode, progress: null, targetVersion });
+    // gets filled by App's own install://progress listener. We hand
+    // off the *effective* mode here (post-degradation) so the dock
+    // label reads "Installing" rather than "Updating" when we had
+    // to fall back. The pin still rides along so re-entering this
+    // view through the dock doesn't lose the version context.
+    onActiveChange({
+      pack,
+      mode: effectiveMode,
+      progress: null,
+      targetVersion,
+    });
     try {
       // Pass the pin through to the Rust commands. v0.1.7+ honors
       // `version: Option<String>` on both install_pack and update_pack;
@@ -2629,7 +2665,7 @@ function InstallView({
       // pre-v0.1.7 default). Cloud-side `fetch_manifest_at` also
       // asserts the returned manifest version matches the request,
       // so a misbehaving cloud row can't silently substitute.
-      if (mode === "update") {
+      if (effectiveMode === "update") {
         const report = await invoke<UpdateReport>("update_pack", {
           slug: pack.slug,
           dest,
@@ -2660,7 +2696,15 @@ function InstallView({
               `Aborting before the connect step to avoid an immediate kick.`
           );
         }
-        setState({ kind: "done", result: { mode, report } });
+        // result.mode reads `effectiveMode` so a degraded update→install
+        // renders the install success card (filesCount + dest), not
+        // a confusing UpdateReport-shaped one. The user clicked
+        // "Update" but the install pipeline ran fresh because the
+        // disk was empty — calling it "installed" matches reality.
+        setState({
+          kind: "done",
+          result: { mode: effectiveMode, report },
+        });
         onInstalled(report);
       }
     } catch (e) {
