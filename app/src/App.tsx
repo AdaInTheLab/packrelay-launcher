@@ -149,10 +149,17 @@ type InstallState =
 // progress even when the user has navigated away from InstallView.
 // InstallView toggles this on enter-running / clear-on-exit, and
 // App.tsx's global install://progress listener fills progress in.
+//
+// `targetVersion` carries the server-pin context across navigations:
+// without it, jumping back to InstallView via the dock would lose
+// the "v0.2.0" target and the next render would re-derive against
+// `pack.latestVersion`. Null means "track publisher's latest" (the
+// browse-driven install path).
 type ActiveInstall = {
   pack: CatalogPack;
   mode: InstallMode;
   progress: InstallProgress | null;
+  targetVersion: string | null;
 };
 
 // Mirrors packrelay-core's VerifyReport / VerifyFailure / RepairReport
@@ -816,6 +823,10 @@ function App() {
     setSelectedServer(null);
     setPackView("detail");
     setCanReturnToDetail(false);
+    // Pin context is tied to the currently-open install card. Clear
+    // it on view change so a stale target doesn't latch onto a
+    // future browse-driven install.
+    setPendingTargetVersion(null);
   }, []);
 
   // From browse: card click opens the rich detail page; Install is
@@ -831,11 +842,24 @@ function App() {
   // context, history rows are by definition things you've installed
   // before. canReturnToDetail stays false so InstallView's Back
   // closes the pack rather than rebounding through DetailView.
-  const openPackInstall = useCallback((pack: CatalogPack) => {
-    setSelectedPack(pack);
-    setPackView("install");
-    setCanReturnToDetail(false);
-  }, []);
+  //
+  // `targetVersion`: optional pin propagated from the caller. When
+  // ServerDetailView routes a kicked player through the install flow,
+  // it passes the server's attachedVersion here so InstallView (and,
+  // crucially, the Rust install_pack call underneath) targets that
+  // version rather than silently fetching latest.
+  const [pendingTargetVersion, setPendingTargetVersion] = useState<
+    string | null
+  >(null);
+  const openPackInstall = useCallback(
+    (pack: CatalogPack, targetVersion: string | null = null) => {
+      setSelectedPack(pack);
+      setPackView("install");
+      setCanReturnToDetail(false);
+      setPendingTargetVersion(targetVersion);
+    },
+    []
+  );
 
   // Resolve a pending deep-link install once the catalog is
   // loaded. On cold-start (launcher was opened *via* the URL)
@@ -1013,6 +1037,7 @@ function App() {
           defaultDest={installedRecord?.dest ?? defaultDest}
           installedRecord={installedRecord}
           connectAddress={backToServer?.connectAddress ?? null}
+          targetVersion={pendingTargetVersion}
           backLabel={
             backToServer
               ? backToServer.name.toUpperCase()
@@ -1075,7 +1100,9 @@ function App() {
         onToggleFavorite={() => toggleServerFavorite(selectedServer.slug)}
         onSignInRequest={() => setShowSignIn(true)}
         onBack={() => setSelectedServer(null)}
-        onInstall={(pack) => openPackInstall(pack)}
+        onInstall={(pack, targetVersion) =>
+          openPackInstall(pack, targetVersion)
+        }
       />
     );
   } else if (view === "packs") {
@@ -1141,11 +1168,15 @@ function App() {
             // Re-enter InstallView for the running pack. Bypasses
             // the catalog click path so we use the already-known
             // pack object even if it's been filtered out of the
-            // current catalog.
+            // current catalog. Restore the pin target from the
+            // active-install record too — otherwise jumping back
+            // mid-install would silently flip a pinned install to
+            // "track latest" on the next mode-derivation.
             if (activeInstall) {
               setSelectedPack(activeInstall.pack);
               setPackView("install");
               setCanReturnToDetail(false);
+              setPendingTargetVersion(activeInstall.targetVersion);
             }
           }}
         />
@@ -2458,6 +2489,7 @@ function InstallView({
   defaultDest,
   installedRecord,
   connectAddress,
+  targetVersion,
   backLabel,
   seededActive,
   onActiveChange,
@@ -2476,6 +2508,14 @@ function InstallView({
    *  server's connect address gets surfaced under the "done" state
    *  with a copy button — the actual point of "one-click join." */
   connectAddress: string | null;
+  /** Optional pin: the version the caller wants on disk after this
+   *  flow completes. When set, *every* downstream decision — mode,
+   *  primary-button label, the version stamped on the cover, AND
+   *  the Rust install_pack/update_pack call's `version` arg — keys
+   *  off this number instead of `pack.latestVersion`. Null falls
+   *  back to "track publisher's latest", which is the right default
+   *  for the browse + library re-install paths. */
+  targetVersion: string | null;
   /** What the back button reads — "BROWSE" for pack browse,
    *  the server's name when launched from a server detail page. */
   backLabel: string;
@@ -2493,12 +2533,24 @@ function InstallView({
   onInstalled: (report: InstallReport) => void;
   onUpdated: (report: UpdateReport) => void;
 }) {
-  // Mode is derived from history + catalog state. Update fires when
-  // both the installed record AND a newer catalog version exist;
-  // reinstall covers the "same version on disk" or "older catalog"
-  // edge cases (which can happen if a publisher pulls a version).
+  // The version we're going to lay down on disk. When the caller
+  // pinned us (server-attached version), that wins; otherwise we
+  // track whatever the publisher says is latest.
+  const desiredVersion: string | null =
+    targetVersion ?? pack.latestVersion ?? null;
+
+  // Mode is derived from history + the *desired* version, not blindly
+  // from `pack.latestVersion`. With a pin in play, a v0.3.0→v0.2.0
+  // downgrade now correctly reads as an Update rather than slipping
+  // through the semver-newer guard and landing as a Reinstall. The
+  // unpinned path keeps the original semver-newer check so a publisher
+  // pulling a version (installed > latest) still produces a Reinstall
+  // rather than a confusing "downgrade" prompt.
   const mode: InstallMode = (() => {
     if (!installedRecord) return "install";
+    if (targetVersion) {
+      return targetVersion === installedRecord.version ? "reinstall" : "update";
+    }
     if (
       pack.latestVersion &&
       semverIsNewer(pack.latestVersion, installedRecord.version)
@@ -2553,21 +2605,48 @@ function InstallView({
     setState({ kind: "running", progress: null });
     // Tell App "an install is now active for this pack" so the
     // bottom-of-LeftRail dock can render. progress starts null and
-    // gets filled by App's own install://progress listener.
-    onActiveChange({ pack, mode, progress: null });
+    // gets filled by App's own install://progress listener. We also
+    // hand off the pin so re-entering this view through the dock
+    // doesn't lose the version context.
+    onActiveChange({ pack, mode, progress: null, targetVersion });
     try {
+      // Pass the pin through to the Rust commands. v0.1.7+ honors
+      // `version: Option<String>` on both install_pack and update_pack;
+      // when null/omitted the cloud's "latest" endpoint is used (the
+      // pre-v0.1.7 default). Cloud-side `fetch_manifest_at` also
+      // asserts the returned manifest version matches the request,
+      // so a misbehaving cloud row can't silently substitute.
       if (mode === "update") {
         const report = await invoke<UpdateReport>("update_pack", {
           slug: pack.slug,
           dest,
+          version: targetVersion,
         });
+        // Thicc check: even with the Rust-side guard, sanity-check the
+        // returned report against the caller's pin before showing a
+        // green success card. If the two disagree, surface a loud
+        // error rather than letting the player connect to a server
+        // they're version-mismatched against.
+        if (targetVersion && report.toVersion !== targetVersion) {
+          throw new Error(
+            `Installer reported v${report.toVersion} but the server pinned v${targetVersion}. ` +
+              `Aborting before the connect step to avoid an immediate kick.`
+          );
+        }
         setState({ kind: "done", result: { mode: "update", report } });
         onUpdated(report);
       } else {
         const report = await invoke<InstallReport>("install_pack", {
           slug: pack.slug,
           dest,
+          version: targetVersion,
         });
+        if (targetVersion && report.version !== targetVersion) {
+          throw new Error(
+            `Installer reported v${report.version} but the server pinned v${targetVersion}. ` +
+              `Aborting before the connect step to avoid an immediate kick.`
+          );
+        }
         setState({ kind: "done", result: { mode, report } });
         onInstalled(report);
       }
@@ -2584,12 +2663,19 @@ function InstallView({
     }
   }
 
+  // Primary button label keys off `desiredVersion`, not `pack.latestVersion`,
+  // so a pinned downgrade reads "Update to v0.2.0" rather than picking
+  // up the latest publisher version that the user explicitly didn't ask
+  // for. Reinstall mode is version-agnostic — the version is by
+  // definition the one already on disk.
   const primaryButtonLabel =
     mode === "update"
-      ? `Update to v${pack.latestVersion ?? "?"}`
+      ? `Update to v${desiredVersion ?? "?"}`
       : mode === "reinstall"
         ? "Re-install"
-        : "Install pack";
+        : targetVersion
+          ? `Install v${targetVersion}`
+          : "Install pack";
   const errorTitle =
     mode === "update" ? "Update failed" : "Install failed";
   const inFlightLabel = mode === "update" ? "Updating…" : "Installing…";
@@ -2628,8 +2714,13 @@ function InstallView({
             </div>
             <div className="text-xs text-[var(--color-text-dim)] mt-1">
               by {pack.publisherName}
-              {pack.latestVersion && (
-                <span className="font-mono"> · v{pack.latestVersion}</span>
+              {desiredVersion && (
+                // Stamp the *desired* version on the cover (the one
+                // we're about to install), not pack.latestVersion.
+                // The two diverge whenever the caller pinned us to
+                // a specific version — and that mismatch is exactly
+                // the bug the v0.1.7 thicc check is meant to surface.
+                <span className="font-mono"> · v{desiredVersion}</span>
               )}
               {" · "}
               {pack.fileCount.toLocaleString()} files ·{" "}
@@ -2696,7 +2787,7 @@ function InstallView({
               </span>
               <span className="text-[var(--color-text-dim)]"> → </span>
               <span className="font-mono text-[var(--color-accent-soft)]">
-                v{pack.latestVersion}
+                v{desiredVersion ?? "?"}
               </span>
             </span>
             <span className="text-[var(--color-text-dim)]">
@@ -3501,7 +3592,14 @@ function ServerDetailView({
   onToggleFavorite: () => void;
   onSignInRequest: () => void;
   onBack: () => void;
-  onInstall: (pack: CatalogPack) => void;
+  /** Caller receives the attached pack *and* the version the server
+   *  is pinned to (when it is — falls back to the catalog latest).
+   *  Threading targetVersion through here is what keeps the deep-link
+   *  join flow honest: ServerDetailView already derives the right
+   *  number for its three-state card; without forwarding it, the
+   *  downstream InstallView re-derives against `pack.latestVersion`
+   *  and silently up/downgrades. */
+  onInstall: (pack: CatalogPack, targetVersion: string | null) => void;
 }) {
   const cover = server.attachedPack?.coverImage;
 
@@ -3655,7 +3753,7 @@ function ServerDetailView({
               <>
                 <button
                   type="button"
-                  onClick={() => onInstall(attachedPack)}
+                  onClick={() => onInstall(attachedPack, targetVersion)}
                   className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
                 >
                   {installState === "needs-update"

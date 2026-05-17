@@ -57,6 +57,7 @@ pub async fn update<F>(
     slug: &str,
     dest: &Path,
     concurrency: usize,
+    target_version: Option<&str>,
     ctx: InstallContext,
     on_progress: F,
 ) -> Result<UpdateReport>
@@ -70,7 +71,11 @@ where
     let old_manifest: Manifest =
         serde_json::from_str(&old_raw).with_context(|| "parsing installed sidecar")?;
 
-    let (new_raw, new_manifest) = client.fetch_manifest(slug).await?;
+    // Pin-aware: target_version=Some routes to the pinned manifest
+    // endpoint so a server pinned to v0.2.0 doesn't silently get
+    // updated to latest v0.4.0 — this is the v0.1.6 bug screenshot
+    // upgrade-to-pinned shows in the wild.
+    let (new_raw, new_manifest) = client.fetch_manifest_at(slug, target_version).await?;
 
     // No-op early exit when the catalog matches what's installed.
     // Saves us from emitting a Started/Done pair for zero work.

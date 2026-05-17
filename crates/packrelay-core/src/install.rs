@@ -98,13 +98,19 @@ pub async fn install<F>(
     slug: &str,
     dest: &Path,
     concurrency: usize,
+    target_version: Option<&str>,
     ctx: InstallContext,
     on_progress: F,
 ) -> Result<InstallReport>
 where
     F: Fn(ProgressEvent) + Send + Sync + 'static,
 {
-    let (manifest_raw, manifest) = client.fetch_manifest(slug).await?;
+    // Server pin-aware: when target_version is set, fetch THAT
+    // manifest, not whatever the publisher's latest is. fetch_manifest_at
+    // also asserts the returned manifest's version field matches the
+    // request, so a cloud-side bug can't sneak the wrong version past us.
+    let (manifest_raw, manifest) =
+        client.fetch_manifest_at(slug, target_version).await?;
 
     fs::create_dir_all(dest)
         .await

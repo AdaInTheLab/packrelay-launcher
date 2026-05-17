@@ -288,11 +288,17 @@ async fn list_servers() -> Result<Vec<CatalogServer>, String> {
     Ok(body.servers)
 }
 
+/// `version` is an optional pin: when set, the installer fetches the
+/// manifest at that specific version instead of the publisher's latest.
+/// Used by the deep-link join flow so a server pinned to v0.2.0 doesn't
+/// accidentally get v0.4.0 laid down on the player's disk. When None,
+/// behaves identically to pre-v0.1.7 (always latest).
 #[tauri::command]
 async fn install_pack(
     app: AppHandle,
     slug: String,
     dest: String,
+    version: Option<String>,
 ) -> Result<InstallReport, String> {
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
@@ -310,7 +316,7 @@ async fn install_pack(
     let app_clone = app.clone();
 
     let ctx = build_install_context(&app).await?;
-    let report = install(&client, &slug, &dest_path, 8, ctx, move |ev: ProgressEvent| {
+    let report = install(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
                 total_bytes,
@@ -370,11 +376,17 @@ async fn install_pack(
 /// install://progress events as install_pack — the frontend's bar
 /// renders identically, just with a smaller total_bytes since
 /// kept-unchanged files aren't counted.
+/// Same pin semantics as `install_pack`: route the smart-update diff
+/// against a specific version instead of latest. Critical for the
+/// kicked-from-server flow — server pinned to v0.2.0 + locally installed
+/// v0.3.0 → `update_pack(version=Some("0.2.0"))` produces a v0.3.0→v0.2.0
+/// downgrade, not v0.3.0→latest.
 #[tauri::command]
 async fn update_pack(
     app: AppHandle,
     slug: String,
     dest: String,
+    version: Option<String>,
 ) -> Result<UpdateReport, String> {
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
@@ -392,7 +404,7 @@ async fn update_pack(
     let app_clone = app.clone();
 
     let ctx = build_install_context(&app).await?;
-    let report = update(&client, &slug, &dest_path, 8, ctx, move |ev: ProgressEvent| {
+    let report = update(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
                 total_bytes,

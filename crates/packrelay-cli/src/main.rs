@@ -91,7 +91,9 @@ async fn run_install(
     // (empty) context so install behaves exactly as it did before
     // the Phase 4 changes for headless usage.
     let ctx = packrelay_core::install::InstallContext::default();
-    let report = install(client, slug, dest, concurrency, ctx, move |ev: ProgressEvent| {
+    // CLI defaults to latest — no --version flag yet. When/if the CLI
+    // grows a pin/version arg, thread Some(&v) through here.
+    let report = install(client, slug, dest, concurrency, None, ctx, move |ev: ProgressEvent| {
         match ev {
             ProgressEvent::Started {
                 display_name,
