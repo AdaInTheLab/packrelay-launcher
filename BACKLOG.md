@@ -77,6 +77,15 @@ toward earlier in the session.
   jumps back to InstallView. `activeInstall` state hoisted to
   App; global `install://progress` listener feeds the dock so it
   keeps updating even when InstallView is unmounted.
+- ~~**`packrelay://join/<slug>` deep link**~~ — shipped: cloud's
+  Install+Join button and `/join/<slug>` landing page emit this
+  scheme; launcher routes it into ServerDetailView with the
+  matching server pre-selected. The existing three-state card
+  there (Install / Update & connect / Connect) takes over from
+  the user's local install-history, so a kicked player gets a
+  one-click path back into the server. Parser is a discriminated
+  union so future verbs (`server`, `pack`, …) drop in without
+  re-shaping the listener.
 - **Notifications surface** (the bell in the mockup's top-right).
   Requires a notifications/events store on the cloud — per-user
   push from publisher new-version events, server status changes,

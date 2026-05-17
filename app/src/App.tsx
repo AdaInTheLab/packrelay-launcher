@@ -273,15 +273,28 @@ function formatBytes(n: number): string {
 }
 
 /**
- * Parse a `packrelay://` URL into an install request. Returns the
- * pack slug for valid `packrelay://install/<slug>` URLs (with or
- * without trailing slash/query), or null for anything else.
+ * Parse a `packrelay://` URL into a deep-link request. Returns the
+ * verb + target slug for valid URLs, or null for anything else.
+ *
+ * Two verbs today:
+ *   packrelay://install/<pack-slug>   — drop into InstallView for a pack
+ *   packrelay://join/<server-slug>    — drop into ServerDetailView for
+ *                                       a server, where the existing
+ *                                       three-state card picks Install
+ *                                       vs Update & connect vs Connect
+ *                                       based on local install state.
  *
  * The Rust side delivers the raw URL string verbatim; we don't
  * trust it. Slug pattern matches the cloud's: ASCII lowercase
- * alphanum + dashes, 1-64 chars.
+ * alphanum + dashes, 1-64 chars. Unknown verbs return null so
+ * future cloud-side verbs don't accidentally route into the wrong
+ * handler on an older launcher build.
  */
-function parseDeepLinkInstallSlug(rawUrl: string): string | null {
+type DeepLink =
+  | { kind: "install"; slug: string }
+  | { kind: "join"; slug: string };
+
+function parseDeepLink(rawUrl: string): DeepLink | null {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -289,14 +302,13 @@ function parseDeepLinkInstallSlug(rawUrl: string): string | null {
     return null;
   }
   if (url.protocol !== "packrelay:") return null;
-  // Expected shape: packrelay://install/<slug>. The "install" piece
-  // is what URL parses as host; the slug is the first pathname
-  // segment. Future verbs (e.g. packrelay://server/<slug>) can
-  // bolt on with the same parser.
-  if (url.host !== "install") return null;
+  // Shape: packrelay://<verb>/<slug>. The verb is parsed as URL.host;
+  // the slug is the first pathname segment.
+  const verb = url.host;
+  if (verb !== "install" && verb !== "join") return null;
   const slug = url.pathname.replace(/^\/+/, "").split("/")[0] ?? "";
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return null;
-  return slug;
+  return { kind: verb, slug };
 }
 
 function formatRelativeTime(iso: string): string {
@@ -495,19 +507,34 @@ function App() {
     };
   }, []);
 
-  // Deep-link handoff from the cloud website. A URL like
-  // `packrelay://install/<slug>` lands as a "deeplink://incoming"
-  // event from the Rust side. We stash the slug into state and
-  // a separate effect resolves it once the catalog has loaded.
+  // Deep-link handoff from the cloud website. URLs land here as a
+  // "deeplink://incoming" event from the Rust side. We stash the
+  // parsed verb+slug and a separate effect resolves it once the
+  // relevant catalog (packs for install, servers for join) has
+  // loaded — cold-start firing beats the catalog fetch on most
+  // boots.
   const [pendingInstallSlug, setPendingInstallSlug] = useState<string | null>(
     null
   );
+  const [pendingJoinSlug, setPendingJoinSlug] = useState<string | null>(null);
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     (async () => {
       unlisten = await listen<string>("deeplink://incoming", (e) => {
-        const slug = parseDeepLinkInstallSlug(e.payload);
-        if (slug) setPendingInstallSlug(slug);
+        const parsed = parseDeepLink(e.payload);
+        if (!parsed) return;
+        if (parsed.kind === "install") {
+          setPendingInstallSlug(parsed.slug);
+        } else {
+          // packrelay://join/<server-slug>. ServerDetailView
+          // already renders the right "Install / Update / Connect"
+          // affordance based on local install-history; we just
+          // need to drop the user there. If a previous deep-link
+          // install was pending, drop it — the user's most recent
+          // intent (joining a specific server) wins.
+          setPendingInstallSlug(null);
+          setPendingJoinSlug(parsed.slug);
+        }
       });
     })();
     return () => {
@@ -824,6 +851,26 @@ function App() {
     if (match) openPackInstall(match);
     setPendingInstallSlug(null);
   }, [packs, pendingInstallSlug, openPackInstall]);
+
+  // Twin of the install resolver above, but for `packrelay://join/<slug>`.
+  // Drops the user into ServerDetailView for the matching server —
+  // that view already handles the three install states (current →
+  // Connect; needs-update → Update & connect; not-installed → Install
+  // pack & get connect address) so we don't need to special-case any
+  // of them here. If the server isn't in the catalog (private,
+  // delisted, typo'd), we clear the pending slot silently. Future:
+  // a per-slug fetch fallback so a launcher with a stale catalog can
+  // still resolve a fresh server URL from chat.
+  useEffect(() => {
+    if (!pendingJoinSlug || !servers) return;
+    const match = servers.find((s) => s.slug === pendingJoinSlug);
+    if (match) {
+      setView("servers");
+      setSelectedPack(null);
+      setSelectedServer(match);
+    }
+    setPendingJoinSlug(null);
+  }, [servers, pendingJoinSlug]);
 
   const recordInstall = useCallback(
     (slug: string, report: InstallReport, coverImage: string | null) => {

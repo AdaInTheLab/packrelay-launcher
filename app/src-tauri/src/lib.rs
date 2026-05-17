@@ -1243,11 +1243,14 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // Deep-link plugin — registers `packrelay://` so the
-        // cloud's pack page can hand off install requests via a
-        // single anchor click. URLs look like:
-        //   packrelay://install/<slug>?version=<v>
-        // The on_open_url handler in setup() below parses the URL
-        // and emits a `deeplink://install` event to the frontend.
+        // cloud can hand off requests via a single anchor click.
+        // Two verbs today:
+        //   packrelay://install/<pack-slug>     → InstallView
+        //   packrelay://join/<server-slug>      → ServerDetailView
+        // The on_open_url handler in setup() below forwards the
+        // raw URL string up to the frontend as `deeplink://incoming`;
+        // parsing + dispatch lives in App.tsx so adding a new verb
+        // doesn't need a Rust rebuild.
         .plugin(tauri_plugin_deep_link::init())
         // Background blob-cache GC: weekly sweep on startup so disk
         // usage doesn't grow forever. Best-effort — failures stay
