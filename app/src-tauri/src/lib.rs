@@ -30,7 +30,9 @@ use packrelay_core::profile::{
 };
 use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::update::{update, UpdateReport};
-use packrelay_core::verify::{repair, verify, RepairReport, VerifyReport};
+use packrelay_core::verify::{
+    presence_check, repair, verify, PresenceReport, RepairReport, VerifyReport,
+};
 
 /// How many pre-launch snapshots we keep per profile before
 /// pruning the oldest. User-tweakable in a future settings panel;
@@ -463,6 +465,22 @@ async fn update_pack(
 #[tauri::command]
 async fn verify_pack(dest: String) -> Result<VerifyReport, String> {
     verify(&PathBuf::from(dest))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Fast disk-presence probe for a pack we *think* we installed.
+/// Parses the sidecar + stats up to 8 sample files; never hashes,
+/// never reads bytes. Single-digit ms even on spinning disk for a
+/// healthy install.
+///
+/// The screenshot bug — server detail page shows "INSTALLED + Connect"
+/// for a folder that's actually empty — is this command's reason to
+/// exist. ServerDetailView fires it on mount and downgrades to the
+/// install flow when the verdict comes back present=false.
+#[tauri::command]
+async fn check_pack_present(dest: String) -> Result<PresenceReport, String> {
+    presence_check(&PathBuf::from(dest))
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1317,6 +1335,7 @@ pub fn run() {
             default_install_dest,
             launch_game,
             verify_pack,
+            check_pack_present,
             repair_pack,
             uninstall_pack,
             update_pack,

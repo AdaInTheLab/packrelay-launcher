@@ -225,6 +225,19 @@ type ProfileInitialState =
       userdataDir: string | null;
     };
 
+// Mirrors packrelay-core::verify::PresenceReport. Result of the cheap
+// disk probe that ServerDetailView fires on mount — answers "the
+// localStorage history claims this is installed; is it ACTUALLY still
+// on disk?" Single-digit ms on a healthy install.
+type PresenceReport = {
+  present: boolean;
+  displayName: string | null;
+  version: string | null;
+  totalFiles: number;
+  sampledFiles: number;
+  missingSamples: number;
+};
+
 type UninstallFailure = { path: string; reason: string };
 type UninstallReport = {
   displayName: string;
@@ -3615,9 +3628,69 @@ function ServerDetailView({
   // probably auto-updates to it.
   const targetVersion =
     server.attachedPack?.attachedVersion ?? attachedPack?.latestVersion ?? null;
+
+  // Disk-presence probe. localStorage history says "we installed v0.2.0
+  // at <dest>" but the user could have manually deleted the folder,
+  // reinstalled 7DTD over it, or remapped a drive. Without this check
+  // the UI shows INSTALLED + Connect for a pack that isn't actually
+  // there, and the player joins the server with no mods loaded.
+  //
+  // The check is cheap (sidecar parse + 8 stat() calls); single-digit
+  // ms on healthy installs. Result lands in `presence`; the install-
+  // state truth table downgrades "current" → "not-installed" whenever
+  // presence comes back absent.
+  type Presence =
+    | { kind: "checking" }
+    | { kind: "present"; report: PresenceReport }
+    | { kind: "absent"; report: PresenceReport }
+    | { kind: "skipped" }; // no installedRecord → nothing to probe
+  const [presence, setPresence] = useState<Presence>(() =>
+    installedRecord ? { kind: "checking" } : { kind: "skipped" }
+  );
+  useEffect(() => {
+    if (!installedRecord) {
+      setPresence({ kind: "skipped" });
+      return;
+    }
+    let cancelled = false;
+    setPresence({ kind: "checking" });
+    (async () => {
+      try {
+        const report = await invoke<PresenceReport>("check_pack_present", {
+          dest: installedRecord.dest,
+        });
+        if (cancelled) return;
+        setPresence({
+          kind: report.present ? "present" : "absent",
+          report,
+        });
+      } catch {
+        // Probe failed entirely (Tauri unreachable, permission denied,
+        // etc.). Optimistically trust history rather than blocking the
+        // user — the worst case is the existing pre-v0.1.8 behavior.
+        if (!cancelled) setPresence({ kind: "skipped" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [installedRecord?.dest, installedRecord?.slug]);
+
+  // installedRecord is "trusted" only when we either skipped the probe
+  // (no record to begin with) or the probe came back present. While
+  // checking we treat it as trusted so the first paint matches the
+  // optimistic state — the probe completes in ms, so the worst case
+  // is a brief Connect→Install button flip if presence comes back
+  // absent. Better than blocking the UI on every server-detail mount.
+  const installedRecordTrusted =
+    installedRecord &&
+    (presence.kind === "present" ||
+      presence.kind === "checking" ||
+      presence.kind === "skipped");
+
   const installState: "not-installed" | "needs-update" | "current" = (() => {
-    if (!installedRecord) return "not-installed";
-    if (targetVersion && installedRecord.version !== targetVersion) {
+    if (!installedRecordTrusted) return "not-installed";
+    if (targetVersion && installedRecord!.version !== targetVersion) {
       return "needs-update";
     }
     return "current";
@@ -3697,6 +3770,31 @@ function ServerDetailView({
       {server.attachedPack ? (
         attachedPack ? (
           <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+            {/* Stale-history hint. The probe came back absent (sidecar
+                or sample files gone) for an installedRecord we'd
+                otherwise have trusted; surface that explicitly so the
+                user understands why the chip flipped from INSTALLED
+                back to Install. Without this, the v0.1.7 bug would
+                be replaced by a silent "huh, the button changed" UX. */}
+            {presence.kind === "absent" && installedRecord && (
+              <div className="mb-4 rounded-md border border-[var(--color-status-warning)]/40 bg-[var(--color-status-warning)]/10 px-3 py-2 text-[11px] text-[var(--color-text-bright)]/85 leading-relaxed">
+                Found a v{installedRecord.version} install record at{" "}
+                <code className="font-mono break-all">
+                  {installedRecord.dest}
+                </code>{" "}
+                but the files aren&apos;t on disk anymore
+                {presence.report.missingSamples > 0 ? (
+                  <>
+                    {" "}
+                    ({presence.report.missingSamples} of{" "}
+                    {presence.report.sampledFiles} sampled files missing)
+                  </>
+                ) : (
+                  " (sidecar gone)"
+                )}
+                . Installing will refetch everything.
+              </div>
+            )}
             <div className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-2">
               {installState === "current"
                 ? "Ready to play"

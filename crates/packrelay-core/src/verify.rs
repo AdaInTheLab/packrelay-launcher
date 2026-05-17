@@ -203,6 +203,101 @@ async fn read_sidecar(dest: &Path) -> Result<Manifest> {
     serde_json::from_str(&raw).with_context(|| "parsing sidecar manifest")
 }
 
+/// Cheap disk-presence probe. Does the install actually still exist
+/// on disk? Decoupled from `verify()` because the GUI wants this on
+/// every ServerDetailView mount (and on Library row render later) —
+/// hashing all 332 files of a 5GB pack is far too expensive for that.
+///
+/// Three-state result:
+///  - `present: true` and `missing_samples == 0` — sidecar parses,
+///    every sampled file exists. Safe to show "INSTALLED + Connect."
+///  - `present: false`, `sampled_files == 0` — sidecar itself is gone.
+///    The install was wiped (manual delete, 7DTD reinstall, drive
+///    remap). Treat as not-installed.
+///  - `present: false`, `missing_samples > 0` — sidecar there but
+///    sample files are missing. Partially wiped install; UI should
+///    route to re-install rather than letting the user Connect into
+///    a broken Mods/ folder.
+///
+/// Sampling: up to 8 files spread evenly across `manifest.files`.
+/// Pure tokio metadata() calls — no bytes read, no hashes computed.
+/// A fully-intact install completes the probe in single-digit
+/// milliseconds even on a hard-drive system.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceReport {
+    /// Overall verdict: true iff the sidecar parses AND every sampled
+    /// file is on disk. UI keys off this single bool for the
+    /// installed-or-not decision.
+    pub present: bool,
+    /// Pack name from the sidecar, when we got that far. None means
+    /// we couldn't even open the sidecar.
+    pub display_name: Option<String>,
+    /// Version from the sidecar, when we got that far. None means
+    /// we couldn't even open the sidecar.
+    pub version: Option<String>,
+    /// What the manifest *says* should be on disk.
+    pub total_files: u32,
+    /// How many files we actually stat'd (cap at 8).
+    pub sampled_files: u32,
+    /// Of the sampled files, how many came back missing. >0 with
+    /// `sampled_files > 0` means "sidecar lied"; the install is
+    /// partially wiped.
+    pub missing_samples: u32,
+}
+
+const PRESENCE_SAMPLE_CAP: usize = 8;
+
+pub async fn presence_check(dest: &Path) -> Result<PresenceReport> {
+    let manifest = match read_sidecar(dest).await {
+        Ok(m) => m,
+        Err(_) => {
+            // Sidecar missing or unparseable. The install isn't really
+            // there from PackRelay's point of view — even if 7DTD has
+            // some random Mods/ folders, we can't claim ownership.
+            return Ok(PresenceReport {
+                present: false,
+                display_name: None,
+                version: None,
+                total_files: 0,
+                sampled_files: 0,
+                missing_samples: 0,
+            });
+        }
+    };
+
+    let n = manifest.files.len();
+    let sample_count = n.min(PRESENCE_SAMPLE_CAP);
+    let mut missing = 0u32;
+    // Even spread across the manifest: 0, n/8, 2n/8, ... so we catch
+    // "first dir wiped" and "last dir wiped" failure modes with the
+    // same probe. Skips when there are zero files (a degenerate but
+    // technically-valid pack).
+    if sample_count > 0 {
+        for i in 0..sample_count {
+            let idx = (i * n) / sample_count;
+            let f = &manifest.files[idx];
+            // Manifest paths use forward slashes; PathBuf.join handles
+            // mixed separators on Windows, but normalize anyway so the
+            // path that ends up in the error log matches what's in the
+            // sidecar verbatim.
+            let target = dest.join(f.path.replace('\\', "/"));
+            if fs::metadata(&target).await.is_err() {
+                missing += 1;
+            }
+        }
+    }
+
+    Ok(PresenceReport {
+        present: missing == 0,
+        display_name: Some(manifest.display_name),
+        version: Some(manifest.version),
+        total_files: n as u32,
+        sampled_files: sample_count as u32,
+        missing_samples: missing,
+    })
+}
+
 /// Internal: distinguishes "file isn't there" from "file is there
 /// but wrong." We can't surface that distinction from a single
 /// anyhow::Error without parsing the message, so we use a typed
