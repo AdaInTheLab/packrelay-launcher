@@ -18,6 +18,9 @@
   <a href="https://github.com/AdaInTheLab/packrelay-launcher/releases/latest">
     <img src="https://img.shields.io/github/v/release/AdaInTheLab/packrelay-launcher?include_prereleases&label=release&labelColor=171717&color=7c5cff" alt="Latest release" />
   </a>
+  <a href="https://codecov.io/gh/AdaInTheLab/packrelay-launcher">
+    <img src="https://img.shields.io/codecov/c/github/AdaInTheLab/packrelay-launcher?label=coverage&labelColor=171717&color=06b6d4" alt="Coverage" />
+  </a>
   <a href="https://github.com/AdaInTheLab/packrelay-launcher/releases">
     <img src="https://img.shields.io/github/downloads/AdaInTheLab/packrelay-launcher/total?label=downloads&labelColor=171717&color=06b6d4" alt="Total downloads" />
   </a>
