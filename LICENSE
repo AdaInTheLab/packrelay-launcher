@@ -1,0 +1,47 @@
+PackRelay Launcher — Source-Available License
+
+Copyright (c) 2026 AdaInTheLab. All rights reserved.
+
+This source code is published for one reason: so anyone can independently
+verify that the PackRelay launcher binaries shipped on the official
+GitHub Releases page are built from the source visible in this repository,
+and that the launcher does not contain hidden behavior beyond what its
+documentation describes.
+
+This is NOT an open-source license. The "PackRelay Launcher" name, the
+launcher binaries, and this source code are not free for general use,
+redistribution, or modification.
+
+YOU MAY:
+  1. Read this source code, in this repository, for inspection / audit /
+     security-research purposes.
+  2. Quote short excerpts in security write-ups, bug reports, blog posts,
+     or academic work, with attribution.
+  3. Build the code yourself locally and run the resulting binary on your
+     own machine for personal evaluation.
+
+YOU MAY NOT, without prior written permission from the copyright holder:
+  1. Redistribute this source code, in whole or in part.
+  2. Use this source code (in whole or in part) in another project,
+     whether commercial, non-commercial, open-source, or proprietary.
+  3. Create or distribute modified builds, forks, or derivative works.
+  4. Use the name "PackRelay" or any associated mark to identify,
+     promote, or imply endorsement of any derivative product or service.
+  5. Sell, sublicense, or otherwise commercially exploit any portion of
+     this source code.
+
+The pre-built launcher binaries on the Releases page are the only sanctioned
+way to actually use this software. Their distribution is gratis but their
+terms of use are governed by this notice, not by an open-source license.
+
+If you want to do something not allowed above, get in touch — exceptions
+are case-by-case and not unreasonable to ask for, but they need to be
+explicit and in writing.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.

@@ -9,7 +9,13 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.1.8"
-license = "MIT"
+# Custom source-available license — read LICENSE for the rules. Short
+# version: read it, build it for yourself, don't redistribute or fork.
+# `LicenseRef-...` is SPDX's canonical way to spell a non-OSI license
+# in a place that demands an SPDX expression (here, every child crate
+# inherits via `license.workspace = true`). `publish = false` keeps
+# anyone from accidentally shipping this to crates.io.
+license = "LicenseRef-PackRelay-Source-Available"
 publish = false
 
 [workspace.dependencies]
