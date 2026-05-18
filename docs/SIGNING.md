@@ -1,0 +1,201 @@
+# Windows code-signing — Azure Trusted Signing
+
+The PackRelay launcher's Windows installers (`.exe` + `.msi`) are
+signed via [**Azure Trusted Signing**](https://learn.microsoft.com/en-us/azure/trusted-signing/),
+Microsoft's hosted code-signing service. Signing happens in CI on
+every tagged release via Levminer's
+[`trusted-signing-cli`](https://github.com/Levminer/trusted-signing-cli),
+invoked through Tauri's `bundle.windows.signCommand` hook.
+
+This document is the operator walkthrough — what to set up once
+when Azure verification completes, and how to verify a signed
+binary lands on a user's machine correctly.
+
+For the *why* (Safe Browsing context, alternatives we considered),
+see kanban card #173.
+
+---
+
+## Status checklist
+
+- [x] `release.yml` provisions `trusted-signing-cli` on Windows runners
+- [x] `tauri.conf.json` invokes `sign-windows.ps1` via the signCommand
+- [x] `sign-windows.ps1` no-ops gracefully when secrets are absent
+- [ ] **Azure identity verification approved** ← waiting on Microsoft (1–2 wk from submit)
+- [ ] **GitHub secrets + repo variables added** ← do once verification approves
+- [ ] **First signed release shipped** ← cut a tag, watch the workflow, confirm signature
+
+---
+
+## One-time setup (do once verification approves)
+
+### 1. Create a Certificate Profile in Azure
+
+In the Azure portal, navigate to your Trusted Signing Account
+(`packrelay-trusted-signing`) → **Certificate Profiles** → **+ New
+certificate profile**.
+
+- **Certificate profile name:** `packrelay-prod` (this is what
+  `AZURE_CERT_PROFILE_NAME` below points at)
+- **Identity validation:** select the verified Public Trust identity
+  you submitted earlier
+- **Certificate type:** **Public Trust** — the SmartScreen-visible
+  variant
+- **Include `quotes` in the cert:** leave as default
+
+Click **Create**. Provisioning takes ~30 sec. From this moment
+forward you're billing at the Basic tier rate (~$9.99/mo).
+
+### 2. Create a Service Principal for CI
+
+GitHub Actions needs a non-interactive Azure identity that can
+request signatures on your behalf. Use the Azure CLI (or the
+portal — both work, CLI is faster):
+
+```bash
+# Sign in interactively first if not already
+az login
+
+# Replace <subscription-id> with your real subscription ID
+az ad sp create-for-rbac \
+  --name packrelay-launcher-signing \
+  --role "Trusted Signing Certificate Profile Signer" \
+  --scopes "/subscriptions/<subscription-id>/resourceGroups/packrelay-rg/providers/Microsoft.CodeSigning/codeSigningAccounts/packrelay-trusted-signing"
+```
+
+The CLI emits a JSON blob with three values you need:
+
+```json
+{
+  "appId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",     // -> AZURE_CLIENT_ID
+  "displayName": "packrelay-launcher-signing",
+  "password": "secret-string-rotates-every-2-years",  // -> AZURE_CLIENT_SECRET
+  "tenant": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"     // -> AZURE_TENANT_ID
+}
+```
+
+**Save the `password` immediately** — Azure will never show it again.
+If you lose it, you'll need to generate a new client secret.
+
+### 3. Add the secrets + variables to this GitHub repo
+
+GitHub repo → **Settings** → **Secrets and variables** → **Actions**.
+
+**Repository secrets** (encrypted, never readable after save):
+
+| Name | Value |
+|---|---|
+| `AZURE_TENANT_ID` | the `tenant` from step 2 |
+| `AZURE_CLIENT_ID` | the `appId` from step 2 |
+| `AZURE_CLIENT_SECRET` | the `password` from step 2 |
+
+**Repository variables** (plaintext, readable by anyone with repo
+write access — these don't need to be secret):
+
+| Name | Value |
+|---|---|
+| `AZURE_ENDPOINT` | `https://eus.codesigning.azure.net` *(East US — change if you provisioned elsewhere)* |
+| `AZURE_CODE_SIGNING_ACCOUNT_NAME` | `packrelay-trusted-signing` *(or whatever you named the resource)* |
+| `AZURE_CERT_PROFILE_NAME` | `packrelay-prod` *(matches what you created in step 1)* |
+
+### 4. Cut a release to verify
+
+```bash
+git tag v0.1.9
+git push --tags
+```
+
+Watch the release workflow run. The Windows job should show
+`[sign-windows] Signing ... OK` in the build logs for each `.exe`
+and `.msi` artifact.
+
+### 5. Verify a signed binary
+
+Download the freshly signed `PackRelay_0.1.9_x64-setup.exe` from
+the GitHub release. From a Windows machine:
+
+```powershell
+Get-AuthenticodeSignature .\PackRelay_0.1.9_x64-setup.exe |
+  Select-Object SignerCertificate, Status, TimeStamperCertificate
+```
+
+Expected output:
+
+```
+SignerCertificate     : [Subject: CN=<your verified legal name>, ...]
+Status                : Valid
+TimeStamperCertificate: [Subject: ..., O=Microsoft, ...]
+```
+
+`Status = Valid` is the win condition. If you see `NotSigned` or
+`HashMismatch`, the workflow's sign step didn't run or didn't
+complete — check Actions logs.
+
+---
+
+## Operational notes
+
+### Credential rotation
+
+`AZURE_CLIENT_SECRET` expires every **2 years** by default. Set a
+calendar reminder. To rotate:
+
+```bash
+az ad app credential reset --id <AZURE_CLIENT_ID>
+```
+
+Save the new `password`, update the `AZURE_CLIENT_SECRET` GitHub
+secret. The cert and identity itself don't rotate — only the
+service principal's auth secret does.
+
+### Local dev / forks / PR builds
+
+`sign-windows.ps1` checks `$env:AZURE_CLIENT_SECRET` and skips
+signing if it's not set. So:
+
+- Local Windows dev builds: unsigned, no error
+- PRs from forks: unsigned, no error (forks don't have access to
+  upstream secrets — GitHub's standard protection)
+- Untagged pushes to main: unsigned (workflow only runs on tags)
+
+This is intentional. The single source of signed binaries is
+tagged releases from this upstream repo, built on GitHub Actions.
+
+### Cost monitoring
+
+The Basic tier is **$9.99/mo flat + 5000 free signatures included
+per month**. With ~10 signatures per tagged release (5 artifacts ×
+~2 signing operations each due to NSIS bundling), you'd need ~500
+releases per month to exceed the included quota. You will not
+exceed it.
+
+To check your usage: Azure portal → Trusted Signing Account →
+**Metrics** → "Total signatures."
+
+### If signing fails in CI
+
+The workflow surfaces non-zero exit codes from `sign-windows.ps1`
+loud and clear. Common failure modes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `AZURE_CLIENT_SECRET not set - skipping signing` in logs | Secrets not configured | Add them per step 3 |
+| `Required env var 'AZURE_ENDPOINT' is not set` | Repo variable missing | Add it (variable, not secret) |
+| `trusted-signing-cli: command not found` | Cargo install step skipped | Check `if: matrix.platform == 'windows-latest'` ran |
+| `403 Forbidden` from Azure | Service principal lacks the Signer role | Re-run `az ad sp create-for-rbac` with correct `--role` scope |
+| `Certificate profile 'foo' not found` | `AZURE_CERT_PROFILE_NAME` typo | Match the name from Azure portal exactly |
+
+### Disabling signing temporarily
+
+Delete the `AZURE_CLIENT_SECRET` secret. The script will then
+short-circuit on every Windows artifact and the build will
+succeed with unsigned binaries. Easier than reverting the workflow.
+
+---
+
+## See also
+
+- Microsoft docs: [Trusted Signing concepts](https://learn.microsoft.com/en-us/azure/trusted-signing/concept-trusted-signing-resources-roles)
+- Tauri docs: [Windows code-signing](https://v2.tauri.app/distribute/sign/windows/)
+- Card #173 on the packrelay-raunk kanban for the original design notes
+- `docs/NOTARIZATION.md` for the parallel macOS signing flow
