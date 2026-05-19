@@ -714,10 +714,10 @@ pub struct PackDirEntry {
 }
 
 /// Per-dir source provenance for the launcher's "What's inside"
-/// render (#154). Holds enough info to draw a deep link, but
-/// nothing more ~ the launcher never refetches bytes via these
-/// URLs (downloads are always content-addressed against the blob
-/// cache).
+/// render (#154). Holds enough info to draw a deep link + (future)
+/// an icon, but nothing more ~ the launcher never refetches bytes
+/// via these URLs (downloads are always content-addressed against
+/// the blob cache).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntrySource {
@@ -731,7 +731,104 @@ pub struct DirEntrySource {
     /// nothing to link to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Small upstream icon (16-32px PNG, hosted on packrelay.cloud's
+    /// CDN). None today for every variant ~ icons are a future
+    /// visual-polish pass. The field exists so wiring an icon is a
+    /// one-line registry change, not a schema change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
 }
+
+/// One row in the source-renderer registry (#171). Adding a new
+/// source variant = adding one row here + nothing else. Each entry
+/// declares:
+///
+///   - `kind` ~ matches `ManifestSource.source` for lookup.
+///   - `display_name` ~ what the launcher renders next to "source:".
+///   - `icon_url` ~ small upstream icon. None until icons ship.
+///   - `url_builder` ~ takes the matched ManifestSource and returns
+///     a deep link, or None if the required fields aren't present.
+///
+/// Why a const slice of structs instead of a trait + dyn dispatch:
+/// the lookup runs once per pack-detail render (≤ a few dozen
+/// mods), the variants are bounded by what the manifest schema
+/// accepts (4 today, ~6 plausibly ever), and we want compile-time
+/// errors when a future source kind forgets to register.
+struct SourceRenderer {
+    kind: &'static str,
+    display_name: &'static str,
+    icon_url: Option<&'static str>,
+    url_builder: fn(&packrelay_core::manifest::ManifestSource) -> Option<String>,
+}
+
+/// Build the Nexus mod-page URL from a ManifestSource's `game` +
+/// `mod_id`. Falls back to "7daystodie" when `game` is absent ~
+/// shouldn't happen on a well-formed v2 manifest (schema requires
+/// game on nexus sources), but the launcher prefers to surface a
+/// best-effort link over silently dropping the row.
+fn nexus_url(src: &packrelay_core::manifest::ManifestSource) -> Option<String> {
+    let mod_id = src.mod_id?;
+    let game = src.game.as_deref().unwrap_or("7daystodie");
+    Some(format!("https://www.nexusmods.com/{game}/mods/{mod_id}"))
+}
+
+/// Build the GitHub repo URL from `owner/repo`. We could deep-link
+/// to the specific release tag, but the repo root surfaces the
+/// project README + license + recent activity which is what most
+/// users care about. The tag is a one-line addition if it turns
+/// out useful.
+fn github_url(src: &packrelay_core::manifest::ManifestSource) -> Option<String> {
+    let owner = src.owner.as_deref()?;
+    let repo = src.repo.as_deref()?;
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
+
+/// 7DTM stores the captured upstream URL directly in the manifest
+/// source entry (the site doesn't have stable numeric IDs we can
+/// reconstruct from), so the renderer just passes it through.
+fn sevendtm_url(src: &packrelay_core::manifest::ManifestSource) -> Option<String> {
+    src.upstream_url.clone()
+}
+
+/// Legacy-blob has no upstream ~ it's a "self-hosted, no provenance"
+/// marker. The label "self-hosted" still renders so users can tell
+/// the mod is a known-quantity vs. an orphaned reference.
+fn legacy_blob_url(_src: &packrelay_core::manifest::ManifestSource) -> Option<String> {
+    None
+}
+
+/// The source-renderer registry. Order is rendering-stable but not
+/// semantically meaningful ~ lookup goes by `kind` match.
+///
+/// Adding a future source kind: append one row + define one
+/// `*_url` helper. resolve_source picks it up automatically and
+/// the existing tests + frontend keep working.
+const RENDERERS: &[SourceRenderer] = &[
+    SourceRenderer {
+        kind: "nexus",
+        display_name: "Nexus",
+        icon_url: None,
+        url_builder: nexus_url,
+    },
+    SourceRenderer {
+        kind: "github",
+        display_name: "GitHub",
+        icon_url: None,
+        url_builder: github_url,
+    },
+    SourceRenderer {
+        kind: "7dtm",
+        display_name: "7DaysToDieMods",
+        icon_url: None,
+        url_builder: sevendtm_url,
+    },
+    SourceRenderer {
+        kind: "legacy-blob",
+        display_name: "self-hosted",
+        icon_url: None,
+        url_builder: legacy_blob_url,
+    },
+];
 
 /// Resolve a file entry's `source_ref` against the manifest's
 /// sources catalog and translate the matching `ManifestSource`
@@ -751,50 +848,13 @@ pub fn resolve_source(
 ) -> Option<DirEntrySource> {
     let source_ref = file.source_ref.as_deref()?;
     let src = sources.iter().find(|s| s.id == source_ref)?;
-    match src.source.as_str() {
-        "nexus" => {
-            let mod_id = src.mod_id?;
-            let game = src.game.as_deref().unwrap_or("7daystodie");
-            Some(DirEntrySource {
-                kind: "nexus".to_string(),
-                label: "Nexus".to_string(),
-                url: Some(format!(
-                    "https://www.nexusmods.com/{game}/mods/{mod_id}"
-                )),
-            })
-        }
-        "github" => {
-            // Future #162 ~ for now we still emit a row with a
-            // link to the repo so users see the source kind even
-            // before the renderer registry lands.
-            let owner = src.owner.as_deref()?;
-            let repo = src.repo.as_deref()?;
-            Some(DirEntrySource {
-                kind: "github".to_string(),
-                label: "GitHub".to_string(),
-                url: Some(format!("https://github.com/{owner}/{repo}")),
-            })
-        }
-        "7dtm" => {
-            // Future #170 ~ same forward-compat treatment.
-            let url = src.upstream_url.clone();
-            Some(DirEntrySource {
-                kind: "7dtm".to_string(),
-                label: "7DaysToDieMods".to_string(),
-                url,
-            })
-        }
-        "legacy-blob" => Some(DirEntrySource {
-            kind: "legacy-blob".to_string(),
-            label: "self-hosted".to_string(),
-            url: None,
-        }),
-        // Unknown source variant ~ skip the render. New variants
-        // land additively in future cloud releases; the launcher
-        // doesn't break, it just doesn't surface them until it
-        // ships a matching mapping.
-        _ => None,
-    }
+    let renderer = RENDERERS.iter().find(|r| r.kind == src.source)?;
+    Some(DirEntrySource {
+        kind: renderer.kind.to_string(),
+        label: renderer.display_name.to_string(),
+        url: (renderer.url_builder)(src),
+        icon_url: renderer.icon_url.map(|s| s.to_string()),
+    })
 }
 
 /// Fetch a pack's manifest and reduce it to its top-level dirs.
@@ -1638,6 +1698,43 @@ mod tests {
         assert_eq!(out.kind, "legacy-blob");
         assert_eq!(out.label, "self-hosted");
         assert!(out.url.is_none());
+    }
+
+    #[test]
+    fn renderers_table_covers_every_known_source_kind() {
+        // The cloud's manifest schema accepts exactly these four
+        // source variants today (see PackRelayCloud
+        // src/lib/manifest.ts ~ nexusSourceSchema,
+        // githubSourceSchema, sevenDtmSourceSchema,
+        // legacyBlobSourceSchema). The launcher's registry must
+        // have a renderer for each, otherwise a valid v2 manifest
+        // would lose provenance on its files. This test fails
+        // loudly if a future cloud release adds a variant the
+        // launcher hasn't onboarded yet.
+        let known = ["nexus", "github", "7dtm", "legacy-blob"];
+        for kind in known {
+            assert!(
+                RENDERERS.iter().any(|r| r.kind == kind),
+                "RENDERERS missing a registration for kind={kind}. \
+                 Add a row to the const RENDERERS slice in lib.rs."
+            );
+        }
+    }
+
+    #[test]
+    fn renderers_kinds_are_unique() {
+        // Two rows with the same kind would mean lookup ambiguity
+        // ~ `iter().find()` returns the first match, which is
+        // probably not what the author intended. Catch the typo
+        // before it lands.
+        let mut seen = std::collections::HashSet::new();
+        for r in RENDERERS {
+            assert!(
+                seen.insert(r.kind),
+                "Duplicate RENDERERS entry for kind={}",
+                r.kind
+            );
+        }
     }
 
     #[test]

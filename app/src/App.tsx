@@ -2984,6 +2984,12 @@ type DirEntrySource = {
   /** Deep link to the upstream listing. Absent for legacy-blob and
    *  any source variant the Rust side doesn't know how to render. */
   url?: string;
+  /** Small upstream icon, served from packrelay.cloud's CDN.
+   *  Absent today for every variant ~ icons are a future visual-
+   *  polish pass. The field is plumbed end-to-end (registry ->
+   *  Rust DirEntrySource -> here) so wiring an icon is a one-line
+   *  registry change. */
+  iconUrl?: string;
 };
 
 type PackDirEntry = {
