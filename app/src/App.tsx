@@ -2974,11 +2974,63 @@ function InstallView({
 // manifest. DetailView fetches these lazily so the page renders
 // before the network roundtrip lands; missing data just hides the
 // "What's inside" section.
+type DirEntrySource = {
+  /** "nexus" | "github" | "7dtm" | "legacy-blob" ~ matches the
+   *  Rust DirEntrySource.kind. */
+  kind: string;
+  /** Human-readable label ("Nexus", "GitHub", ...). Computed
+   *  Rust-side so the frontend doesn't need a kind->label map. */
+  label: string;
+  /** Deep link to the upstream listing. Absent for legacy-blob and
+   *  any source variant the Rust side doesn't know how to render. */
+  url?: string;
+};
+
 type PackDirEntry = {
   name: string;
   fileCount: number;
   totalBytes: number;
+  /** Per-dir provenance (#154). Resolved Rust-side from the first
+   *  file in the dir's sourceRef. v1 manifests + missing sourceRef
+   *  leave this undefined ~ render nothing. */
+  source?: DirEntrySource;
 };
+
+/**
+ * Per-dir source provenance line in DetailView's "What's inside"
+ * list (#154). One thin row below the mod-name + file-count line:
+ *
+ *   source: Nexus · view on nexus →
+ *
+ * The link is rendered as an `<a>` so Tauri's webview routes it
+ * through the OS default browser (same behavior the existing
+ * external-link surfaces in this view rely on). When the source
+ * has no URL (legacy-blob or future variants the Rust side can't
+ * deep-link), we still show the label so users can tell the mod
+ * is self-hosted rather than orphaned.
+ */
+function DirSourceLine({ source }: { source: DirEntrySource }) {
+  return (
+    <div className="text-[10px] text-[var(--color-text-dim)] flex items-center gap-1 truncate">
+      <span>source:</span>
+      <span className="text-[var(--color-text-bright)]/70">{source.label}</span>
+      {source.url && (
+        <>
+          <span aria-hidden="true">·</span>
+          <a
+            href={source.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-[var(--color-accent-soft)] hover:underline"
+            title={source.url}
+          >
+            view on {source.label.toLowerCase()} →
+          </a>
+        </>
+      )}
+    </div>
+  );
+}
 
 function DetailView({
   pack,
@@ -3149,21 +3201,24 @@ function DetailView({
             {insideDirs.map((d) => (
               <li
                 key={d.name}
-                className="flex items-center justify-between gap-3 rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2"
+                className="flex flex-col gap-0.5 rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2"
               >
-                <span
-                  className={`text-[12px] truncate ${
-                    d.name === "(root)"
-                      ? "text-[var(--color-text-dim)] italic"
-                      : "text-[var(--color-text-bright)] font-medium"
-                  }`}
-                  title={d.name}
-                >
-                  {d.name}
-                </span>
-                <span className="shrink-0 text-[10px] text-[var(--color-text-dim)] tabular-nums">
-                  {d.fileCount}f · {formatBytes(d.totalBytes)}
-                </span>
+                <div className="flex items-center justify-between gap-3">
+                  <span
+                    className={`text-[12px] truncate ${
+                      d.name === "(root)"
+                        ? "text-[var(--color-text-dim)] italic"
+                        : "text-[var(--color-text-bright)] font-medium"
+                    }`}
+                    title={d.name}
+                  >
+                    {d.name}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-[var(--color-text-dim)] tabular-nums">
+                    {d.fileCount}f · {formatBytes(d.totalBytes)}
+                  </span>
+                </div>
+                {d.source && <DirSourceLine source={d.source} />}
               </li>
             ))}
           </ul>

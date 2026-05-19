@@ -695,12 +695,106 @@ async fn toggle_favorite_impl(
 /// One entry in a pack's "what's inside" overview. Each top-level
 /// directory in the manifest's file list is one mod, by 7DTD's
 /// pack-on-disk convention (Mods/<ModName>/ModInfo.xml).
+///
+/// `source` (#154) ~ when the manifest carries v2 provenance, the
+/// launcher surfaces it as a deep link in DetailView. Resolved by
+/// taking the first file's sourceRef and looking it up in the
+/// manifest's sources catalog. Files in a single mod dir share a
+/// source in the canonical Nexus case, so first-file is
+/// representative; the rare cross-source dir loses provenance for
+/// the trailing files but doesn't break the render.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackDirEntry {
     pub name: String,
     pub file_count: u32,
     pub total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<DirEntrySource>,
+}
+
+/// Per-dir source provenance for the launcher's "What's inside"
+/// render (#154). Holds enough info to draw a deep link, but
+/// nothing more ~ the launcher never refetches bytes via these
+/// URLs (downloads are always content-addressed against the blob
+/// cache).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirEntrySource {
+    /// "nexus" | "github" | "7dtm" | "legacy-blob".
+    pub kind: String,
+    /// Human-readable label for the source ("Nexus", "GitHub",
+    /// "7DaysToDieMods", "self-hosted"). Computed Rust-side so the
+    /// React side doesn't need to know the kind->label mapping.
+    pub label: String,
+    /// Deep link to the upstream listing. None for legacy-blob ~
+    /// nothing to link to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Resolve a file entry's `source_ref` against the manifest's
+/// sources catalog and translate the matching `ManifestSource`
+/// into the launcher's display shape. Returns None when:
+///   - the file has no source_ref (v1 manifest or legacy-blob)
+///   - the source_ref doesn't match any catalog entry (malformed
+///     manifest ~ the cloud's superRefine catches this at publish
+///     time, but the launcher tolerates it gracefully)
+///   - the matched source variant isn't one the launcher knows
+///     how to render yet (forward-compat for future source types)
+///
+/// Pure function, public for test access from the lib.rs test
+/// module below.
+pub fn resolve_source(
+    sources: &[packrelay_core::manifest::ManifestSource],
+    file: &packrelay_core::manifest::FileEntry,
+) -> Option<DirEntrySource> {
+    let source_ref = file.source_ref.as_deref()?;
+    let src = sources.iter().find(|s| s.id == source_ref)?;
+    match src.source.as_str() {
+        "nexus" => {
+            let mod_id = src.mod_id?;
+            let game = src.game.as_deref().unwrap_or("7daystodie");
+            Some(DirEntrySource {
+                kind: "nexus".to_string(),
+                label: "Nexus".to_string(),
+                url: Some(format!(
+                    "https://www.nexusmods.com/{game}/mods/{mod_id}"
+                )),
+            })
+        }
+        "github" => {
+            // Future #162 ~ for now we still emit a row with a
+            // link to the repo so users see the source kind even
+            // before the renderer registry lands.
+            let owner = src.owner.as_deref()?;
+            let repo = src.repo.as_deref()?;
+            Some(DirEntrySource {
+                kind: "github".to_string(),
+                label: "GitHub".to_string(),
+                url: Some(format!("https://github.com/{owner}/{repo}")),
+            })
+        }
+        "7dtm" => {
+            // Future #170 ~ same forward-compat treatment.
+            let url = src.upstream_url.clone();
+            Some(DirEntrySource {
+                kind: "7dtm".to_string(),
+                label: "7DaysToDieMods".to_string(),
+                url,
+            })
+        }
+        "legacy-blob" => Some(DirEntrySource {
+            kind: "legacy-blob".to_string(),
+            label: "self-hosted".to_string(),
+            url: None,
+        }),
+        // Unknown source variant ~ skip the render. New variants
+        // land additively in future cloud releases; the launcher
+        // doesn't break, it just doesn't surface them until it
+        // ships a matching mapping.
+        _ => None,
+    }
 }
 
 /// Fetch a pack's manifest and reduce it to its top-level dirs.
@@ -716,20 +810,42 @@ async fn fetch_pack_overview(slug: String) -> Result<Vec<PackDirEntry>, String> 
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    // Bucket file count + total bytes by first path segment.
-    // Manifest paths can use either slash flavour on Windows-
-    // published packs (Zod doesn't normalize); canonicalize before
-    // splitting so a backslash-in-path doesn't end up as its own
-    // bogus "dir".
-    let mut by_dir: std::collections::HashMap<String, (u32, u64)> =
-        std::collections::HashMap::new();
+    Ok(reduce_to_dirs(&manifest))
+}
+
+/// Pure helper extracted from `fetch_pack_overview` so the
+/// dir-bucketing + per-dir source resolution can be unit-tested
+/// without a live API. Takes the parsed manifest and emits the
+/// flat dir list with each entry's representative source.
+///
+/// Source resolution rule: take the FIRST file inside a dir's
+/// sourceRef. In the canonical Nexus case all files in one mod
+/// folder share a single sourceRef so the first is representative.
+/// For a hypothetical cross-source dir the trailing files lose
+/// provenance ~ acceptable as v0 since no publisher actually
+/// builds such a pack, and the cloud's audit (#178-ish) will
+/// flag it before publish anyway.
+pub fn reduce_to_dirs(manifest: &packrelay_core::manifest::Manifest) -> Vec<PackDirEntry> {
+    // Bucket file count + total bytes + first-file source by
+    // first path segment. Manifest paths can use either slash
+    // flavour on Windows-published packs (Zod doesn't normalize);
+    // canonicalize before splitting so a backslash-in-path
+    // doesn't end up as its own bogus "dir".
+    let mut by_dir: std::collections::HashMap<
+        String,
+        (u32, u64, Option<DirEntrySource>),
+    > = std::collections::HashMap::new();
     let mut root_count: u32 = 0;
     let mut root_bytes: u64 = 0;
+    let mut root_source: Option<DirEntrySource> = None;
+
     for file in &manifest.files {
         let normalized = file.path.replace('\\', "/");
         match normalized.split_once('/') {
             Some((first, _)) => {
-                let entry = by_dir.entry(first.to_string()).or_insert((0, 0));
+                let entry = by_dir
+                    .entry(first.to_string())
+                    .or_insert_with(|| (0, 0, resolve_source(&manifest.sources, file)));
                 entry.0 += 1;
                 entry.1 += file.size;
             }
@@ -738,17 +854,22 @@ async fn fetch_pack_overview(slug: String) -> Result<Vec<PackDirEntry>, String> 
                 // parent dir. Group as a synthetic "(root)"
                 // bucket at the end of the list — uncommon, but
                 // worth showing rather than silently dropping.
+                if root_count == 0 {
+                    root_source = resolve_source(&manifest.sources, file);
+                }
                 root_count += 1;
                 root_bytes += file.size;
             }
         }
     }
+
     let mut dirs: Vec<PackDirEntry> = by_dir
         .into_iter()
-        .map(|(name, (file_count, total_bytes))| PackDirEntry {
+        .map(|(name, (file_count, total_bytes, source))| PackDirEntry {
             name,
             file_count,
             total_bytes,
+            source,
         })
         .collect();
     dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -757,9 +878,10 @@ async fn fetch_pack_overview(slug: String) -> Result<Vec<PackDirEntry>, String> 
             name: "(root)".to_string(),
             file_count: root_count,
             total_bytes: root_bytes,
+            source: root_source,
         });
     }
-    Ok(dirs)
+    dirs
 }
 
 // ---------- Profile commands ----------
@@ -1364,3 +1486,290 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use packrelay_core::manifest::{FileEntry, Manifest, ManifestSource, Signature};
+
+    fn nexus_source(id: &str, mod_id: u64) -> ManifestSource {
+        ManifestSource {
+            id: id.to_string(),
+            source: "nexus".to_string(),
+            game: Some("7daystodie".to_string()),
+            mod_id: Some(mod_id),
+            file_id: Some(100),
+            version: Some("1.0".to_string()),
+            owner: None,
+            repo: None,
+            release_tag: None,
+            asset_name: None,
+            mod_slug: None,
+            upstream_url: None,
+        }
+    }
+
+    fn github_source(id: &str, owner: &str, repo: &str) -> ManifestSource {
+        ManifestSource {
+            id: id.to_string(),
+            source: "github".to_string(),
+            game: None,
+            mod_id: None,
+            file_id: None,
+            version: None,
+            owner: Some(owner.to_string()),
+            repo: Some(repo.to_string()),
+            release_tag: Some("v1.0".to_string()),
+            asset_name: Some("mod.zip".to_string()),
+            mod_slug: None,
+            upstream_url: None,
+        }
+    }
+
+    fn legacy_source(id: &str) -> ManifestSource {
+        ManifestSource {
+            id: id.to_string(),
+            source: "legacy-blob".to_string(),
+            game: None,
+            mod_id: None,
+            file_id: None,
+            version: None,
+            owner: None,
+            repo: None,
+            release_tag: None,
+            asset_name: None,
+            mod_slug: None,
+            upstream_url: None,
+        }
+    }
+
+    fn file(path: &str, source_ref: Option<&str>) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            sha256: "a".repeat(64),
+            size: 100,
+            executable: None,
+            source_ref: source_ref.map(|s| s.to_string()),
+        }
+    }
+
+    fn build_manifest(sources: Vec<ManifestSource>, files: Vec<FileEntry>) -> Manifest {
+        Manifest {
+            schema_version: 2,
+            name: "test".to_string(),
+            display_name: "Test".to_string(),
+            version: "1.0.0".to_string(),
+            game: "7d2d".to_string(),
+            game_version: "1.0".to_string(),
+            publisher: "tester".to_string(),
+            published_at: "2026-05-19T00:00:00Z".to_string(),
+            description: None,
+            tags: vec![],
+            sources,
+            files,
+            signature: Signature {
+                algo: "ed25519".to_string(),
+                public_key_id: "tester/key1".to_string(),
+                value: "f".repeat(128),
+            },
+        }
+    }
+
+    // ---- resolve_source ----
+
+    #[test]
+    fn resolve_source_returns_none_when_file_has_no_source_ref() {
+        let sources = vec![nexus_source("nexus-42-100", 42)];
+        let f = file("Mods/Foo/ModInfo.xml", None);
+        assert!(resolve_source(&sources, &f).is_none());
+    }
+
+    #[test]
+    fn resolve_source_returns_none_when_source_ref_unknown() {
+        let sources = vec![nexus_source("nexus-42-100", 42)];
+        let f = file("Mods/Foo/ModInfo.xml", Some("does-not-exist"));
+        assert!(resolve_source(&sources, &f).is_none());
+    }
+
+    #[test]
+    fn resolve_source_nexus_emits_label_and_url() {
+        let sources = vec![nexus_source("nexus-42-100", 42)];
+        let f = file("Mods/Foo/ModInfo.xml", Some("nexus-42-100"));
+        let out = resolve_source(&sources, &f).expect("Nexus source should resolve");
+        assert_eq!(out.kind, "nexus");
+        assert_eq!(out.label, "Nexus");
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://www.nexusmods.com/7daystodie/mods/42")
+        );
+    }
+
+    #[test]
+    fn resolve_source_nexus_uses_game_field_in_url() {
+        let mut src = nexus_source("nexus-7-50", 7);
+        src.game = Some("stardewvalley".to_string());
+        let sources = vec![src];
+        let f = file("Mods/Foo/ModInfo.xml", Some("nexus-7-50"));
+        let out = resolve_source(&sources, &f).unwrap();
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://www.nexusmods.com/stardewvalley/mods/7")
+        );
+    }
+
+    #[test]
+    fn resolve_source_github_emits_repo_url() {
+        let sources = vec![github_source("gh-foo", "ada", "foo-mod")];
+        let f = file("Mods/Foo/ModInfo.xml", Some("gh-foo"));
+        let out = resolve_source(&sources, &f).unwrap();
+        assert_eq!(out.kind, "github");
+        assert_eq!(out.label, "GitHub");
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://github.com/ada/foo-mod")
+        );
+    }
+
+    #[test]
+    fn resolve_source_legacy_blob_has_no_url() {
+        let sources = vec![legacy_source("legacy-old")];
+        let f = file("Mods/Foo/ModInfo.xml", Some("legacy-old"));
+        let out = resolve_source(&sources, &f).unwrap();
+        assert_eq!(out.kind, "legacy-blob");
+        assert_eq!(out.label, "self-hosted");
+        assert!(out.url.is_none());
+    }
+
+    #[test]
+    fn resolve_source_unknown_variant_returns_none() {
+        // Forward-compat: a future source type the launcher doesn't
+        // know how to render should not crash deserialization OR
+        // emit a half-rendered row. None lets DetailView skip.
+        let src = ManifestSource {
+            id: "future-1".to_string(),
+            source: "neogaf".to_string(),
+            game: None,
+            mod_id: None,
+            file_id: None,
+            version: None,
+            owner: None,
+            repo: None,
+            release_tag: None,
+            asset_name: None,
+            mod_slug: None,
+            upstream_url: None,
+        };
+        let sources = vec![src];
+        let f = file("Mods/Foo/ModInfo.xml", Some("future-1"));
+        assert!(resolve_source(&sources, &f).is_none());
+    }
+
+    // ---- reduce_to_dirs ----
+
+    #[test]
+    fn reduce_to_dirs_groups_by_first_path_segment() {
+        let manifest = build_manifest(
+            vec![],
+            vec![
+                file("Mods/FooMod/ModInfo.xml", None),
+                file("Mods/FooMod/Config.xml", None),
+                file("Mods/BarMod/ModInfo.xml", None),
+            ],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        assert_eq!(dirs.len(), 1, "single top-level Mods dir expected");
+        let mods = dirs.iter().find(|d| d.name == "Mods").unwrap();
+        assert_eq!(mods.file_count, 3);
+    }
+
+    #[test]
+    fn reduce_to_dirs_attaches_first_file_source() {
+        let manifest = build_manifest(
+            vec![nexus_source("nexus-42-100", 42)],
+            vec![
+                file("Mods/FooMod/ModInfo.xml", Some("nexus-42-100")),
+                file("Mods/FooMod/Config.xml", Some("nexus-42-100")),
+            ],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        let entry = dirs.iter().find(|d| d.name == "Mods").unwrap();
+        let src = entry.source.as_ref().expect("source resolved");
+        assert_eq!(src.kind, "nexus");
+        assert!(src.url.is_some());
+    }
+
+    #[test]
+    fn reduce_to_dirs_no_source_when_first_file_has_no_source_ref() {
+        let manifest = build_manifest(
+            vec![nexus_source("nexus-42-100", 42)],
+            // First file lacks sourceRef → entire dir gets no source,
+            // because the dir's representative is the first file
+            // encountered. Subsequent files don't override.
+            vec![
+                file("Mods/FooMod/ModInfo.xml", None),
+                file("Mods/FooMod/Config.xml", Some("nexus-42-100")),
+            ],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        let entry = dirs.iter().find(|d| d.name == "Mods").unwrap();
+        assert!(entry.source.is_none());
+    }
+
+    #[test]
+    fn reduce_to_dirs_handles_v1_manifest_without_sources() {
+        // v1 manifests have no sources[] AND files have no
+        // source_ref. The launcher should still produce the dir
+        // list without crashing; just no source line in the render.
+        let manifest = build_manifest(
+            vec![],
+            vec![file("Mods/FooMod/ModInfo.xml", None)],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].source.is_none());
+    }
+
+    #[test]
+    fn reduce_to_dirs_normalizes_windows_backslash_paths() {
+        let manifest = build_manifest(
+            vec![],
+            vec![file("Mods\\FooMod\\ModInfo.xml", None)],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].name, "Mods");
+    }
+
+    #[test]
+    fn reduce_to_dirs_groups_root_level_files_into_synthetic_bucket() {
+        let manifest = build_manifest(
+            vec![],
+            vec![
+                file("readme.txt", None),
+                file("changelog.md", None),
+                file("Mods/FooMod/ModInfo.xml", None),
+            ],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        assert_eq!(dirs.len(), 2);
+        let root = dirs.iter().find(|d| d.name == "(root)").unwrap();
+        assert_eq!(root.file_count, 2);
+    }
+
+    #[test]
+    fn reduce_to_dirs_sorts_alphabetically_with_root_last() {
+        let manifest = build_manifest(
+            vec![],
+            vec![
+                file("Zeta/x.txt", None),
+                file("Alpha/x.txt", None),
+                file("Mods/x.txt", None),
+                file("readme.txt", None),
+            ],
+        );
+        let dirs = reduce_to_dirs(&manifest);
+        let names: Vec<&str> = dirs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Mods", "Zeta", "(root)"]);
+    }
+}
+
