@@ -210,3 +210,23 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Tauri's bundler swallows the signCommand's output and only
+      # reports "failed to run powershell" on failure. sign-windows.ps1
+      # mirrors every milestone (and the full artifact-signing-cli
+      # output) into a log file; dump it here so a failed Windows
+      # signing step is actually diagnosable. `always()` so it runs
+      # even when the build step above failed. Temporary diagnostic ~
+      # can be dropped once Windows signing is confirmed stable.
+      - name: Dump Windows signing log
+        if: always() && matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "packrelay-sign-windows.log"
+          if (Test-Path $log) {
+            Write-Host "===== packrelay-sign-windows.log ====="
+            Get-Content -LiteralPath $log
+            Write-Host "===== end of log ====="
+          } else {
+            Write-Host "no sign-windows log at $log - the script never started"
+          }

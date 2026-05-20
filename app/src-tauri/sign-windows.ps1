@@ -21,6 +21,14 @@
 # Authentication: `artifact-signing-cli` reads
 # AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID from the
 # environment automatically. We don't pass them on the command line.
+#
+# DEBUG NOTE: Tauri's bundler captures this script's stdout/stderr and
+# logs it only at `debug` level ~ then discards it entirely if the
+# script exits non-zero (see tauri-bundler CommandExt::output_ok). So
+# a failing sign step only ever surfaces a useless "failed to run
+# powershell". To get around that, every milestone below is also
+# appended to a log file ($RUNNER_TEMP\packrelay-sign-windows.log),
+# which release.yml dumps in an `if: always()` step.
 
 param(
     [Parameter(Mandatory = $true, Position = 0)]
@@ -29,11 +37,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Persistent log file ~ the only reliable channel out of this script,
+# since Tauri swallows the console streams. Append: the bundler calls
+# this script once per artifact (raw .exe, NSIS .exe, .msi).
+$logDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$logPath = Join-Path $logDir "packrelay-sign-windows.log"
+
+function Log($msg) {
+    $line = "$(Get-Date -Format o) [sign-windows] $msg"
+    Write-Host $line
+    try { Add-Content -LiteralPath $logPath -Value $line -ErrorAction Stop } catch { }
+}
+
+Log "invoked  artifact=$ArtifactPath"
+Log "host     PSVersion=$($PSVersionTable.PSVersion) PID=$PID CWD=$(Get-Location)"
+
 # If creds aren't present, signing is intentionally skipped. This
 # is the path local devs and PR-builds take. The artifact stays
 # unsigned but the build itself succeeds.
 if (-not $env:AZURE_CLIENT_SECRET) {
-    Write-Host "[sign-windows] AZURE_CLIENT_SECRET not set - skipping signing for $ArtifactPath"
+    Log "AZURE_CLIENT_SECRET not set - skipping signing"
     exit 0
 }
 
@@ -49,12 +72,12 @@ $required = @(
 )
 foreach ($var in $required) {
     if (-not (Get-Item "env:$var" -ErrorAction SilentlyContinue)) {
-        Write-Error "[sign-windows] Required env var '$var' is not set."
+        Log "ERROR required env var '$var' is not set"
         exit 1
     }
 }
 
-Write-Host "[sign-windows] Signing $ArtifactPath ..."
+Log "signing  $ArtifactPath"
 
 # artifact-signing-cli wraps signtool.exe + the Microsoft signing
 # dlib. Maintained by Levminer; the canonical community CLI for
@@ -72,21 +95,27 @@ Write-Host "[sign-windows] Signing $ArtifactPath ..."
 # `powershell` (Windows PowerShell 5.1) and captures its output via
 # a pipe ~ and under 5.1, a redirected native command's stderr gets
 # promoted to ErrorRecords, which with ErrorActionPreference=Stop
-# *terminates the script on the first stderr line*. That throw is
-# the opaque "failed to run powershell" the v0.1.9 release hit. We
-# gate success on $LASTEXITCODE explicitly just below, so relaxing
-# the preference here costs us nothing. `2>&1` keeps stderr visible
-# as ordinary output instead of letting it leak as red error text.
+# *terminates the script on the first stderr line*. We gate success
+# on $LASTEXITCODE explicitly below, so relaxing the preference here
+# costs us nothing. Capture the full output (2>&1) so it lands in the
+# log file regardless of what Tauri does with the console streams.
 $ErrorActionPreference = "Continue"
-& artifact-signing-cli `
+$cliOutput = & artifact-signing-cli `
     --endpoint $env:AZURE_ENDPOINT `
     --account $env:AZURE_CODE_SIGNING_ACCOUNT_NAME `
     --certificate $env:AZURE_CERT_PROFILE_NAME `
-    $ArtifactPath 2>&1
+    $ArtifactPath 2>&1 | Out-String
+$cliExit = $LASTEXITCODE
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "[sign-windows] artifact-signing-cli exited $LASTEXITCODE for $ArtifactPath"
-    exit $LASTEXITCODE
+Log "artifact-signing-cli exit=$cliExit  output follows >>>"
+Write-Host $cliOutput
+try { Add-Content -LiteralPath $logPath -Value $cliOutput -ErrorAction Stop } catch { }
+Log "<<< end artifact-signing-cli output"
+
+if ($cliExit -ne 0) {
+    Log "ERROR artifact-signing-cli exited $cliExit for $ArtifactPath"
+    exit $cliExit
 }
 
-Write-Host "[sign-windows] OK - $ArtifactPath signed."
+Log "OK - $ArtifactPath signed"
+exit 0
