@@ -8,11 +8,18 @@
 #   - macOS:   PackRelay.app.tar.gz + .dmg (universal target, both arches)
 #   - Linux:   .AppImage + .deb
 #
-# The Windows build is unsigned today — SmartScreen + Safe Browsing
-# will warn on first run until we get a code-signing cert wired in.
-# When that lands, add TAURI_SIGNING_PRIVATE_KEY + the Windows
-# cert env vars to the secrets and tauri-action picks them up
-# automatically.
+# Windows code-signing via Azure Trusted Signing — see docs/SIGNING.md
+# for the one-time setup walkthrough. When the secrets and repo
+# variables listed below are present:
+#
+#   * `cargo install artifact-signing-cli` step provisions the CLI
+#   * tauri-action invokes it via tauri.conf.json's bundle.windows.signCommand
+#   * each .exe / .msi artifact is signed before release upload
+#
+# When the secrets are absent (e.g. PR builds, forks, local-dev runs),
+# `sign-windows.ps1` gracefully no-ops and the build still succeeds —
+# just produces an unsigned binary that triggers SmartScreen on
+# first run. macOS + Linux artifacts are untouched.
 
 name: Release
 
@@ -96,6 +103,24 @@ jobs:
         working-directory: app
         run: npm ci
 
+      # Provision Levminer's artifact-signing-cli on Windows runners
+      # so tauri.conf.json's signCommand can invoke it during the
+      # bundle phase. The CLI wraps signtool.exe + the Microsoft
+      # signing dlib — canonical community tooling for Tauri + Azure
+      # Artifact Signing. Pinned because the CLI's interface has
+      # evolved across versions.
+      #
+      # Crate note: this tool was published as `trusted-signing-cli`
+      # through 0.9.x; at 0.10.0 it was renamed `artifact-signing-cli`
+      # (binary name follows). We track the current name + version.
+      #
+      # When AZURE_* secrets aren't set, this CLI still gets
+      # installed but sign-windows.ps1 short-circuits before
+      # calling it — no Azure connection attempted.
+      - name: Install artifact-signing-cli (Windows only)
+        if: matrix.platform == 'windows-latest'
+        run: cargo install artifact-signing-cli --locked --version 0.11.0
+
       - name: Build + upload via tauri-action
         uses: tauri-apps/tauri-action@v0
         env:
@@ -132,6 +157,24 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows code-signing via Azure Trusted Signing — see
+          # docs/SIGNING.md for the one-time setup. Only consumed
+          # by sign-windows.ps1 (invoked via tauri.conf.json's
+          # bundle.windows.signCommand). When AZURE_CLIENT_SECRET
+          # is unset, sign-windows.ps1 short-circuits and the
+          # Windows artifact ships unsigned (the existing v0.1.x
+          # behavior). All six values live in repo Secrets ~ the
+          # last three (endpoint / account / profile name) aren't
+          # sensitive, but keeping them as Secrets alongside the
+          # real ones avoids a secrets-vs-variables split and the
+          # `${{ vars.* }}` empty-string trap when only one tab is
+          # populated.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
         with:
           # The Tauri app lives in app/, not at the repo root, so
           # the action needs the project path to find tauri.conf.json.
@@ -144,17 +187,21 @@ jobs:
           releaseBody: |
             Pre-built binaries for the PackRelay launcher.
 
-            **Windows users:** the binary isn't yet code-signed, so
-            Windows SmartScreen will flag it as an "unrecognized
-            app" on first run. Click **More info** → **Run anyway**.
-            The launcher is open source — every binary attached to
-            this release is built by GitHub Actions directly from
-            this repo's source.
+            Every binary attached to this release is built by
+            GitHub Actions directly from this repo's source. SHA-256
+            hashes appear on packrelay.cloud/download — verify
+            before running if you'd like.
 
-            **macOS users:** the .dmg is signed + notarized — open
-            normally. (If you happen to land on an older v0.1.x
-            release that pre-dates this, you'll need to right-click
-            → Open the first time.)
+            **Windows:** when code-signing is configured the binary
+            is signed via Azure Trusted Signing (Microsoft attested
+            publisher). When it isn't, you may see a SmartScreen
+            prompt on first run — see
+            https://packrelay.cloud/docs/windows-first-run for
+            details on the warning and how to verify the binary.
+
+            **macOS:** the .dmg is signed + notarized. Open
+            normally. (Older v0.1.x builds that pre-date notarization
+            need right-click → Open the first time.)
 
             See the README for what's in this release.
           # Mark every release as a draft so we get a chance to
