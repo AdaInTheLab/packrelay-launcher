@@ -163,15 +163,18 @@ jobs:
           # bundle.windows.signCommand). When AZURE_CLIENT_SECRET
           # is unset, sign-windows.ps1 short-circuits and the
           # Windows artifact ships unsigned (the existing v0.1.x
-          # behavior). All three secrets must be set together; the
-          # two repo-vars below are non-secret and can stay in
-          # plain GitHub Variables.
+          # behavior). All six values live in repo Secrets ~ the
+          # last three (endpoint / account / profile name) aren't
+          # sensitive, but keeping them as Secrets alongside the
+          # real ones avoids a secrets-vs-variables split and the
+          # `${{ vars.* }}` empty-string trap when only one tab is
+          # populated.
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          AZURE_ENDPOINT: ${{ vars.AZURE_ENDPOINT }}
-          AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
-          AZURE_CERT_PROFILE_NAME: ${{ vars.AZURE_CERT_PROFILE_NAME }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
         with:
           # The Tauri app lives in app/, not at the repo root, so
           # the action needs the project path to find tauri.conf.json.

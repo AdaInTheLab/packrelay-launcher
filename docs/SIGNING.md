@@ -23,8 +23,9 @@ see kanban card #173.
 - [x] `release.yml` provisions `artifact-signing-cli` on Windows runners
 - [x] `tauri.conf.json` invokes `sign-windows.ps1` via the signCommand
 - [x] `sign-windows.ps1` no-ops gracefully when secrets are absent
-- [ ] **Azure identity verification approved** ← waiting on Microsoft (1–2 wk from submit)
-- [ ] **GitHub secrets + repo variables added** ← do once verification approves
+- [x] **Azure identity verification approved** (Individual / Public Trust, `Dara Hensley`)
+- [x] **Certificate profile created** (`packrelay-prod`, Active)
+- [x] **GitHub secrets added** (all six `AZURE_*` as repo Secrets)
 - [ ] **First signed release shipped** ← cut a tag, watch the workflow, confirm signature
 
 ---
@@ -92,23 +93,23 @@ The CLI emits a JSON blob with three values you need:
 **Save the `password` immediately** — Azure will never show it again.
 If you lose it, you'll need to generate a new client secret.
 
-### 3. Add the secrets + variables to this GitHub repo
+### 3. Add the secrets to this GitHub repo
 
-GitHub repo → **Settings** → **Secrets and variables** → **Actions**.
+GitHub repo → **Settings** → **Secrets and variables** → **Actions**
+→ **Secrets** tab.
 
-**Repository secrets** (encrypted, never readable after save):
+All six values go in as **Repository secrets**. The last three
+aren't sensitive (an endpoint URL, two resource names), but
+keeping everything as Secrets ~ rather than splitting three into
+the Variables tab ~ avoids the `${{ vars.* }}` empty-string trap
+if only one tab ends up populated. `release.yml` reads all six
+via `${{ secrets.* }}`.
 
 | Name | Value |
 |---|---|
 | `AZURE_TENANT_ID` | the `tenant` from step 2 |
 | `AZURE_CLIENT_ID` | the `appId` from step 2 |
 | `AZURE_CLIENT_SECRET` | the `password` from step 2 |
-
-**Repository variables** (plaintext, readable by anyone with repo
-write access — these don't need to be secret):
-
-| Name | Value |
-|---|---|
 | `AZURE_ENDPOINT` | `https://eus.codesigning.azure.net` *(East US — the account is deployed in `eastus`, so this is correct as-is)* |
 | `AZURE_CODE_SIGNING_ACCOUNT_NAME` | `packrelay` *(the deployed Artifact Signing Account name)* |
 | `AZURE_CERT_PROFILE_NAME` | `packrelay-prod` *(matches what you created in step 1)* |
@@ -195,7 +196,7 @@ loud and clear. Common failure modes:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `AZURE_CLIENT_SECRET not set - skipping signing` in logs | Secrets not configured | Add them per step 3 |
-| `Required env var 'AZURE_ENDPOINT' is not set` | Repo variable missing | Add it (variable, not secret) |
+| `Required env var 'AZURE_ENDPOINT' is not set` | Secret missing | Add it as a repo Secret per step 3 |
 | `artifact-signing-cli: command not found` | Cargo install step skipped | Check `if: matrix.platform == 'windows-latest'` ran |
 | `403 Forbidden` from Azure | Service principal lacks the Signer role | Re-run `az ad sp create-for-rbac` with correct `--role` scope |
 | `Certificate profile 'foo' not found` | `AZURE_CERT_PROFILE_NAME` typo | Match the name from Azure portal exactly |
