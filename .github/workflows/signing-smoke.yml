@@ -1,13 +1,14 @@
 # Manual diagnostic — exercises Windows code-signing OUTSIDE the Tauri
-# bundler. Tauri swallows the signCommand's stdout/stderr and only
-# reports a generic "failed to run powershell", so the first signed
-# release (v0.1.9) gave us nothing to debug from. Two checks here:
+# bundler. Tauri swallows the signCommand's stdout/stderr (it logs it
+# only at `debug` level and discards it entirely on failure), so the
+# signed-release attempts only ever gave us "failed to run powershell".
 #
-#   1. `artifact-signing-cli` straight ~ proves Azure / SP / cert
-#      profile work.
-#   2. `sign-windows.ps1` invoked the way Tauri invokes it ~ Windows
-#      PowerShell 5.1, output captured through a pipe ~ which is what
-#      actually broke v0.1.9 (redirected native stderr + Stop = throw).
+# CRITICAL: the very first step that touches artifact-signing-cli runs
+# COLD — no cached signing dlib, no cached `az login` token. The real
+# release hits exactly that cold path, and an earlier version of this
+# workflow masked the bug by warming the cache first. So the COLD
+# sign-windows.ps1 run is step 1 here, and nothing else runs the CLI
+# before it.
 #
 # Trigger: Actions tab -> "Signing smoke test" -> Run workflow.
 # Delete this file once Windows signing is confirmed green.
@@ -28,9 +29,6 @@ jobs:
       - name: Install artifact-signing-cli
         run: cargo install artifact-signing-cli --locked --version 0.11.0
 
-      # The CLI hard-codes default paths for az.cmd and signtool.exe
-      # (the latter with a specific SDK build number). Confirm what the
-      # runner actually has before blaming Azure.
       - name: Probe runner environment
         shell: pwsh
         run: |
@@ -38,33 +36,18 @@ jobs:
           Write-Host "az.cmd at CLI default path : $(Test-Path $az)"
           $signtoolDefault = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
           Write-Host "signtool at CLI default    : $(Test-Path $signtoolDefault)"
+          Write-Host "artifact-signing-cli cache : $(Test-Path "$env:USERPROFILE\.artifact-signing-cli")"
+          Write-Host "azure token cache          : $(Test-Path "$env:USERPROFILE\.azure")"
 
-      # Check 1 — CLI straight. Output is NOT routed through Tauri, so
-      # any 403 / role / auth / signtool error lands directly here.
-      - name: Sign a throwaway binary (CLI direct)
-        shell: pwsh
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          Copy-Item "$env:USERPROFILE\.cargo\bin\artifact-signing-cli.exe" .\smoke-direct.exe
-          & artifact-signing-cli `
-            --endpoint "${{ secrets.AZURE_ENDPOINT }}" `
-            --account "${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}" `
-            --certificate "${{ secrets.AZURE_CERT_PROFILE_NAME }}" `
-            .\smoke-direct.exe
-          Write-Host "CLI exit code: $LASTEXITCODE"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      # Check 2 — the real plumbing. Invoke sign-windows.ps1 byte-for-
-      # byte the way tauri.conf.json's signCommand does: Windows
-      # PowerShell 5.1 (`powershell`, not `pwsh`), -File, quoted path.
-      # Capturing the child's output into a variable redirects its
-      # streams through a pipe ~ the exact condition under which 5.1
-      # promotes native stderr to terminating errors. If the script's
-      # ErrorActionPreference fix works, this exits 0.
-      - name: Exercise sign-windows.ps1 (the Tauri way)
+      # THE faithful repro. sign-windows.ps1 invoked exactly as
+      # tauri.conf.json's signCommand does — Windows PowerShell 5.1
+      # (`powershell`, not `pwsh`), -File, with the artifact path —
+      # and it is the FIRST thing to touch the CLI, so the cold dlib
+      # download + cold `az login` happen inside the script, just
+      # like in the release build. The child's streams are captured
+      # via `$out = ... 2>&1`, reproducing Tauri's piped redirection.
+      # Unlike Tauri, we then PRINT $out, so the failure is visible.
+      - name: Exercise sign-windows.ps1 COLD (the Tauri way)
         shell: pwsh
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -75,17 +58,17 @@ jobs:
           AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
         run: |
           Copy-Item "$env:USERPROFILE\.cargo\bin\artifact-signing-cli.exe" .\smoke-script.exe
+          Write-Host "=== invoking sign-windows.ps1 via Windows PowerShell 5.1 ==="
           $out = powershell -ExecutionPolicy Bypass -File .\app\src-tauri\sign-windows.ps1 ".\smoke-script.exe" 2>&1
           $code = $LASTEXITCODE
+          Write-Host "=== captured output (stdout + stderr) ==="
           $out | ForEach-Object { Write-Host $_ }
+          Write-Host "=== end captured output ==="
           Write-Host "sign-windows.ps1 exit code: $code"
           if ($code -ne 0) { exit $code }
 
-      - name: Verify both signatures
+      - name: Verify the signature
         shell: pwsh
         run: |
-          foreach ($f in @(".\smoke-direct.exe", ".\smoke-script.exe")) {
-            Write-Host "--- $f ---"
-            Get-AuthenticodeSignature $f |
-              Select-Object Status, StatusMessage, SignerCertificate | Format-List
-          }
+          Get-AuthenticodeSignature .\smoke-script.exe |
+            Select-Object Status, StatusMessage, SignerCertificate | Format-List
