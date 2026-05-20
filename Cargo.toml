@@ -8,7 +8,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.9"
+version = "0.1.10"
 # Custom source-available license — read LICENSE for the rules. Short
 # version: read it, build it for yourself, don't redistribute or fork.
 # `LicenseRef-...` is SPDX's canonical way to spell a non-OSI license
