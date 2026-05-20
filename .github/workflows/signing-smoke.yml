@@ -1,0 +1,66 @@
+# Manual diagnostic — exercises `artifact-signing-cli` against Azure
+# Artifact Signing DIRECTLY, outside the Tauri bundler. Tauri swallows
+# the signCommand's stdout/stderr and only reports a generic
+# "failed to run powershell", so the first signed-release attempt
+# (v0.1.9) gave us nothing to debug from. This job runs the CLI in a
+# plain step where its output is fully visible in the log.
+#
+# Trigger: Actions tab -> "Signing smoke test" -> Run workflow.
+# Delete this file once Windows signing is confirmed green.
+
+name: Signing smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      # Same pin as release.yml so we're testing the real thing.
+      - name: Install artifact-signing-cli
+        run: cargo install artifact-signing-cli --locked --version 0.11.0
+
+      # The CLI hard-codes default paths for az.cmd and signtool.exe
+      # (the latter with a specific SDK build number). Confirm what the
+      # runner actually has before blaming Azure.
+      - name: Probe runner environment
+        shell: pwsh
+        run: |
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          Write-Host "az.cmd at CLI default path : $(Test-Path $az)"
+          $signtoolDefault = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
+          Write-Host "signtool at CLI default    : $(Test-Path $signtoolDefault)"
+          Write-Host "--- installed Windows SDK bin folders ---"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "10.*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              $st = Join-Path $_.FullName "x64\signtool.exe"
+              Write-Host "  $($_.Name)  signtool: $(Test-Path $st)"
+            }
+
+      # Sign a throwaway PE — the freshly built (unsigned) CLI binary
+      # itself. Output is NOT routed through Tauri, so any 403 / role /
+      # auth / signtool error lands directly in this log.
+      - name: Sign a throwaway binary
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          Copy-Item "$env:USERPROFILE\.cargo\bin\artifact-signing-cli.exe" .\smoke.exe
+          Write-Host "Signing .\smoke.exe ..."
+          & artifact-signing-cli `
+            --endpoint "${{ secrets.AZURE_ENDPOINT }}" `
+            --account "${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}" `
+            --certificate "${{ secrets.AZURE_CERT_PROFILE_NAME }}" `
+            .\smoke.exe
+          $code = $LASTEXITCODE
+          Write-Host "artifact-signing-cli exit code: $code"
+          if ($code -ne 0) { exit $code }
+
+      - name: Verify the signature
+        shell: pwsh
+        run: |
+          Get-AuthenticodeSignature .\smoke.exe |
+            Select-Object Status, StatusMessage, SignerCertificate | Format-List
