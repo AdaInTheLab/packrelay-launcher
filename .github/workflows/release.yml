@@ -12,7 +12,7 @@
 # for the one-time setup walkthrough. When the secrets and repo
 # variables listed below are present:
 #
-#   * `cargo install trusted-signing-cli` step provisions the CLI
+#   * `cargo install artifact-signing-cli` step provisions the CLI
 #   * tauri-action invokes it via tauri.conf.json's bundle.windows.signCommand
 #   * each .exe / .msi artifact is signed before release upload
 #
@@ -103,19 +103,23 @@ jobs:
         working-directory: app
         run: npm ci
 
-      # Provision Levminer's trusted-signing-cli on Windows runners
+      # Provision Levminer's artifact-signing-cli on Windows runners
       # so tauri.conf.json's signCommand can invoke it during the
       # bundle phase. The CLI wraps signtool.exe + the Microsoft
-      # Trusted Signing dlib — canonical community tooling for
-      # Tauri + Azure Trusted Signing. Pinned because the CLI's
-      # interface has evolved across versions.
+      # signing dlib — canonical community tooling for Tauri + Azure
+      # Artifact Signing. Pinned because the CLI's interface has
+      # evolved across versions.
+      #
+      # Crate note: this tool was published as `trusted-signing-cli`
+      # through 0.9.x; at 0.10.0 it was renamed `artifact-signing-cli`
+      # (binary name follows). We track the current name + version.
       #
       # When AZURE_* secrets aren't set, this CLI still gets
       # installed but sign-windows.ps1 short-circuits before
       # calling it — no Azure connection attempted.
-      - name: Install trusted-signing-cli (Windows only)
+      - name: Install artifact-signing-cli (Windows only)
         if: matrix.platform == 'windows-latest'
-        run: cargo install trusted-signing-cli --locked --version 0.5.0
+        run: cargo install artifact-signing-cli --locked --version 0.11.0
 
       - name: Build + upload via tauri-action
         uses: tauri-apps/tauri-action@v0

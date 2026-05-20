@@ -4,8 +4,10 @@ The PackRelay launcher's Windows installers (`.exe` + `.msi`) are
 signed via [**Azure Trusted Signing**](https://learn.microsoft.com/en-us/azure/trusted-signing/),
 Microsoft's hosted code-signing service. Signing happens in CI on
 every tagged release via Levminer's
-[`trusted-signing-cli`](https://github.com/Levminer/trusted-signing-cli),
-invoked through Tauri's `bundle.windows.signCommand` hook.
+[`artifact-signing-cli`](https://github.com/Levminer/trusted-signing-cli)
+(published as `trusted-signing-cli` through 0.9.x ~ renamed at 0.10.0;
+the GitHub repo keeps its original name), invoked through Tauri's
+`bundle.windows.signCommand` hook.
 
 This document is the operator walkthrough — what to set up once
 when Azure verification completes, and how to verify a signed
@@ -18,7 +20,7 @@ see kanban card #173.
 
 ## Status checklist
 
-- [x] `release.yml` provisions `trusted-signing-cli` on Windows runners
+- [x] `release.yml` provisions `artifact-signing-cli` on Windows runners
 - [x] `tauri.conf.json` invokes `sign-windows.ps1` via the signCommand
 - [x] `sign-windows.ps1` no-ops gracefully when secrets are absent
 - [ ] **Azure identity verification approved** ← waiting on Microsoft (1–2 wk from submit)
@@ -194,7 +196,7 @@ loud and clear. Common failure modes:
 |---|---|---|
 | `AZURE_CLIENT_SECRET not set - skipping signing` in logs | Secrets not configured | Add them per step 3 |
 | `Required env var 'AZURE_ENDPOINT' is not set` | Repo variable missing | Add it (variable, not secret) |
-| `trusted-signing-cli: command not found` | Cargo install step skipped | Check `if: matrix.platform == 'windows-latest'` ran |
+| `artifact-signing-cli: command not found` | Cargo install step skipped | Check `if: matrix.platform == 'windows-latest'` ran |
 | `403 Forbidden` from Azure | Service principal lacks the Signer role | Re-run `az ad sp create-for-rbac` with correct `--role` scope |
 | `Certificate profile 'foo' not found` | `AZURE_CERT_PROFILE_NAME` typo | Match the name from Azure portal exactly |
 

@@ -1,7 +1,7 @@
 # Invoked by Tauri's `bundle.windows.signCommand` on each Windows
-# artifact (NSIS .exe, .msi). Wraps `trusted-signing-cli` so that:
+# artifact (NSIS .exe, .msi). Wraps `artifact-signing-cli` so that:
 #
-#   * CI with Azure secrets   -> sign with Azure Trusted Signing
+#   * CI with Azure secrets   -> sign with Azure Artifact Signing
 #   * Local dev (no secrets)  -> skip signing, exit 0, build still wins
 #
 # This lets the same tauri.conf.json work for everyone without
@@ -15,13 +15,12 @@
 #   AZURE_CLIENT_SECRET             - Service Principal secret
 #   AZURE_TENANT_ID                 - Entra tenant ID
 #   AZURE_ENDPOINT                  - e.g. https://eus.codesigning.azure.net
-#   AZURE_CODE_SIGNING_ACCOUNT_NAME - Trusted Signing Account resource name
+#   AZURE_CODE_SIGNING_ACCOUNT_NAME - Artifact Signing Account resource name
 #   AZURE_CERT_PROFILE_NAME         - Certificate Profile name
 #
-# Authentication: `trusted-signing-cli` uses Azure's
-# DefaultAzureCredential under the hood, which reads
-# AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID
-# automatically. We don't pass them on the command line.
+# Authentication: `artifact-signing-cli` reads
+# AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID from the
+# environment automatically. We don't pass them on the command line.
 
 param(
     [Parameter(Mandatory = $true, Position = 0)]
@@ -57,23 +56,23 @@ foreach ($var in $required) {
 
 Write-Host "[sign-windows] Signing $ArtifactPath ..."
 
-# trusted-signing-cli wraps signtool.exe + the Microsoft signing
+# artifact-signing-cli wraps signtool.exe + the Microsoft signing
 # dlib. Maintained by Levminer; the canonical community CLI for
 # this exact use case in the Tauri ecosystem.
 #
-# Flag names verified against the pinned v0.5.0 (clap arg defs in
-# src/main.rs at the 0.5.0 tag): --endpoint/-e, --account/-a, and
-# --certificate/-c. NOTE: it's --certificate, NOT --certificate-profile
-# ~ clap derives the long flag from the field name `certificate`.
-# The Certificate *Profile* name is the VALUE we pass to it.
-& trusted-signing-cli `
+# Flag names verified against the pinned v0.11.0: --endpoint/-e,
+# --account/-a, and --certificate/-c. NOTE: it's --certificate,
+# NOT --certificate-profile ~ clap derives the long flag from the
+# field name `certificate`. The Certificate *Profile* name is the
+# VALUE we pass to it.
+& artifact-signing-cli `
     --endpoint $env:AZURE_ENDPOINT `
     --account $env:AZURE_CODE_SIGNING_ACCOUNT_NAME `
     --certificate $env:AZURE_CERT_PROFILE_NAME `
     $ArtifactPath
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "[sign-windows] trusted-signing-cli exited $LASTEXITCODE for $ArtifactPath"
+    Write-Error "[sign-windows] artifact-signing-cli exited $LASTEXITCODE for $ArtifactPath"
     exit $LASTEXITCODE
 }
 
