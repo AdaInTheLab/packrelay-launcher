@@ -65,11 +65,24 @@ Write-Host "[sign-windows] Signing $ArtifactPath ..."
 # NOT --certificate-profile ~ clap derives the long flag from the
 # field name `certificate`. The Certificate *Profile* name is the
 # VALUE we pass to it.
+#
+# Drop back to "Continue" for the native call. artifact-signing-cli
+# shells out to `az login` and `signtool`, both of which write
+# progress/info to stderr. Tauri invokes this script through
+# `powershell` (Windows PowerShell 5.1) and captures its output via
+# a pipe ~ and under 5.1, a redirected native command's stderr gets
+# promoted to ErrorRecords, which with ErrorActionPreference=Stop
+# *terminates the script on the first stderr line*. That throw is
+# the opaque "failed to run powershell" the v0.1.9 release hit. We
+# gate success on $LASTEXITCODE explicitly just below, so relaxing
+# the preference here costs us nothing. `2>&1` keeps stderr visible
+# as ordinary output instead of letting it leak as red error text.
+$ErrorActionPreference = "Continue"
 & artifact-signing-cli `
     --endpoint $env:AZURE_ENDPOINT `
     --account $env:AZURE_CODE_SIGNING_ACCOUNT_NAME `
     --certificate $env:AZURE_CERT_PROFILE_NAME `
-    $ArtifactPath
+    $ArtifactPath 2>&1
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "[sign-windows] artifact-signing-cli exited $LASTEXITCODE for $ArtifactPath"
