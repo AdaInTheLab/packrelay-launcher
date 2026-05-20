@@ -29,11 +29,17 @@ see kanban card #173.
 
 ## One-time setup (do once verification approves)
 
+> **Naming note:** Microsoft now brands this service "Azure
+> Artifact Signing" (formerly "Trusted Signing"). The Azure portal
+> + the resource type label say "Artifact Signing", but the ARM
+> provider namespace is unchanged: `Microsoft.CodeSigning`. Don't
+> let the rebrand confuse you ~ they're the same service.
+
 ### 1. Create a Certificate Profile in Azure
 
-In the Azure portal, navigate to your Trusted Signing Account
-(`packrelay-trusted-signing`) → **Certificate Profiles** → **+ New
-certificate profile**.
+In the Azure portal, navigate to your Artifact Signing Account
+(`packrelay`, in resource group `pack-relay-signing`) →
+**Certificate Profiles** → **+ New certificate profile**.
 
 - **Certificate profile name:** `packrelay-prod` (this is what
   `AZURE_CERT_PROFILE_NAME` below points at)
@@ -57,11 +63,18 @@ portal — both work, CLI is faster):
 az login
 
 # Replace <subscription-id> with your real subscription ID
+# (Azure portal → Subscriptions, or `az account show --query id -o tsv`).
 az ad sp create-for-rbac \
   --name packrelay-launcher-signing \
   --role "Trusted Signing Certificate Profile Signer" \
-  --scopes "/subscriptions/<subscription-id>/resourceGroups/packrelay-rg/providers/Microsoft.CodeSigning/codeSigningAccounts/packrelay-trusted-signing"
+  --scopes "/subscriptions/<subscription-id>/resourceGroups/pack-relay-signing/providers/Microsoft.CodeSigning/codesigningaccounts/packrelay"
 ```
+
+> The scope path above uses the **real** resource group
+> (`pack-relay-signing`) and account name (`packrelay`) from the
+> deployment. If the portal shows the RBAC role under a different
+> name post-rebrand, pick the one whose description is "sign with
+> a certificate profile" — the role definition itself is unchanged.
 
 The CLI emits a JSON blob with three values you need:
 
@@ -94,8 +107,8 @@ write access — these don't need to be secret):
 
 | Name | Value |
 |---|---|
-| `AZURE_ENDPOINT` | `https://eus.codesigning.azure.net` *(East US — change if you provisioned elsewhere)* |
-| `AZURE_CODE_SIGNING_ACCOUNT_NAME` | `packrelay-trusted-signing` *(or whatever you named the resource)* |
+| `AZURE_ENDPOINT` | `https://eus.codesigning.azure.net` *(East US — the account is deployed in `eastus`, so this is correct as-is)* |
+| `AZURE_CODE_SIGNING_ACCOUNT_NAME` | `packrelay` *(the deployed Artifact Signing Account name)* |
 | `AZURE_CERT_PROFILE_NAME` | `packrelay-prod` *(matches what you created in step 1)* |
 
 ### 4. Cut a release to verify

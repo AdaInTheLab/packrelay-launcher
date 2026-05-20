@@ -57,13 +57,19 @@ foreach ($var in $required) {
 
 Write-Host "[sign-windows] Signing $ArtifactPath ..."
 
-# trusted-signing-cli wraps signtool.exe + the Microsoft.Trusted.Signing
+# trusted-signing-cli wraps signtool.exe + the Microsoft signing
 # dlib. Maintained by Levminer; the canonical community CLI for
 # this exact use case in the Tauri ecosystem.
+#
+# Flag names verified against the pinned v0.5.0 (clap arg defs in
+# src/main.rs at the 0.5.0 tag): --endpoint/-e, --account/-a, and
+# --certificate/-c. NOTE: it's --certificate, NOT --certificate-profile
+# ~ clap derives the long flag from the field name `certificate`.
+# The Certificate *Profile* name is the VALUE we pass to it.
 & trusted-signing-cli `
     --endpoint $env:AZURE_ENDPOINT `
     --account $env:AZURE_CODE_SIGNING_ACCOUNT_NAME `
-    --certificate-profile $env:AZURE_CERT_PROFILE_NAME `
+    --certificate $env:AZURE_CERT_PROFILE_NAME `
     $ArtifactPath
 
 if ($LASTEXITCODE -ne 0) {
