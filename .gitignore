@@ -3,6 +3,10 @@ Cargo.lock.bak
 *.swp
 .DS_Store
 
+# Coverage report emitted by `cargo llvm-cov` (CI uploads it to
+# Codecov; never committed).
+lcov.info
+
 # Editor / IDE
 .idea/
 .vscode/

@@ -1868,5 +1868,47 @@ mod tests {
         let names: Vec<&str> = dirs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "Mods", "Zeta", "(root)"]);
     }
+
+    // --- Windows code-signing regression guards ---
+    //
+    // These two checks lock in the fixes from the v0.1.9-v0.1.11
+    // signing saga. They're plain string assertions over the config
+    // files (compiled in via include_str!), so they cost nothing and
+    // run inside the normal `cargo test`.
+
+    /// Tauri's bundler only substitutes the artifact path when a
+    /// signCommand argument is *exactly* `%1`. Quoting it (`"%1"`)
+    /// ships the literal token to signtool, which fails with
+    /// "File not found: %1" — the bug behind every failed Windows
+    /// release. Keep the placeholder bare.
+    #[test]
+    fn windows_sign_command_uses_a_bare_placeholder() {
+        let conf = include_str!("../tauri.conf.json");
+        assert!(
+            conf.contains("sign-windows.ps1 %1\""),
+            "tauri.conf.json signCommand must pass the artifact path as a bare %1"
+        );
+        assert!(
+            !conf.contains(r#"sign-windows.ps1 \"%1\""#),
+            "tauri.conf.json signCommand must not quote %1 — Tauri won't \
+             substitute a quoted placeholder"
+        );
+    }
+
+    /// artifact-signing-cli shells out to `az` and `signtool`, which
+    /// write progress to stderr. Tauri runs sign-windows.ps1 under
+    /// Windows PowerShell 5.1 with redirected streams; with
+    /// ErrorActionPreference=Stop that promotes the first stderr
+    /// line to a terminating error and kills the script. The script
+    /// must relax the preference before the native call.
+    #[test]
+    fn sign_script_relaxes_erroractionpreference_for_the_cli_call() {
+        let script = include_str!("../sign-windows.ps1");
+        assert!(
+            script.contains("$ErrorActionPreference = \"Continue\""),
+            "sign-windows.ps1 must drop ErrorActionPreference to \
+             Continue around the artifact-signing-cli call"
+        );
+    }
 }
 

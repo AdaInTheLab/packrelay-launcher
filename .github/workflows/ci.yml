@@ -1,7 +1,7 @@
 # Fast feedback on every push to main and every PR opened against
 # it. Two parallel jobs:
 #
-#   rust  -- cargo check + cargo test on the whole workspace
+#   rust  -- cargo check + test (with coverage -> Codecov) on the workspace
 #   web   -- tsc --noEmit + vite build for the React frontend
 #
 # Both run on Ubuntu only — the release.yml workflow handles the
@@ -31,8 +31,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview backs cargo-llvm-cov's instrumentation.
+          components: llvm-tools-preview
 
       - uses: swatinem/rust-cache@v2
+
+      # Prebuilt cargo-llvm-cov — avoids a slow from-source install.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       # The Tauri crate depends on libwebkit2gtk via the build-time
       # tauri-build crate, which probes for these on Linux even
@@ -50,8 +58,19 @@ jobs:
       - name: cargo check (all targets)
         run: cargo check --workspace --all-targets
 
-      - name: cargo test
-        run: cargo test --workspace
+      # cargo-llvm-cov runs the whole test suite AND collects
+      # coverage in one pass, emitting an lcov report for Codecov.
+      - name: cargo test + coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      # Coverage is informational (see codecov.yml) — never fail CI
+      # on the upload, including before CODECOV_TOKEN is configured.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
 
   web:
     name: Frontend

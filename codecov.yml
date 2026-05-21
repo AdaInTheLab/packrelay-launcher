@@ -1,0 +1,18 @@
+# Coverage is informational only. The Rust test suite is still
+# small and the React frontend has no tests yet, so a hard
+# threshold would just be noise that blocks PRs. Track the trend;
+# don't gate on it. Revisit `informational` once the suite grows.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Only the Rust workspace is measured (ci.yml uploads an lcov
+# report from cargo-llvm-cov). Frontend files simply won't appear
+# in the report until there are frontend tests to cover them.
+comment:
+  require_changes: true
