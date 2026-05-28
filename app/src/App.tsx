@@ -255,6 +255,79 @@ type RowUninstallState =
 
 /** A row in the local install-history list. Stored in localStorage
  *  as a JSON array under HISTORY_STORAGE_KEY. */
+/** Persisted state for the "Last logged in" tile in the sidebar
+ *  (Kitsunebi card #217). Updated whenever the user clicks
+ *  Connect or Launch on a ServerDetailView; the tile reads it back
+ *  and offers a one-click re-launch.
+ *
+ *  v1 is frontend-only: clicking the tile just calls the same
+ *  `launch_game(connectAddress)` invoke that the existing buttons
+ *  do, which gets the user to 7DTD's main menu with the address
+ *  on their clipboard. The real one-click-into-server experience
+ *  needs the in-game Harmony patch tracked as #227. */
+type LastJoinedServer = {
+  /** host:port the user actually connected to. */
+  address: string;
+  /** Server's friendly name as it was at the moment of join, so the
+   *  tile keeps a useful label even if the catalog later renames or
+   *  drops the server. */
+  serverName: string;
+  /** Attached pack's friendly name + cover, captured at join time.
+   *  Both nullable -- not every server has an attached pack. */
+  packName: string | null;
+  packCover: string | null;
+  /** Drives the status dot on the tile. "ok" when launch_game
+   *  returned without error; "failed" if it threw. The launcher
+   *  doesn't yet know whether the IN-GAME connect succeeded (that
+   *  needs #227's Harmony bridge), so "ok" really means "we
+   *  successfully kicked off 7DTD". Honest about its scope. */
+  lastStatus: "ok" | "failed";
+  /** ISO timestamp of the most recent attempt. Formatted via
+   *  formatRelativeTime() for display. */
+  lastAttemptAt: string;
+};
+
+const LAST_JOINED_KEY = "packrelay.lastJoined.v1";
+
+function loadLastJoined(): LastJoinedServer | null {
+  try {
+    const raw = localStorage.getItem(LAST_JOINED_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      typeof parsed?.address !== "string" ||
+      typeof parsed?.serverName !== "string"
+    ) {
+      return null;
+    }
+    return {
+      address: parsed.address,
+      serverName: parsed.serverName,
+      packName: typeof parsed.packName === "string" ? parsed.packName : null,
+      packCover: typeof parsed.packCover === "string" ? parsed.packCover : null,
+      lastStatus: parsed.lastStatus === "failed" ? "failed" : "ok",
+      lastAttemptAt:
+        typeof parsed.lastAttemptAt === "string"
+          ? parsed.lastAttemptAt
+          : new Date(0).toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveLastJoined(r: LastJoinedServer | null): void {
+  try {
+    if (r === null) {
+      localStorage.removeItem(LAST_JOINED_KEY);
+    } else {
+      localStorage.setItem(LAST_JOINED_KEY, JSON.stringify(r));
+    }
+  } catch {
+    // Quota or private mode -- tile is convenience, not critical.
+  }
+}
+
 type InstallRecord = {
   slug: string;
   name: string;
@@ -530,6 +603,19 @@ function App() {
   );
 
   const [history, setHistory] = useState<InstallRecord[]>(() => loadHistory());
+
+  // Persisted "last logged in" state for the sidebar Quick Launch
+  // tile (#217). Updated by ConnectButton / LaunchPanel on a
+  // successful launch_game invoke; the tile reads it via the same
+  // state. Initial value comes from localStorage so a fresh launcher
+  // start still renders the tile.
+  const [lastJoined, setLastJoined] = useState<LastJoinedServer | null>(() =>
+    loadLastJoined()
+  );
+  const recordLastJoined = useCallback((next: LastJoinedServer) => {
+    setLastJoined(next);
+    saveLastJoined(next);
+  }, []);
   // OS-canonical 7DTD Mods/ path, fetched once on mount. The
   // InstallView uses it as the initial destination so users don't
   // type or even pick a folder for the common case.
@@ -1164,6 +1250,7 @@ function App() {
         onSignInRequest={() => setShowSignIn(true)}
         onBack={() => setSelectedServer(null)}
         backLabel={detailBackLabelFor(view)}
+        recordLastJoined={recordLastJoined}
         onInstall={(pack, targetVersion) =>
           openPackInstall(pack, targetVersion)
         }
@@ -1253,6 +1340,39 @@ function App() {
               setPendingTargetVersion(activeInstall.targetVersion);
             }
           }}
+          lastJoined={lastJoined}
+          onQuickLaunch={async () => {
+            // Re-fire the same launch_game invoke that the
+            // ServerDetailView Connect button does, then refresh
+            // the persisted record with a new timestamp + status.
+            // We don't navigate; the game launches in the
+            // background and the user can keep using the launcher.
+            if (!lastJoined) return;
+            // Prime the clipboard with the address so the
+            // ConnectButton's fallback path (paste into Direct
+            // Connect) still works if 7DTD silently ignores
+            // -connecttoip (which it does in 2.6 -- the WRN
+            // line in the launcher's own copy of the Pack Detail
+            // hedge is honest about this).
+            try {
+              await navigator.clipboard.writeText(lastJoined.address);
+            } catch {
+              // Clipboard API blocked -- non-fatal.
+            }
+            let status: "ok" | "failed" = "ok";
+            try {
+              await invoke("launch_game", {
+                connectAddress: lastJoined.address,
+              });
+            } catch {
+              status = "failed";
+            }
+            recordLastJoined({
+              ...lastJoined,
+              lastStatus: status,
+              lastAttemptAt: new Date().toISOString(),
+            });
+          }}
         />
         <main className="flex-1 overflow-y-auto">{mainContent}</main>
       </div>
@@ -1298,6 +1418,8 @@ function LeftRail({
   onSignOut,
   activeInstall,
   onJumpToActiveInstall,
+  lastJoined,
+  onQuickLaunch,
 }: {
   view: ViewKey;
   onViewChange: (next: ViewKey) => void;
@@ -1309,6 +1431,15 @@ function LeftRail({
   activeInstall: ActiveInstall | null;
   /** Clicking the dock re-enters InstallView for the running pack. */
   onJumpToActiveInstall: () => void;
+  /** Persisted last-joined record. Null when the user has never
+   *  clicked Connect; the tile then hides entirely so there's no
+   *  dead space. */
+  lastJoined: LastJoinedServer | null;
+  /** Called when the tile is clicked. Fires the same launch_game
+   *  invoke that the ServerDetailView Connect button does, then
+   *  refreshes the lastJoined record (in App) with a new attempt
+   *  timestamp + status. */
+  onQuickLaunch: () => void;
 }) {
   return (
     <aside className="w-56 shrink-0 border-r border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 flex flex-col">
@@ -1401,6 +1532,13 @@ function LeftRail({
         />
       )}
 
+      {/* Quick Launch tile (#217). Hidden when there's no recorded
+          join attempt yet -- a placeholder slot would be visually
+          confusing on first launch. */}
+      {lastJoined && (
+        <LastJoinedTile record={lastJoined} onLaunch={onQuickLaunch} />
+      )}
+
       <div className="px-3 pb-3 pt-2 border-t border-[var(--color-bg-raised)]">
         <AuthChip
           auth={auth}
@@ -1476,6 +1614,79 @@ function ActiveDownloadsDock({
       <div className="mt-1 text-[10px] text-[var(--color-text-dim)] truncate">
         {progress?.lastCompletedFile ?? "Preparing…"}
       </div>
+    </button>
+  );
+}
+
+// Sidebar Quick Launch tile (Kitsunebi #217). Shown between the
+// ActiveDownloadsDock and the AuthChip whenever the user has at
+// least one recorded join attempt. Click → re-fires launch_game
+// for the saved address, the same way the ServerDetailView's
+// Connect button does.
+//
+// v1 scope: gets you to 7DTD's main menu with the address on the
+// clipboard, no further. The "one click and you're in the server"
+// experience needs the Harmony patch tracked as #227; until that
+// lands, this tile is a save-a-click feature, not a teleporter.
+//
+// Status dot reflects the LAST attempt's outcome:
+//   green  = launch_game returned cleanly
+//   red    = launch_game threw
+//   gray   = never (shouldn't occur -- we don't render the tile
+//            without a record)
+function LastJoinedTile({
+  record,
+  onLaunch,
+}: {
+  record: LastJoinedServer;
+  onLaunch: () => void;
+}) {
+  const dotClass =
+    record.lastStatus === "ok"
+      ? "bg-[var(--color-status-success)] shadow-[0_0_6px_rgba(80,200,120,0.7)]"
+      : record.lastStatus === "failed"
+        ? "bg-[var(--color-status-danger)]"
+        : "bg-[var(--color-text-dim)]/60";
+  const dotLabel =
+    record.lastStatus === "ok"
+      ? "Last attempt succeeded"
+      : record.lastStatus === "failed"
+        ? "Last attempt failed -- check Player.log via KitsuneJoinDiag"
+        : "No attempts yet";
+
+  return (
+    <button
+      type="button"
+      onClick={onLaunch}
+      className="w-full text-left px-3 pt-3 pb-2 border-t border-[var(--color-bg-raised)] hover:bg-[var(--color-bg-raised)]/30 transition-colors group"
+      title={`Re-launch ${record.serverName} (${record.address})`}
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        <span
+          className={`relative size-1.5 shrink-0 rounded-full ${dotClass}`}
+          title={dotLabel}
+        />
+        <span className="text-[9px] tracking-[0.18em] uppercase font-medium text-[var(--color-text-dim)] group-hover:text-[var(--color-text-bright)]/85">
+          Last logged in
+        </span>
+        <span
+          className="ml-auto text-[10px] text-[var(--color-text-dim)] group-hover:text-[var(--color-text-bright)]/70 tabular-nums"
+          title={record.lastAttemptAt}
+        >
+          {formatRelativeTime(record.lastAttemptAt)}
+        </span>
+      </div>
+      <div
+        className="text-[11px] text-[var(--color-text-bright)] truncate font-medium"
+        title={record.serverName}
+      >
+        {record.serverName}
+      </div>
+      {record.packName && (
+        <div className="text-[10px] text-[var(--color-text-dim)] truncate mt-0.5">
+          {record.packName}
+        </div>
+      )}
     </button>
   );
 }
@@ -3898,6 +4109,7 @@ function ServerDetailView({
    *  Browse Servers, "← DASHBOARD" from a future "recently joined"
    *  tile, etc.). */
   backLabel,
+  recordLastJoined,
   onInstall,
 }: {
   server: CatalogServer;
@@ -3915,6 +4127,9 @@ function ServerDetailView({
   onSignInRequest: () => void;
   onBack: () => void;
   backLabel: string;
+  /** Called from ConnectButton / LaunchPanel after a launch_game
+   *  invoke returns. Drives the sidebar Quick Launch tile (#217). */
+  recordLastJoined: (next: LastJoinedServer) => void;
   /** Caller receives the attached pack *and* the version the server
    *  is pinned to (when it is — falls back to the catalog latest).
    *  Threading targetVersion through here is what keeps the deep-link
@@ -3924,6 +4139,24 @@ function ServerDetailView({
    *  and silently up/downgrades. */
   onInstall: (pack: CatalogPack, targetVersion: string | null) => void;
 }) {
+  // Builds the LastJoinedServer record from the server context this
+  // view already has, then hands it to the App-level setter. Used by
+  // both ConnectButton and LaunchPanel below -- whichever path the
+  // user takes to launch, the sidebar tile updates.
+  const onLaunched = useCallback(
+    (status: "ok" | "failed") => {
+      if (!server.connectAddress) return;
+      recordLastJoined({
+        address: server.connectAddress,
+        serverName: server.name,
+        packName: server.attachedPack?.name ?? null,
+        packCover: server.attachedPack?.coverImage ?? null,
+        lastStatus: status,
+        lastAttemptAt: new Date().toISOString(),
+      });
+    },
+    [recordLastJoined, server]
+  );
   const cover = server.attachedPack?.coverImage;
 
   // Three-state truth table for the bottom card:
@@ -4162,7 +4395,10 @@ function ServerDetailView({
               // The button copies the address (clipboard fallback)
               // and asks launch_game to spawn the client directly
               // into the server.
-              <ConnectButton address={server.connectAddress} />
+              <ConnectButton
+                address={server.connectAddress}
+                onLaunched={onLaunched}
+              />
             ) : (
               <>
                 <button
@@ -4392,7 +4628,18 @@ function ConnectCopy({ address }: { address: string }) {
 // we can't). The address is also primed to clipboard before the
 // launch so any arg-stripping at the Steam layer still leaves
 // the user one paste away from joining.
-function ConnectButton({ address }: { address: string }) {
+function ConnectButton({
+  address,
+  onLaunched,
+}: {
+  address: string;
+  /** Optional. Called after launch_game returns, with "ok" or
+   *  "failed" depending on the invoke result. Drives the sidebar
+   *  Quick Launch tile (#217) -- ServerDetailView passes a closure
+   *  that captures the server's name + pack + cover so the tile
+   *  has something useful to display. */
+  onLaunched?: (status: "ok" | "failed") => void;
+}) {
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "launching" }
@@ -4411,10 +4658,12 @@ function ConnectButton({ address }: { address: string }) {
     try {
       await invoke("launch_game", { connectAddress: address });
       setState({ kind: "launched" });
+      onLaunched?.("ok");
     } catch (e) {
       setState({ kind: "error", message: String(e) });
+      onLaunched?.("failed");
     }
-  }, [address]);
+  }, [address, onLaunched]);
 
   return (
     <div className="space-y-2">
