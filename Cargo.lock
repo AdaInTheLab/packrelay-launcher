@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "packrelay-app"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "packrelay-core",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "packrelay-cli"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "packrelay-core"
-version = "0.1.12"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",
