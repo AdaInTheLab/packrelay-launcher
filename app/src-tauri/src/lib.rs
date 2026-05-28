@@ -1444,6 +1444,41 @@ fn percent_encode_arg(s: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance MUST be registered first per the plugin
+        // docs -- it intercepts new-process launches before the rest
+        // of the builder spins up. When a second PackRelay process
+        // starts (icon double-click, packrelay:// link, etc.) this
+        // handler fires inside the FIRST process with the second
+        // process's argv + cwd, then the second process exits
+        // cleanly. Eliminates the duplicate-window bug (Kitsunebi
+        // #221) and the localStorage race between two windows.
+        //
+        // The deep-link plugin below still works in this setup --
+        // when a packrelay:// link triggers the second launch, the
+        // single-instance handler gets the URL in `argv` and the
+        // first process emits the same `deeplink://incoming` event
+        // it would have via its own deep-link handler. So no
+        // wiring change to App.tsx is needed.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Re-surface the existing window so the user sees the
+            // launcher come back to focus instead of nothing
+            // happening on their second launch.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            // Forward any packrelay:// URL in argv to the frontend.
+            // On Windows / Linux the URL arrives as a positional arg
+            // when a deep link is clicked while the launcher is
+            // already running; on macOS the deep-link plugin's
+            // on_open_url path covers that case so this is a no-op
+            // there.
+            for arg in &argv {
+                if arg.starts_with("packrelay://") {
+                    let _ = app.emit("deeplink://incoming", arg);
+                }
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // Updater plugin — checks `endpoints` from tauri.conf.json
