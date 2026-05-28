@@ -1168,7 +1168,16 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col">
+    // h-screen (not min-h-screen) so the outer container is exactly
+    // viewport-height; that bounds <main>'s flex-1 and lets its
+    // overflow-y-auto actually do its job. Without this, tall detail
+    // views (Pack Detail with the long "What's Inside" grid, Server
+    // Detail with the connect/ready cards stacked) grow the outer div
+    // past viewport, the body gets a scrollbar instead of <main>, and
+    // the LeftRail nav items scroll off the top of the screen with the
+    // main content. overflow-hidden on the outer is a belt-and-
+    // suspenders against any child momentarily exceeding bounds.
+    <div className="h-screen flex flex-col overflow-hidden">
       <div className="flex-1 flex min-h-0">
         <LeftRail
           view={view}
