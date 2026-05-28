@@ -42,4 +42,12 @@ tauri-plugin-process = "2"
 # registration: Windows registry, macOS Info.plist, Linux .desktop.
 # See https://v2.tauri.app/plugin/deep-link/ for the protocol.
 tauri-plugin-deep-link = "2"
+# Single-instance plugin — when the user launches PackRelay while
+# it's already running (icon double-click, packrelay:// link clicked,
+# launcher started during an active dev session), this plugin
+# routes the new launch's args to the existing process and focuses
+# its window instead of spawning a duplicate. Eliminates the
+# duplicate-window UX bug tracked as Kitsunebi #221, plus the
+# risk of two localStorage writers fighting over the same keys.
+tauri-plugin-single-instance = { version = "2", features = [] }
 tokio.workspace = true
