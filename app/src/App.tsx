@@ -195,18 +195,31 @@ type RowVerifyState =
 // Note: ProfileMeta (the create/rename return shape) is dropped on
 // the frontend — every consumer refreshes the full list afterwards
 // so a single-row type adds nothing.
+type PackSummary = {
+  slug: string;
+  version: string;
+  installedAt: string;
+  lastPlayedAt: string | null;
+  modsBytes: number;
+  savesBytes: number;
+  snapshotCount: number;
+};
+
 type ProfileSummary = {
   id: string;
   name: string;
-  packSlug: string | null;
-  packVersion: string | null;
+  /** Multi-pack data-model schema version. 1 = current. 0 / older
+   *  shapes get auto-migrated by the Rust side before reaching here. */
+  schemaVersion: number;
+  packs: PackSummary[];
+  activePackSlug: string | null;
   createdAt: string;
   lastPlayedAt: string | null;
   isActive: boolean;
-  modsBytes: number;
-  savesBytes: number;
+  /** Profile-shared worlds dir (shared across all packs in this
+   *  profile -- per the hybrid scope decision: saves are per-pack,
+   *  worlds are profile-shared). */
   worldsBytes: number;
-  snapshotCount: number;
 };
 
 type ProfileSnapshot = {
@@ -5295,6 +5308,25 @@ function ProfilesView({
                   setBusy(null);
                 }
               }}
+              onSetActivePack={async (slug) => {
+                // Multi-pack switching (Kitsunebi #226). Mounts the
+                // chosen pack's mods + saves into 7DTD's live folders
+                // without changing the active profile. Slug=null
+                // drops to vanilla mode (no mods).
+                setBusy(p.id);
+                setError(null);
+                try {
+                  await invoke("profile_set_active_pack", {
+                    profileId: p.id,
+                    packSlug: slug,
+                  });
+                  await refresh();
+                } catch (e) {
+                  setError(typeof e === "string" ? e : `${e}`);
+                } finally {
+                  setBusy(null);
+                }
+              }}
               onRename={async (newName) => {
                 setError(null);
                 try {
@@ -5348,12 +5380,23 @@ function ProfilesView({
                 }
               }}
               onShowSnapshots={async () => {
+                // Snapshots are per-pack in the v1 multi-pack model
+                // (#226). When the profile has an active pack, show
+                // that pack's snapshot history. When in vanilla mode
+                // (no active pack), there's nothing to show -- snapshot
+                // is a pre-launch concept tied to a pack's saves.
+                if (!p.activePackSlug) {
+                  setError(
+                    "No snapshots in vanilla mode -- snapshots are tied to a pack's saves. Switch to a pack first."
+                  );
+                  return;
+                }
                 setSnapshotsForId(p.id);
                 setSnapshots(null);
                 try {
                   const list = await invoke<ProfileSnapshot[]>(
                     "profile_list_snapshots",
-                    { profileId: p.id }
+                    { profileId: p.id, packSlug: p.activePackSlug }
                   );
                   setSnapshots(list);
                 } catch (e) {
@@ -5369,6 +5412,9 @@ function ProfilesView({
       {snapshotsForId && (
         <SnapshotsModal
           profileId={snapshotsForId}
+          packSlug={
+            profiles.find((p) => p.id === snapshotsForId)?.activePackSlug ?? ""
+          }
           profileName={
             profiles.find((p) => p.id === snapshotsForId)?.name ?? "profile"
           }
@@ -5573,6 +5619,7 @@ function ProfileCard({
   history,
   busy,
   onSwitch,
+  onSetActivePack,
   onRename,
   onClone,
   onDelete,
@@ -5583,6 +5630,11 @@ function ProfileCard({
   history: InstallRecord[];
   busy: boolean;
   onSwitch: () => void;
+  /** Switch which pack is mounted within this profile (multi-pack
+   *  per profile, Kitsunebi #226). Pass null to drop to vanilla
+   *  mode. Only meaningful for the active profile -- the Rust side
+   *  bails on other profiles. */
+  onSetActivePack: (slug: string | null) => Promise<void>;
   onRename: (newName: string) => Promise<void>;
   onClone: () => void;
   onDelete: () => void;
@@ -5591,19 +5643,23 @@ function ProfileCard({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(p.name);
 
-  const totalBytes = p.modsBytes + p.savesBytes + p.worldsBytes;
+  // Sum across packs + worlds for the inline-stats blurb. Per-pack
+  // sizes also rendered individually below.
+  const totalPackBytes = p.packs.reduce(
+    (n, pk) => n + pk.modsBytes + pk.savesBytes,
+    0
+  );
+  const totalBytes = totalPackBytes + p.worldsBytes;
+  const totalSnapshots = p.packs.reduce((n, pk) => n + pk.snapshotCount, 0);
 
-  // Resolve pack slug -> friendly name. Prefer the live catalog (which
-  // has the publisher's current name); fall back to install-history
-  // (covers offline catalog + packs the publisher pulled); final
-  // fallback is the raw slug, the pre-fix behavior. Empty/null slug
-  // shouldn't reach here -- the JSX gates on `p.packSlug && (...)` --
-  // but we defend against it anyway.
-  const packName =
-    (p.packSlug
-      ? packBySlug.get(p.packSlug)?.name ??
-        history.find((h) => h.slug === p.packSlug)?.name
-      : null) ?? p.packSlug;
+  // Resolve a pack slug -> friendly name. Prefer the live catalog
+  // (publisher's current name), fall back to install-history (covers
+  // offline catalog + packs the publisher pulled), final fallback is
+  // the raw slug.
+  const friendlyName = (slug: string): string =>
+    packBySlug.get(slug)?.name ??
+    history.find((h) => h.slug === slug)?.name ??
+    slug;
 
   return (
     <div
@@ -5660,20 +5716,12 @@ function ProfileCard({
             )}
           </div>
           <div className="text-[11px] text-[var(--color-text-dim)] flex flex-wrap items-center gap-x-3 gap-y-0.5">
-            {p.packSlug && (
-              <span title={p.packSlug}>
-                Pack:{" "}
-                <span className="text-[var(--color-accent-soft)]">
-                  {packName}
-                </span>
-                {p.packVersion && (
-                  <span className="font-mono"> v{p.packVersion}</span>
-                )}
-              </span>
-            )}
+            <span>
+              {p.packs.length} pack{p.packs.length === 1 ? "" : "s"}
+            </span>
             <span className="font-mono tabular-nums">{formatBytes(totalBytes)}</span>
             <span>
-              {p.snapshotCount} snapshot{p.snapshotCount === 1 ? "" : "s"}
+              {totalSnapshots} snapshot{totalSnapshots === 1 ? "" : "s"}
             </span>
             <span>created {formatRelativeTime(p.createdAt)}</span>
           </div>
@@ -5729,30 +5777,85 @@ function ProfileCard({
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 text-[11px]">
-        <ProfileStat label="Mods" bytes={p.modsBytes} />
-        <ProfileStat label="Saves" bytes={p.savesBytes} />
-        <ProfileStat label="Worlds" bytes={p.worldsBytes} />
+      {/* Per-pack list. Filled radio = active pack; click an inactive
+          radio (or its "Switch to" button) to swap which pack's
+          mods + saves are mirrored into 7DTD's live folders.
+          Profile-shared worlds row sits at the bottom. */}
+      <div className="space-y-1.5">
+        {p.packs.length === 0 ? (
+          <div className="rounded-md border border-dashed border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/30 px-3 py-2.5 text-[11px] text-[var(--color-text-dim)]">
+            No packs installed in this profile yet. Browse the catalog and
+            install one -- it'll join this profile automatically.
+          </div>
+        ) : (
+          p.packs.map((pk) => {
+            const isActivePack = p.activePackSlug === pk.slug;
+            return (
+              <div
+                key={pk.slug}
+                className={`flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[11px] ${
+                  isActivePack
+                    ? "border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/8"
+                    : "border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/30"
+                }`}
+              >
+                <span
+                  className={`size-2 shrink-0 rounded-full ${
+                    isActivePack
+                      ? "bg-[var(--color-accent-soft)] shadow-[0_0_4px_rgba(150,120,220,0.7)]"
+                      : "ring-1 ring-[var(--color-bg-raised)]"
+                  }`}
+                  title={isActivePack ? "Active pack" : "Inactive"}
+                />
+                <span className="font-medium text-[var(--color-text-bright)] truncate" title={pk.slug}>
+                  {friendlyName(pk.slug)}
+                </span>
+                <span className="font-mono text-[var(--color-text-dim)]">v{pk.version}</span>
+                <span className="ml-auto font-mono tabular-nums text-[var(--color-text-dim)]">
+                  {formatBytes(pk.modsBytes + pk.savesBytes)}
+                </span>
+                {!isActivePack && p.isActive && (
+                  <button
+                    type="button"
+                    onClick={() => void onSetActivePack(pk.slug)}
+                    disabled={busy}
+                    className="shrink-0 inline-flex items-center px-2 py-0.5 rounded text-[9px] tracking-[0.14em] uppercase font-medium border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-accent-soft)] text-[var(--color-text-dim)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    title={`Switch to ${friendlyName(pk.slug)}`}
+                  >
+                    Switch to
+                  </button>
+                )}
+              </div>
+            );
+          })
+        )}
+        {/* Worlds (profile-shared). Visually distinct from packs so
+            it reads as "this isn't a pack, it's a shared thing." */}
+        {p.worldsBytes > 0 && (
+          <div className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[11px] border border-dashed border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/20">
+            <span
+              className="size-2 shrink-0 rounded-full bg-[var(--color-text-dim)]/40"
+              title="Profile-shared worlds"
+            />
+            <span className="text-[var(--color-text-bright)]/80">Worlds</span>
+            <span className="text-[10px] text-[var(--color-text-dim)] italic">shared across packs</span>
+            <span className="ml-auto font-mono tabular-nums text-[var(--color-text-dim)]">
+              {formatBytes(p.worldsBytes)}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function ProfileStat({ label, bytes }: { label: string; bytes: number }) {
-  return (
-    <div className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-2.5 py-1.5">
-      <div className="text-[9px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-dim)]">
-        {label}
-      </div>
-      <div className="text-[12px] font-medium text-[var(--color-text-bright)] tabular-nums mt-0.5">
-        {bytes > 0 ? formatBytes(bytes) : "—"}
-      </div>
-    </div>
-  );
-}
+// (ProfileStat removed in #226 -- was the 3-stat Mods/Saves/Worlds
+// row when stats were profile-level. In the multi-pack model stats
+// are per-pack and rendered in the pack list inside ProfileCard.)
 
 function SnapshotsModal({
   profileId,
+  packSlug,
   profileName,
   snapshots,
   isActive,
@@ -5760,6 +5863,11 @@ function SnapshotsModal({
   onClose,
 }: {
   profileId: string;
+  /** Snapshots are per-pack in the v1 multi-pack model (#226). The
+   *  modal is opened against the profile's active pack; this prop
+   *  threads the pack slug to the restore_snapshot call. Empty
+   *  string for vanilla mode (handler skips opening the modal). */
+  packSlug: string;
   profileName: string;
   snapshots: ProfileSnapshot[] | null;
   isActive: boolean;
@@ -5842,6 +5950,7 @@ function SnapshotsModal({
                       try {
                         await invoke("profile_restore_snapshot", {
                           profileId,
+                          packSlug,
                           snapshotId: s.id,
                         });
                         await onRestored();
