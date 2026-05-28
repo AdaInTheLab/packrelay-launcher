@@ -58,15 +58,26 @@ fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
 /// initialized.
 async fn build_install_context(app: &AppHandle) -> Result<InstallContext, String> {
     let layout = store_layout(app)?;
-    let profile_mods = match profile::active_profile(&layout).await {
-        Ok(Some(m)) => Some(layout.profile_dir(&m.id).join("mods")),
-        Ok(None) => None,
-        Err(_) => None, // profile system uninitialized → no mirror
-    };
+    let profile_mods = active_pack_mods_dir(&layout).await;
     Ok(InstallContext {
         cache_root: Some(layout.cache_dir()),
         profile_mods,
     })
+}
+
+/// Resolve the active profile's active pack's `mods/` directory --
+/// what install/update mirror into, and what uninstall clears. In
+/// the v1 multi-pack layout this is `profiles/<id>/packs/<slug>/mods/`.
+///
+/// Returns None when the profile system isn't initialized OR the
+/// active profile has no active pack (vanilla mode). Both cases
+/// produce an InstallContext with no profile mirror, which the install
+/// flow handles by writing only to the user-picked destination.
+async fn active_pack_mods_dir(layout: &StoreLayout) -> Option<PathBuf> {
+    let m = profile::active_profile(layout).await.ok().flatten()?;
+    let active_slug = m.active_pack_slug.as_deref()?;
+    let profile_paths = profile::ProfilePaths::from_root(&layout.profile_dir(&m.id));
+    Some(profile_paths.pack_paths(active_slug).mods)
 }
 
 /// Steam app id for 7 Days to Die. Encoded in the launch URI so
@@ -510,10 +521,7 @@ async fn uninstall_pack(app: AppHandle, dest: String) -> Result<UninstallReport,
     // switching back to this profile later would re-install the
     // pack we just removed.
     let layout = store_layout(&app)?;
-    let profile_mods = match profile::active_profile(&layout).await {
-        Ok(Some(m)) => Some(layout.profile_dir(&m.id).join("mods")),
-        _ => None,
-    };
+    let profile_mods = active_pack_mods_dir(&layout).await;
     let report = uninstall(&PathBuf::from(dest), profile_mods.as_deref())
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -1155,13 +1163,29 @@ async fn profile_snapshot_active(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Switch which pack is mounted to the live 7DTD Mods/+Saves/ within
+/// the active profile. Worlds are profile-shared and untouched.
+/// Pass null/None to switch to vanilla mode (no mods).
+#[tauri::command]
+async fn profile_set_active_pack(
+    app: AppHandle,
+    profile_id: String,
+    pack_slug: Option<String>,
+) -> Result<(), String> {
+    let layout = store_layout(&app)?;
+    profile::set_active_pack(&layout, &profile_id, pack_slug.as_deref())
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 async fn profile_list_snapshots(
     app: AppHandle,
     profile_id: String,
+    pack_slug: String,
 ) -> Result<Vec<ProfileSnapshot>, String> {
     let layout = store_layout(&app)?;
-    profile::list_snapshots(&layout, &profile_id)
+    profile::list_snapshots(&layout, &profile_id, &pack_slug)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1170,10 +1194,11 @@ async fn profile_list_snapshots(
 async fn profile_restore_snapshot(
     app: AppHandle,
     profile_id: String,
+    pack_slug: String,
     snapshot_id: String,
 ) -> Result<(), String> {
     let layout = store_layout(&app)?;
-    profile::restore_snapshot(&layout, &profile_id, &snapshot_id)
+    profile::restore_snapshot(&layout, &profile_id, &pack_slug, &snapshot_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1570,6 +1595,7 @@ pub fn run() {
             profile_clone,
             cache_stats,
             cache_gc,
+            profile_set_active_pack,
             profile_snapshot_active,
             profile_list_snapshots,
             profile_restore_snapshot,
