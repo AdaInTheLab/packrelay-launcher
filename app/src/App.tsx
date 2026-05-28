@@ -331,6 +331,29 @@ function parseDeepLink(rawUrl: string): DeepLink | null {
   return { kind: verb, slug };
 }
 
+/** Maps the current top-level view to the label rendered on the
+ *  back-button of a detail page. When the user opens a pack from
+ *  "Recently installed" on Dashboard, the breadcrumb should read
+ *  "DASHBOARD" -- not "BROWSE", which is what the hardcoded label
+ *  used to say regardless of entry point and which made the back
+ *  button feel mis-aimed. */
+function detailBackLabelFor(view: ViewKey): string {
+  switch (view) {
+    case "dashboard":
+      return "DASHBOARD";
+    case "packs":
+      return "BROWSE";
+    case "library":
+      return "LIBRARY";
+    case "servers":
+      return "SERVERS";
+    case "profiles":
+      return "PROFILES";
+    case "settings":
+      return "SETTINGS";
+  }
+}
+
 function formatRelativeTime(iso: string): string {
   const then = new Date(iso).getTime();
   const deltaSec = Math.max(0, (Date.now() - then) / 1000);
@@ -408,6 +431,12 @@ type ServerFilters = {
   onlineOnly: boolean;
   notFull: boolean;
   sort: ServerSort;
+  /** Server browse can be deep-linked / drilled into from Pack
+   *  Detail's "Played on" link with a pre-selected pack slug.
+   *  Empty string = unset = show all. Not persisted across launcher
+   *  restarts (filtered out in saveFilters) -- it's a transient
+   *  in-session navigation, not a sticky preference. */
+  pack: string;
 };
 
 const PACK_FILTERS_KEY = "packrelay.packFilters.v1";
@@ -418,6 +447,7 @@ const DEFAULT_SERVER_FILTERS: ServerFilters = {
   region: "",
   onlineOnly: false,
   notFull: false,
+  pack: "",
   sort: "players",
 };
 
@@ -450,6 +480,11 @@ function loadServerFilters(): ServerFilters {
       region: typeof parsed.region === "string" ? parsed.region : "",
       onlineOnly: !!parsed.onlineOnly,
       notFull: !!parsed.notFull,
+      // pack is a transient in-session nav filter (set by "Played on"
+      // on Pack Detail). Always start empty on launch -- a stale
+      // pack-filter survived from yesterday's deep-link would silently
+      // hide most of the servers list, which is worse than the alt.
+      pack: "",
       // Stored as a string but validate against the union — guards
       // against a saved value from a future version that has a
       // mode we don't recognize anymore.
@@ -575,7 +610,11 @@ function App() {
     saveFilters(PACK_FILTERS_KEY, packFilters);
   }, [packFilters]);
   useEffect(() => {
-    saveFilters(SERVER_FILTERS_KEY, serverFilters);
+    // Strip the transient `pack` filter before persisting -- it's a
+    // deep-link / nav filter set by "Played on" on Pack Detail, not
+    // a sticky preference. See ServerFilters type doc.
+    const { pack: _omit, ...persistable } = serverFilters;
+    saveFilters(SERVER_FILTERS_KEY, persistable);
   }, [serverFilters]);
 
   // Auth state — resolved on startup from the persisted token (if
@@ -1082,10 +1121,21 @@ function App() {
           installedRecord={installedRecord}
           favorited={packFavs?.has(selectedPack.slug) ?? false}
           signedIn={auth.kind === "signedIn"}
+          servers={servers ?? []}
           onToggleFavorite={() => togglePackFavorite(selectedPack.slug)}
           onSignInRequest={() => setShowSignIn(true)}
           onBack={() => setSelectedPack(null)}
+          backLabel={detailBackLabelFor(view)}
           onInstall={() => setPackView("install")}
+          onShowServersForPack={(slug) => {
+            // Set a transient pack filter, close the pack detail,
+            // and switch the user to Browse Servers. The detail
+            // page itself unmounts so the filter shows immediately
+            // alongside the dismissible banner.
+            setServerFilters({ ...DEFAULT_SERVER_FILTERS, pack: slug });
+            setSelectedPack(null);
+            setView("servers");
+          }}
         />
       );
     }
@@ -1113,6 +1163,7 @@ function App() {
         onToggleFavorite={() => toggleServerFavorite(selectedServer.slug)}
         onSignInRequest={() => setShowSignIn(true)}
         onBack={() => setSelectedServer(null)}
+        backLabel={detailBackLabelFor(view)}
         onInstall={(pack, targetVersion) =>
           openPackInstall(pack, targetVersion)
         }
@@ -1132,6 +1183,7 @@ function App() {
     mainContent = (
       <ServerBrowseView
         servers={servers}
+        history={history}
         error={serversError}
         onSelect={setSelectedServer}
         filters={serverFilters}
@@ -1151,7 +1203,7 @@ function App() {
       />
     );
   } else if (view === "profiles") {
-    mainContent = <ProfilesView />;
+    mainContent = <ProfilesView packBySlug={packBySlug} history={history} />;
   } else if (view === "settings") {
     mainContent = <SettingsView auth={auth} onSignOut={handleSignOut} />;
   } else {
@@ -3043,20 +3095,43 @@ function DetailView({
   installedRecord,
   favorited,
   signedIn,
+  servers,
   onToggleFavorite,
   onSignInRequest,
   onBack,
+  /** Text rendered in the breadcrumb back-button. Derived in App
+   *  from the view the user was on when they opened this pack, so
+   *  the breadcrumb is honest -- "← DASHBOARD" when they came from
+   *  Recently Installed, "← LIBRARY" when they came from My
+   *  Library, "← BROWSE" when they came from Browse Packs. */
+  backLabel,
   onInstall,
+  onShowServersForPack,
 }: {
   pack: CatalogPack;
   installedRecord: InstallRecord | null;
   favorited: boolean;
   signedIn: boolean;
+  /** Catalog servers, used to count "Played on" matches. Empty
+   *  array when the catalog hasn't loaded -- in that case the
+   *  link just doesn't render. */
+  servers: CatalogServer[];
   onToggleFavorite: () => void;
   onSignInRequest: () => void;
   onBack: () => void;
+  backLabel: string;
   onInstall: () => void;
+  /** Caller deep-links to Browse Servers pre-filtered to this pack
+   *  slug. Closes the detail view. */
+  onShowServersForPack: (slug: string) => void;
 }) {
+  // Count servers running this pack; surfaced as the "Played on" link
+  // below. Only public + visible servers are in `servers`, so this
+  // matches what the user would see if they navigated to the filtered
+  // browse view themselves.
+  const playedOnCount = servers.filter(
+    (s) => s.attachedPack?.slug === pack.slug
+  ).length;
   // "What's inside" list — the top-level dirs in the manifest,
   // which by 7DTD's pack-on-disk convention are the names of the
   // mods bundled inside the pack. Fetched lazily so the page
@@ -3123,7 +3198,7 @@ function DetailView({
           onClick={onBack}
           className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)]"
         >
-          ← BROWSE
+          ← {backLabel}
         </button>
         <HeartButton
           count={pack.favoriteCount}
@@ -3194,6 +3269,30 @@ function DetailView({
         />
         <StatCard label="Published" value={ageLabel} />
       </div>
+
+      {/* "Played on" deep-link to Browse Servers, filtered to this
+          pack. The follow-up after Install is "where do I actually
+          play this?"; surfacing the count + link saves the user a
+          scan through the unfiltered server list. Hidden when no
+          servers run this pack (count 0) -- a "0 servers" link
+          would lead to an empty list and feel misleading. */}
+      {playedOnCount > 0 && (
+        <div className="mb-6">
+          <button
+            type="button"
+            onClick={() => onShowServersForPack(pack.slug)}
+            className="text-[11px] text-[var(--color-text-dim)] hover:text-[var(--color-accent-soft)] transition-colors inline-flex items-center gap-1.5"
+          >
+            <span>
+              Played on{" "}
+              <span className="text-[var(--color-text-bright)] font-medium">
+                {playedOnCount} server{playedOnCount === 1 ? "" : "s"}
+              </span>
+            </span>
+            <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      )}
 
       {insideDirs && insideDirs.length > 0 && (
         <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/40 px-5 py-5 mb-6">
@@ -3287,12 +3386,16 @@ function StatCard({ label, value }: { label: string; value: string }) {
 
 function ServerBrowseView({
   servers,
+  history,
   error,
   onSelect,
   filters,
   onFiltersChange,
 }: {
   servers: CatalogServer[] | null;
+  /** Install history — used by ServerCard to render an "INSTALLED"
+   *  pip on cards whose attached pack the user already has. */
+  history: InstallRecord[];
   error: string | null;
   onSelect: (s: CatalogServer) => void;
   filters: ServerFilters;
@@ -3325,6 +3428,7 @@ function ServerBrowseView({
   return (
     <ServerBrowseLoaded
       servers={servers}
+      history={history}
       onSelect={onSelect}
       filters={filters}
       onFiltersChange={onFiltersChange}
@@ -3348,16 +3452,18 @@ const FILTER_REGIONS: { value: string; label: string }[] = [
 
 function ServerBrowseLoaded({
   servers,
+  history,
   onSelect,
   filters,
   onFiltersChange,
 }: {
   servers: CatalogServer[];
+  history: InstallRecord[];
   onSelect: (s: CatalogServer) => void;
   filters: ServerFilters;
   onFiltersChange: (next: ServerFilters) => void;
 }) {
-  const { region, onlineOnly, notFull, sort } = filters;
+  const { region, onlineOnly, notFull, pack, sort } = filters;
   const setRegion = (v: string) => onFiltersChange({ ...filters, region: v });
   const setOnlineOnly = (v: boolean) =>
     onFiltersChange({ ...filters, onlineOnly: v });
@@ -3365,12 +3471,23 @@ function ServerBrowseLoaded({
     onFiltersChange({ ...filters, notFull: v });
   const setSort = (v: ServerSort) =>
     onFiltersChange({ ...filters, sort: v });
+  const clearPack = () => onFiltersChange({ ...filters, pack: "" });
+
+  // Look up the friendly pack name for the active pack filter so the
+  // dismissible chip reads as "Pack: Pets of 7 Days" instead of the
+  // slug. Falls back to the slug if the pack isn't in any current
+  // server's attached metadata (catalog stale or pack pulled).
+  const activePackName: string | null = pack
+    ? (servers.find((s) => s.attachedPack?.slug === pack)?.attachedPack?.name ??
+      pack)
+    : null;
 
   const filtered = servers
     .filter((s) => {
       if (region && s.region !== region) return false;
       if (onlineOnly && !s.online) return false;
       if (notFull && s.currentPlayers >= s.maxPlayers) return false;
+      if (pack && s.attachedPack?.slug !== pack) return false;
       return true;
     })
     .slice()
@@ -3399,7 +3516,11 @@ function ServerBrowseLoaded({
       return a.slug.localeCompare(b.slug);
     });
   const hasFilters =
-    !!region || onlineOnly || notFull || sort !== DEFAULT_SERVER_FILTERS.sort;
+    !!region ||
+    onlineOnly ||
+    notFull ||
+    !!pack ||
+    sort !== DEFAULT_SERVER_FILTERS.sort;
   const clearFilters = () => onFiltersChange(DEFAULT_SERVER_FILTERS);
 
   return (
@@ -3418,6 +3539,29 @@ function ServerBrowseLoaded({
             : `${servers.length} servers`}
         </div>
       </div>
+
+      {/* Pack-filter banner: only rendered when set by a deep link
+          from Pack Detail's "Played on" link. Dismissible because
+          it's not a sticky preference and unexpectedly-empty server
+          lists are confusing if you can't see WHY they're empty. */}
+      {pack && (
+        <div className="mb-3 inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-[var(--color-accent)]/10 text-[11px] text-[var(--color-accent-soft)] ring-1 ring-[var(--color-accent-soft)]/40">
+          <span>
+            Showing servers running{" "}
+            <span className="font-medium text-[var(--color-text-bright)]">
+              {activePackName}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={clearPack}
+            title="Clear pack filter"
+            className="ml-1 text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)] transition-colors"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       <div className="mb-5 flex flex-wrap items-center gap-2">
         <label className="text-[11px] text-[var(--color-text-dim)] mr-1">
@@ -3499,7 +3643,7 @@ function ServerBrowseLoaded({
         <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((s) => (
             <li key={s.slug}>
-              <ServerCard server={s} onSelect={onSelect} />
+              <ServerCard server={s} history={history} onSelect={onSelect} />
             </li>
           ))}
         </ul>
@@ -3581,13 +3725,33 @@ function uptimeTier(pct: number): {
 // players + uptime indicators in one place.
 function ServerCard({
   server: s,
+  history,
   onSelect,
 }: {
   server: CatalogServer;
+  history: InstallRecord[];
   onSelect: (s: CatalogServer) => void;
 }) {
   const ut = uptimeTier(s.uptimePct);
   const isFull = s.online && s.currentPlayers >= s.maxPlayers;
+
+  // Resolve install state of the attached pack. Three buckets:
+  //   "current"      -- installed AND version matches what the server
+  //                     is pinned to (or catalog latest if unpinned)
+  //   "needs-update" -- installed but at a different version
+  //   "not-installed"-- not in history at all (or no attached pack)
+  //
+  // Drives the small pip next to the pack name. The user scanning the
+  // browse grid wants to answer "do I need to wait for a download?"
+  // before they click in -- this is that answer.
+  const installState: "current" | "needs-update" | "not-installed" = (() => {
+    if (!s.attachedPack) return "not-installed";
+    const rec = history.find((r) => r.slug === s.attachedPack!.slug);
+    if (!rec) return "not-installed";
+    const wanted = s.attachedPack.attachedVersion ?? null;
+    if (wanted && wanted !== rec.version) return "needs-update";
+    return "current";
+  })();
   return (
     <button
       type="button"
@@ -3636,15 +3800,40 @@ function ServerCard({
           )}
         </div>
         {s.attachedPack ? (
-          <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate">
-            Running{" "}
-            <span className="text-[var(--color-accent-soft)]">
-              {s.attachedPack.name}
+          <div className="text-[10px] text-[var(--color-text-dim)] mb-2 truncate flex items-center gap-1.5">
+            <span className="truncate">
+              Running{" "}
+              <span className="text-[var(--color-accent-soft)]">
+                {s.attachedPack.name}
+              </span>
+              {s.attachedPack.attachedVersion && (
+                <span className="font-mono">
+                  {" "}
+                  · v{s.attachedPack.attachedVersion}
+                </span>
+              )}
             </span>
-            {s.attachedPack.attachedVersion && (
-              <span className="font-mono">
-                {" "}
-                · v{s.attachedPack.attachedVersion}
+            {/* Pip: green dot when the user already has this pack at
+                the right version (one-click Connect path), amber when
+                they have it but at a different version (will need an
+                update before joining). Hidden in the "not-installed"
+                case so the line stays calm by default. */}
+            {installState === "current" && (
+              <span
+                title="You have this pack installed at the right version"
+                className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-status-success)]/15 text-[var(--color-status-success)] ring-1 ring-[var(--color-status-success)]/40"
+              >
+                <span className="size-1 rounded-full bg-[var(--color-status-success)]" />
+                Installed
+              </span>
+            )}
+            {installState === "needs-update" && (
+              <span
+                title="You have this pack but at a different version"
+                className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase font-medium bg-[var(--color-status-warning)]/15 text-[var(--color-status-warning)] ring-1 ring-[var(--color-status-warning)]/40"
+              >
+                <span className="size-1 rounded-full bg-[var(--color-status-warning)]" />
+                Update
               </span>
             )}
           </div>
@@ -3694,6 +3883,12 @@ function ServerDetailView({
   onToggleFavorite,
   onSignInRequest,
   onBack,
+  /** Text rendered in the breadcrumb back-button. Derived in App
+   *  from the view the user was on when they clicked the server, so
+   *  the breadcrumb labels back to that view ("← SERVERS" from
+   *  Browse Servers, "← DASHBOARD" from a future "recently joined"
+   *  tile, etc.). */
+  backLabel,
   onInstall,
 }: {
   server: CatalogServer;
@@ -3710,6 +3905,7 @@ function ServerDetailView({
   onToggleFavorite: () => void;
   onSignInRequest: () => void;
   onBack: () => void;
+  backLabel: string;
   /** Caller receives the attached pack *and* the version the server
    *  is pinned to (when it is — falls back to the catalog latest).
    *  Threading targetVersion through here is what keeps the deep-link
@@ -3808,7 +4004,7 @@ function ServerDetailView({
           onClick={onBack}
           className="text-[10px] tracking-[0.18em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)]"
         >
-          ← SERVERS
+          ← {backLabel}
         </button>
         <HeartButton
           count={server.favoriteCount}
@@ -3874,7 +4070,13 @@ function ServerDetailView({
 
       {server.attachedPack ? (
         attachedPack ? (
-          <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+          // sticky bottom-4 matches the action card on Pack Detail
+          // (DetailView around line 3347). With the h-screen scroll
+          // container from #218 in place, this card now pins to the
+          // viewport bottom while the rest of the page scrolls
+          // behind it -- so the Connect / Update-and-connect button
+          // is always within thumb-reach instead of below the fold.
+          <div className="sticky bottom-4 rounded-xl border border-[var(--color-accent-soft)]/30 bg-[var(--color-bg-panel)]/90 backdrop-blur-sm p-5 shadow-lg">
             {/* Stale-history hint. The probe came back absent (sidecar
                 or sample files gone) for an installedRecord we'd
                 otherwise have trusted; surface that explicitly so the
@@ -4724,7 +4926,17 @@ function CacheStat({
 // All ops route through the Tauri commands; the view holds local
 // optimistic state for the list so switches feel instant even
 // when the underlying copy is slow.
-function ProfilesView() {
+function ProfilesView({
+  packBySlug,
+  history,
+}: {
+  /** Used to resolve pack slug → friendly name on each profile card.
+   *  Falls back to install-history name, then raw slug, so we never
+   *  show an empty string even when the catalog is offline or has
+   *  dropped the pack. */
+  packBySlug: Map<string, CatalogPack>;
+  history: InstallRecord[];
+}) {
   const [initial, setInitial] = useState<ProfileInitialState | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -4810,6 +5022,8 @@ function ProfilesView() {
           <li key={p.id}>
             <ProfileCard
               profile={p}
+              packBySlug={packBySlug}
+              history={history}
               busy={busy === p.id}
               onSwitch={async () => {
                 setBusy(p.id);
@@ -5097,6 +5311,8 @@ function NewProfileCard({
 
 function ProfileCard({
   profile: p,
+  packBySlug,
+  history,
   busy,
   onSwitch,
   onRename,
@@ -5105,6 +5321,8 @@ function ProfileCard({
   onShowSnapshots,
 }: {
   profile: ProfileSummary;
+  packBySlug: Map<string, CatalogPack>;
+  history: InstallRecord[];
   busy: boolean;
   onSwitch: () => void;
   onRename: (newName: string) => Promise<void>;
@@ -5116,6 +5334,18 @@ function ProfileCard({
   const [draft, setDraft] = useState(p.name);
 
   const totalBytes = p.modsBytes + p.savesBytes + p.worldsBytes;
+
+  // Resolve pack slug -> friendly name. Prefer the live catalog (which
+  // has the publisher's current name); fall back to install-history
+  // (covers offline catalog + packs the publisher pulled); final
+  // fallback is the raw slug, the pre-fix behavior. Empty/null slug
+  // shouldn't reach here -- the JSX gates on `p.packSlug && (...)` --
+  // but we defend against it anyway.
+  const packName =
+    (p.packSlug
+      ? packBySlug.get(p.packSlug)?.name ??
+        history.find((h) => h.slug === p.packSlug)?.name
+      : null) ?? p.packSlug;
 
   return (
     <div
@@ -5173,10 +5403,10 @@ function ProfileCard({
           </div>
           <div className="text-[11px] text-[var(--color-text-dim)] flex flex-wrap items-center gap-x-3 gap-y-0.5">
             {p.packSlug && (
-              <span>
+              <span title={p.packSlug}>
                 Pack:{" "}
                 <span className="text-[var(--color-accent-soft)]">
-                  {p.packSlug}
+                  {packName}
                 </span>
                 {p.packVersion && (
                   <span className="font-mono"> v{p.packVersion}</span>
