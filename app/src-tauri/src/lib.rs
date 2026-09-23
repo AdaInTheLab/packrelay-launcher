@@ -316,6 +316,40 @@ async fn install_pack(
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
 
+    // Multi-pack guard (#230): if the active profile already has a
+    // DIFFERENT pack active, swap to vanilla mode first. Without
+    // this, live Mods/ keeps the outgoing pack's files and the new
+    // install mixes both packs (the bug flagged in PR #10's known-
+    // limitation section).
+    //
+    // The swap captures the outgoing pack's live state back into its
+    // packs/<slug>/mods + saves dirs, then clears live. After the
+    // install lands, bind_pack_to_active(new_slug) auto-activates
+    // the new pack because active_pack_slug is now None.
+    //
+    // No-op when (a) no profile is active, (b) profile has no active
+    // pack (already vanilla mode), or (c) the active pack IS the
+    // slug being installed (reinstall / first-install case).
+    //
+    // Best-effort: a swap failure logs but doesn't fail the install.
+    // Worst case the user gets the pre-#230 mixed-state behavior;
+    // they can manually clear via Profiles -> Switch to vanilla.
+    if let Ok(layout) = store_layout(&app) {
+        if let Some(meta) = profile::active_profile(&layout).await.ok().flatten() {
+            if let Some(current_active) = meta.active_pack_slug.as_deref() {
+                if current_active != slug {
+                    if let Err(e) =
+                        profile::set_active_pack(&layout, &meta.id, None).await
+                    {
+                        eprintln!(
+                            "[install_pack] pre-install vanilla swap failed (non-fatal): {e:#}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Atomics so worker tasks can update a shared counter without
     // lock contention. Emitter::emit itself is cheap (queues an
     // event for the main thread to drain).
