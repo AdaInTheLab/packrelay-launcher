@@ -691,6 +691,75 @@ pub async fn bind_pack_to_active(
     add_pack_to_profile(layout, id, slug, version).await
 }
 
+/// What `align_for_server` did to the live Mods folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Alignment {
+    /// The profile system isn't set up, so there is nothing to swap:
+    /// the launcher leaves live Mods/ exactly as the user has it.
+    NoProfile,
+    /// Live Mods/ already holds what the server runs.
+    AlreadyAligned,
+    /// Swapped from one pack (or vanilla, None) to another.
+    Switched {
+        from: Option<String>,
+        to: Option<String>,
+    },
+}
+
+/// Make live Mods/ match the server about to be joined: the server's
+/// pack when it has one, vanilla (no mods) when it doesn't.
+///
+/// Why this exists: 7DTD loads EVERY mod in the user's Mods/ folder
+/// for EVERY server. A pack left live from the last session rides
+/// along to a server that doesn't run it, and a mod that changes the
+/// network format (PaintUnlocked's 64-bit chunk storage) kills the
+/// client's reader mid-join -- "Starting game." forever, with nothing
+/// wrong in the server's log. Seen for real 2026-08-23: 13 joins, 0
+/// spawns. Joining through the launcher is the one moment we know
+/// which mod set the player needs, so this is where it gets fixed.
+///
+/// Nothing is lost by swapping: set_active_pack captures the outgoing
+/// pack's live mods + saves back into its own dirs first.
+///
+/// Errors (the caller should NOT launch -- joining with the wrong mods
+/// is exactly the silent failure this prevents):
+///   - the server's pack isn't installed in the active profile;
+///   - the swap itself fails, typically because 7DTD is running and
+///     has the mod files open.
+pub async fn align_for_server(
+    layout: &StoreLayout,
+    server_pack: Option<&str>,
+) -> Result<Alignment> {
+    let Some(meta) = active_profile(layout).await? else {
+        return Ok(Alignment::NoProfile);
+    };
+    if meta.active_pack_slug.as_deref() == server_pack {
+        return Ok(Alignment::AlreadyAligned);
+    }
+    if let Some(slug) = server_pack {
+        if !meta.packs.iter().any(|p| p.slug == slug) {
+            anyhow::bail!(
+                "This server runs the pack '{slug}', which isn't installed in \
+                 your active profile '{}'. Install it (or switch to the profile \
+                 that has it), then join again.",
+                meta.name
+            );
+        }
+    }
+    let from = meta.active_pack_slug.clone();
+    set_active_pack(layout, &meta.id, server_pack)
+        .await
+        .context(
+            "Couldn't swap your Mods folder to match this server. If 7 Days \
+             to Die is open, close it and join again.",
+        )?;
+    Ok(Alignment::Switched {
+        from,
+        to: server_pack.map(str::to_string),
+    })
+}
+
 /// Remove a pack from a profile -- deletes its `packs/<slug>/` dir
 /// (mods, saves, snapshots). If the removed pack was the active
 /// one, active_pack_slug is cleared (profile drops to vanilla mode
@@ -1365,4 +1434,108 @@ fn new_profile_id() -> String {
     // collide.
     let mix = (nanos as u64).wrapping_mul(2654435761) ^ nanos as u64;
     format!("p{:x}", mix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway launcher store + 7DTD userdata dir, with one active
+    /// profile holding packs "a" and "b" and pack "a" live.
+    async fn fixture(name: &str) -> (StoreLayout, PathBuf, String) {
+        let root =
+            std::env::temp_dir().join(format!("packrelay-align-{name}-{}", new_profile_id()));
+        let layout = StoreLayout::new(&root.join("app"));
+        let userdata = root.join("7DaysToDie");
+        fs::create_dir_all(userdata.join("Mods")).await.unwrap();
+        let meta = create_profile(&layout, "Main").await.unwrap();
+        set_active(&layout, Some(&meta.id), Some(&userdata))
+            .await
+            .unwrap();
+        // "a" was installed straight into live Mods/ and is active.
+        add_pack_to_profile(&layout, &meta.id, "a", "1.0")
+            .await
+            .unwrap();
+        fs::write(userdata.join("Mods").join("a.txt"), "a")
+            .await
+            .unwrap();
+        // "b" sits in its pack dir, not live.
+        add_pack_to_profile(&layout, &meta.id, "b", "1.0")
+            .await
+            .unwrap();
+        let b_mods = ProfilePaths::from_root(&layout.profile_dir(&meta.id))
+            .pack_paths("b")
+            .mods;
+        fs::write(b_mods.join("b.txt"), "b").await.unwrap();
+        (layout, userdata, meta.id)
+    }
+
+    fn live(userdata: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(userdata.join("Mods"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn joining_a_server_with_no_pack_goes_vanilla() {
+        let (layout, userdata, _) = fixture("vanilla").await;
+        let r = align_for_server(&layout, None).await.unwrap();
+        assert_eq!(
+            r,
+            Alignment::Switched {
+                from: Some("a".into()),
+                to: None
+            }
+        );
+        assert!(live(&userdata).is_empty());
+        // And back: pack "a" was captured, not lost.
+        align_for_server(&layout, Some("a")).await.unwrap();
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn joining_a_server_with_another_pack_swaps_to_it() {
+        let (layout, userdata, _) = fixture("swap").await;
+        let r = align_for_server(&layout, Some("b")).await.unwrap();
+        assert_eq!(
+            r,
+            Alignment::Switched {
+                from: Some("a".into()),
+                to: Some("b".into())
+            }
+        );
+        assert_eq!(live(&userdata), vec!["b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn already_matching_is_left_alone() {
+        let (layout, userdata, _) = fixture("same").await;
+        assert_eq!(
+            align_for_server(&layout, Some("a")).await.unwrap(),
+            Alignment::AlreadyAligned
+        );
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_pack_not_in_the_profile_refuses_rather_than_joining_wrong() {
+        let (layout, userdata, _) = fixture("missing").await;
+        let err = align_for_server(&layout, Some("zzz")).await.unwrap_err();
+        assert!(err.to_string().contains("isn't installed"), "{err:#}");
+        // Nothing was touched.
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn no_profile_system_means_no_swap() {
+        let root = std::env::temp_dir().join(format!("packrelay-align-none-{}", new_profile_id()));
+        let layout = StoreLayout::new(&root);
+        assert_eq!(
+            align_for_server(&layout, None).await.unwrap(),
+            Alignment::NoProfile
+        );
+    }
 }
