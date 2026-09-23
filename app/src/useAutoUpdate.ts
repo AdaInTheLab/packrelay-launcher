@@ -24,6 +24,8 @@ import { useEffect, useState } from "react";
 
 type Phase =
   | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "upToDate"; checkedAt: string }
   | { kind: "available"; version: string; body: string | null }
   | {
       kind: "downloading";
@@ -147,5 +149,57 @@ export function useAutoUpdate() {
     setPhase({ kind: "idle" });
   }
 
-  return { phase, download, dismiss };
+  /**
+   * Manually re-run the updater check. Used by the Settings view's
+   * "Check for updates" button. Unlike the mount-effect check, this:
+   *
+   *   - Sets phase to "checking" while it runs (so the UI can spin)
+   *   - Clears any prior per-version dismiss (the user is actively
+   *     asking, so respect that over their earlier "Later" click)
+   *   - Settles to "upToDate" with a timestamp when there's nothing,
+   *     so the Settings UI can render "You're on the latest version"
+   *   - Or to "available" when there is something
+   *   - Or to "error" on any failure (instead of silent, since the
+   *     user just clicked a button expecting a response)
+   *
+   * No-ops outside the Tauri runtime (Vite-only dev).
+   */
+  async function checkNow() {
+    if (!isInTauri()) {
+      // In Vite-only dev there's no updater plugin available. Lie
+      // gracefully so the Settings UI can demo without exploding.
+      setPhase({ kind: "upToDate", checkedAt: new Date().toISOString() });
+      return;
+    }
+    setPhase({ kind: "checking" });
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (!update) {
+        setPhase({
+          kind: "upToDate",
+          checkedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      // User clicked Check Now -- forget any prior dismiss for this
+      // version. They're opting in.
+      try {
+        localStorage.removeItem(DISMISS_KEY);
+      } catch {
+        // Storage disabled -- next mount-check will respect a stale
+        // dismiss; fine for this rare case.
+      }
+      setPhase({
+        kind: "available",
+        version: update.version,
+        body: update.body ?? null,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setPhase({ kind: "error", message });
+    }
+  }
+
+  return { phase, download, dismiss, checkNow };
 }

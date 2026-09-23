@@ -595,6 +595,12 @@ function saveFilters(key: string, value: unknown): void {
 }
 
 function App() {
+  // Lifted out of AutoUpdateDock (#231) so SettingsView can render
+  // a manual "Check for updates" button against the same single
+  // hook instance. Two instances would mean two check() calls at
+  // mount and dismiss-state drift across them.
+  const updater = useAutoUpdate();
+
   const [view, setView] = useState<ViewKey>("dashboard");
 
   const [packs, setPacks] = useState<CatalogPack[] | null>(null);
@@ -1305,7 +1311,13 @@ function App() {
   } else if (view === "profiles") {
     mainContent = <ProfilesView packBySlug={packBySlug} history={history} />;
   } else if (view === "settings") {
-    mainContent = <SettingsView auth={auth} onSignOut={handleSignOut} />;
+    mainContent = (
+      <SettingsView
+        auth={auth}
+        onSignOut={handleSignOut}
+        updater={updater}
+      />
+    );
   } else {
     mainContent = (
       <DashboardView
@@ -1400,21 +1412,12 @@ function App() {
         />
       )}
       {/* Background-checks for a new launcher release on mount;
-        * renders nothing when nothing's available. See useAutoUpdate. */}
-      <AutoUpdateDock />
+        * renders nothing when nothing's available. The updater hook
+        * is now lifted to App() so SettingsView's UpdatesSection
+        * (#231) shares the same instance. */}
+      <UpdateToast {...updater} />
     </div>
   );
-}
-
-/**
- * Wraps the update hook + toast so the App-level component
- * tree stays tidy. Pulled out so the hook can be lifted later
- * (e.g. when we want to expose a manual "Check for updates"
- * button in Settings) without re-plumbing call sites.
- */
-function AutoUpdateDock() {
-  const updater = useAutoUpdate();
-  return <UpdateToast {...updater} />;
 }
 
 // Full-height left-rail nav. Replaces the previous top-tab header;
@@ -4950,12 +4953,118 @@ function DashboardView({
 // info inline + sign-out button, since the rail's auth menu is
 // the only formal sign-out path today. Future iterations: API
 // URL toggle, default install dest override, theme picker.
+// Settings -> Updates section. Surfaces the current launcher
+// version + a manual "Check for updates" button against the
+// App-lifted useAutoUpdate hook (#231). The auto-check at mount
+// still happens; this is the explicit "I want to know if I'm on
+// the latest" affordance, and it also lets the user opt back in
+// to an update they previously dismissed via Later.
+function UpdatesSection({
+  updater,
+}: {
+  updater: ReturnType<typeof useAutoUpdate>;
+}) {
+  const { phase, checkNow, download, dismiss } = updater;
+  const checking = phase.kind === "checking";
+
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
+        Updates
+      </h2>
+      <div className="text-sm text-[var(--color-text-bright)] mb-1">
+        Current version{" "}
+        <span className="font-mono text-[var(--color-text-bright)]/90">
+          v{APP_VERSION}
+        </span>
+      </div>
+      <div className="flex items-center gap-3 mt-3 flex-wrap">
+        <button
+          type="button"
+          onClick={() => void checkNow()}
+          disabled={checking || phase.kind === "downloading"}
+          className="inline-flex items-center px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-accent-soft)] text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {checking ? "Checking…" : "Check for updates"}
+        </button>
+        {/* Inline status: mirrors the toast's content but in a
+            calm Settings-page tone. The toast still appears for
+            "available" so a user not on Settings still sees the
+            prompt; here we add explicit "you're on the latest"
+            feedback that the toast intentionally omits (silence
+            is the toast's "nothing to say"). */}
+        {phase.kind === "upToDate" && (
+          <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--color-status-success)]">
+            <span className="size-1.5 rounded-full bg-[var(--color-status-success)]" />
+            You're on the latest version
+          </span>
+        )}
+        {phase.kind === "available" && (
+          <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--color-accent-soft)]">
+            <span className="size-1.5 rounded-full bg-[var(--color-accent-soft)] animate-pulse" />
+            v{phase.version} is available
+          </span>
+        )}
+        {phase.kind === "downloading" && (
+          <span className="text-[11px] text-[var(--color-text-dim)]">
+            Downloading v{phase.version}
+            {phase.total
+              ? ` (${Math.round((phase.downloaded / phase.total) * 100)}%)`
+              : "…"}
+          </span>
+        )}
+        {phase.kind === "installed" && (
+          <span className="text-[11px] text-[var(--color-status-success)]">
+            v{phase.version} installed — restarting…
+          </span>
+        )}
+        {phase.kind === "error" && (
+          <span className="text-[11px] text-[var(--color-status-danger)] break-words max-w-full">
+            Check failed: {phase.message}
+          </span>
+        )}
+      </div>
+      {/* Inline Install button when the manual check turns up an
+          update -- saves the user from having to look at the
+          toast for the action button. */}
+      {phase.kind === "available" && (
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={download}
+            className="inline-flex items-center px-3 py-1.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-[11px] tracking-[0.14em] uppercase font-medium"
+          >
+            Install v{phase.version}
+          </button>
+          <button
+            type="button"
+            onClick={dismiss}
+            className="inline-flex items-center px-3 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 text-[var(--color-text-bright)]/85 text-[11px] tracking-[0.14em] uppercase transition-colors"
+          >
+            Later
+          </button>
+        </div>
+      )}
+      {phase.kind === "upToDate" && (
+        <div className="mt-2 text-[10px] text-[var(--color-text-dim)] tabular-nums">
+          Last checked {formatRelativeTime(phase.checkedAt)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SettingsView({
   auth,
   onSignOut,
+  updater,
 }: {
   auth: AuthState;
   onSignOut: () => void;
+  /** Lifted update hook (App-level) -- so the "Check for updates"
+   *  button below shares state with the AutoUpdate toast and the
+   *  per-version dismiss memory. Single source of truth (#231). */
+  updater: ReturnType<typeof useAutoUpdate>;
 }) {
   return (
     <div className="px-6 py-8 max-w-2xl space-y-4">
@@ -4966,6 +5075,8 @@ function SettingsView({
           default install path, theme.
         </p>
       </div>
+
+      <UpdatesSection updater={updater} />
 
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
         <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
