@@ -1260,15 +1260,35 @@ const SEVEN_DAYS_DEFAULT_PORT: u16 = 26900;
 /// session corrupts a world. Snapshot failures are logged but
 /// non-fatal — we'd rather let the user play with no snapshot
 /// than block the launch on a transient filesystem error.
+///
+/// `server_pack` is set by every JOIN path (absent for a bare launch):
+/// `{ slug: null }` for a server that runs no pack. Before anything
+/// else, live Mods/ is swapped to match it (profile::align_for_server)
+/// -- 7DTD loads every mod in Mods/ for every server, so a pack left
+/// live from the last session can make this join hang forever. Unlike
+/// the snapshot, a failed alignment BLOCKS the launch: joining with
+/// the wrong mods is the silent failure this exists to prevent, and
+/// the error says what to do instead.
 #[tauri::command]
 async fn launch_game(
     app: AppHandle,
     connect_address: Option<String>,
-) -> Result<(), String> {
+    server_pack: Option<ServerPack>,
+) -> Result<Option<profile::Alignment>, String> {
+    let layout = store_layout(&app)?;
+    let alignment = match &server_pack {
+        Some(p) => Some(
+            profile::align_for_server(&layout, p.slug.as_deref())
+                .await
+                .map_err(|e| format!("{e:#}"))?,
+        ),
+        None => None,
+    };
+
     // Best-effort pre-launch snapshot. Only runs when the profile
     // system is initialized — first-time users without profiles
-    // get the existing launch behavior unchanged.
-    let layout = store_layout(&app)?;
+    // get the existing launch behavior unchanged. After alignment,
+    // so it captures the pack actually being played.
     match profile::snapshot_active(&layout, Some("pre-launch"), SNAPSHOT_KEEP_LAST).await {
         Ok(_) => {}
         Err(e) => {
@@ -1285,7 +1305,7 @@ async fn launch_game(
     // on the main menu with Steam's launch flow intact.
     if let Some(addr) = connect_address.as_deref() {
         match try_spawn_seven_days(addr) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(alignment),
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
             }
@@ -1295,7 +1315,15 @@ async fn launch_game(
     let url = build_launch_url(connect_address.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
-        .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))
+        .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))?;
+    Ok(alignment)
+}
+
+/// The pack the server being joined runs, as the frontend knows it
+/// from the catalog. `slug: None` = the server runs no pack (vanilla).
+#[derive(Debug, Clone, Deserialize)]
+struct ServerPack {
+    slug: Option<String>,
 }
 
 /// Try to spawn 7DaysToDie.exe directly with `-connecttoip` /

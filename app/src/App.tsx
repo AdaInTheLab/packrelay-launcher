@@ -289,6 +289,10 @@ type LastJoinedServer = {
    *  Both nullable -- not every server has an attached pack. */
   packName: string | null;
   packCover: string | null;
+  /** Slug of the pack the server ran at join time (null = none), so
+   *  Quick Launch swaps Mods/ the same way Connect does. Absent on
+   *  records saved before this existed: those launch without a swap. */
+  packSlug?: string | null;
   /** Drives the status dot on the tile. "ok" when launch_game
    *  returned without error; "failed" if it threw. The launcher
    *  doesn't yet know whether the IN-GAME connect succeeded (that
@@ -318,6 +322,10 @@ function loadLastJoined(): LastJoinedServer | null {
       serverName: parsed.serverName,
       packName: typeof parsed.packName === "string" ? parsed.packName : null,
       packCover: typeof parsed.packCover === "string" ? parsed.packCover : null,
+      packSlug:
+        typeof parsed.packSlug === "string" || parsed.packSlug === null
+          ? parsed.packSlug
+          : undefined,
       lastStatus: parsed.lastStatus === "failed" ? "failed" : "ok",
       lastAttemptAt:
         typeof parsed.lastAttemptAt === "string"
@@ -1386,9 +1394,12 @@ function App() {
             }
             let status: "ok" | "failed" = "ok";
             try {
-              await invoke("launch_game", {
-                connectAddress: lastJoined.address,
-              });
+              await invoke(
+                "launch_game",
+                lastJoined.packSlug === undefined
+                  ? { connectAddress: lastJoined.address }
+                  : joinArgs(lastJoined.address, lastJoined.packSlug),
+              );
             } catch {
               status = "failed";
             }
@@ -3203,7 +3214,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in 7DTD
                   </div>
-                  <LaunchPanel address={connectAddress} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} />
                 </div>
               )}
             </div>
@@ -3227,7 +3238,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in 7DTD
                   </div>
-                  <LaunchPanel address={connectAddress} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} />
                 </div>
               )}
             </div>
@@ -4167,6 +4178,7 @@ function ServerDetailView({
         serverName: server.name,
         packName: server.attachedPack?.name ?? null,
         packCover: server.attachedPack?.coverImage ?? null,
+        packSlug: server.attachedPack?.slug ?? null,
         lastStatus: status,
         lastAttemptAt: new Date().toISOString(),
       });
@@ -4413,6 +4425,7 @@ function ServerDetailView({
               // into the server.
               <ConnectButton
                 address={server.connectAddress}
+                serverPack={server.attachedPack?.slug ?? null}
                 onLaunched={onLaunched}
               />
             ) : (
@@ -4644,11 +4657,38 @@ function ConnectCopy({ address }: { address: string }) {
 // we can't). The address is also primed to clipboard before the
 // launch so any arg-stripping at the Steam layer still leaves
 // the user one paste away from joining.
+/** What launch_game did to live Mods/ before joining (Rust:
+ *  profile::Alignment). 7DTD loads every mod in Mods/ for every
+ *  server, so each join swaps to the server's own pack -- or to
+ *  vanilla for a server that runs none -- before the game starts. */
+type Alignment =
+  | { kind: "noProfile" }
+  | { kind: "alreadyAligned" }
+  | { kind: "switched"; from: string | null; to: string | null };
+
+/** The line telling the player their Mods folder changed for this
+ *  join. null when nothing changed, so there's nothing to say. */
+function alignmentNote(a: Alignment | null | undefined): string | null {
+  if (a?.kind !== "switched") return null;
+  return a.to
+    ? "Switched your Mods folder to this server's pack. Your other packs are kept in your profile."
+    : "This server runs no mods, so your Mods folder was switched to vanilla for this join. Your packs are kept in your profile.";
+}
+
+/** Tauri args for a JOIN: the server's pack (null = it runs none).
+ *  Bare launches don't send this, so they never touch Mods/. */
+function joinArgs(address: string, serverPack: string | null) {
+  return { connectAddress: address, serverPack: { slug: serverPack } };
+}
+
 function ConnectButton({
   address,
+  serverPack,
   onLaunched,
 }: {
   address: string;
+  /** Slug of the pack this server runs; null when it runs none. */
+  serverPack: string | null;
   /** Optional. Called after launch_game returns, with "ok" or
    *  "failed" depending on the invoke result. Drives the sidebar
    *  Quick Launch tile (#217) -- ServerDetailView passes a closure
@@ -4659,7 +4699,7 @@ function ConnectButton({
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "launching" }
-    | { kind: "launched" }
+    | { kind: "launched"; note: string | null }
     | { kind: "error"; message: string }
   >({ kind: "idle" });
 
@@ -4672,14 +4712,17 @@ function ConnectButton({
       // card above. The user can manually copy if needed.
     }
     try {
-      await invoke("launch_game", { connectAddress: address });
-      setState({ kind: "launched" });
+      const a = await invoke<Alignment | null>(
+        "launch_game",
+        joinArgs(address, serverPack),
+      );
+      setState({ kind: "launched", note: alignmentNote(a) });
       onLaunched?.("ok");
     } catch (e) {
       setState({ kind: "error", message: String(e) });
       onLaunched?.("failed");
     }
-  }, [address, onLaunched]);
+  }, [address, serverPack, onLaunched]);
 
   return (
     <div className="space-y-2">
@@ -4696,6 +4739,11 @@ function ConnectButton({
           Launches 7DTD and joins this server. If the auto-connect
           drops you on the main menu, the address is on your
           clipboard for a manual paste.
+        </p>
+      )}
+      {state.kind === "launched" && state.note && (
+        <p className="text-[11px] text-[var(--color-accent-soft)] leading-relaxed">
+          {state.note}
         </p>
       )}
       {state.kind === "launched" && (
@@ -4723,11 +4771,18 @@ function ConnectButton({
 // paste the address into Join Game → Connect to IP — 7DTD's
 // client doesn't accept a connect address from the command line,
 // so the launcher's job stops at "Steam is opening".
-function LaunchPanel({ address }: { address: string }) {
+function LaunchPanel({
+  address,
+  serverPack,
+}: {
+  address: string;
+  /** Slug of the pack this server runs; null when it runs none. */
+  serverPack: string | null;
+}) {
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "launching" }
-    | { kind: "launched" }
+    | { kind: "launched"; note: string | null }
     | { kind: "error"; message: string }
   >({ kind: "idle" });
 
@@ -4745,12 +4800,15 @@ function LaunchPanel({ address }: { address: string }) {
       // Steam to forward -connecttoip / -connecttoport to the
       // client. Steam occasionally strips args (varies by version),
       // so the clipboard prime above is the reliable fallback.
-      await invoke("launch_game", { connectAddress: address });
-      setState({ kind: "launched" });
+      const a = await invoke<Alignment | null>(
+        "launch_game",
+        joinArgs(address, serverPack),
+      );
+      setState({ kind: "launched", note: alignmentNote(a) });
     } catch (e) {
       setState({ kind: "error", message: String(e) });
     }
-  }, [address]);
+  }, [address, serverPack]);
 
   return (
     <div className="space-y-3">
@@ -4763,6 +4821,11 @@ function LaunchPanel({ address }: { address: string }) {
       >
         {state.kind === "launching" ? "Opening Steam…" : "Launch 7DTD"}
       </button>
+      {state.kind === "launched" && state.note && (
+        <p className="text-[11px] text-[var(--color-accent-soft)] leading-relaxed">
+          {state.note}
+        </p>
+      )}
       {state.kind === "launched" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
           Steam is launching 7DTD with the connect args. If it lands
