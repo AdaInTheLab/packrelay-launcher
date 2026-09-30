@@ -22,6 +22,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::auth::{clear_stored_token, load_stored_token, save_token, validate_token, AuthState};
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
+use packrelay_core::games::{GAMES, SEVEN_DAYS};
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::key_pins::{KeyChanged, KeyPinStore, TrustedKey};
 use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
@@ -116,7 +117,10 @@ impl From<String> for InstallError {
 /// produce an InstallContext with no profile mirror, which the install
 /// flow handles by writing only to the user-picked destination.
 async fn active_pack_mods_dir(layout: &StoreLayout) -> Option<PathBuf> {
-    let m = profile::active_profile(layout).await.ok().flatten()?;
+    let m = profile::active_profile(layout, &SEVEN_DAYS)
+        .await
+        .ok()
+        .flatten()?;
     let active_slug = m.active_pack_slug.as_deref()?;
     let profile_paths = profile::ProfilePaths::from_root(&layout.profile_dir(&m.id));
     Some(profile_paths.pack_paths(active_slug).mods)
@@ -380,10 +384,16 @@ async fn install_pack(
     // Worst case the user gets the pre-#230 mixed-state behavior;
     // they can manually clear via Profiles -> Switch to vanilla.
     if let Ok(layout) = store_layout(&app) {
-        if let Some(meta) = profile::active_profile(&layout).await.ok().flatten() {
+        if let Some(meta) = profile::active_profile(&layout, &SEVEN_DAYS)
+            .await
+            .ok()
+            .flatten()
+        {
             if let Some(current_active) = meta.active_pack_slug.as_deref() {
                 if current_active != slug {
-                    if let Err(e) = profile::set_active_pack(&layout, &meta.id, None).await {
+                    if let Err(e) =
+                        profile::set_active_pack(&layout, &SEVEN_DAYS, &meta.id, None).await
+                    {
                         eprintln!(
                             "[install_pack] pre-install vanilla swap failed (non-fatal): {e:#}"
                         );
@@ -462,7 +472,7 @@ async fn install_pack(
     // Best-effort: tell the active profile what pack lives here now.
     // Failures are non-fatal — the install itself succeeded.
     if let Ok(layout) = store_layout(&app) {
-        let _ = profile::bind_pack_to_active(&layout, &slug, &report.version).await;
+        let _ = profile::bind_pack_to_active(&layout, &SEVEN_DAYS, &slug, &report.version).await;
     }
 
     Ok(report)
@@ -555,7 +565,7 @@ async fn update_pack(
 
     // Update the profile's bound version to the new one.
     if let Ok(layout) = store_layout(&app) {
-        let _ = profile::bind_pack_to_active(&layout, &slug, &report.to_version).await;
+        let _ = profile::bind_pack_to_active(&layout, &SEVEN_DAYS, &slug, &report.to_version).await;
     }
 
     Ok(report)
@@ -620,7 +630,7 @@ async fn uninstall_pack(app: AppHandle, dest: String) -> Result<UninstallReport,
 
     // Clear the profile's bound pack so it doesn't claim a pack
     // that's no longer there.
-    let _ = profile::clear_active_pack(&layout).await;
+    let _ = profile::clear_active_pack(&layout, &SEVEN_DAYS).await;
     Ok(report)
 }
 
@@ -1067,10 +1077,10 @@ enum ProfileInitialState {
 #[tauri::command]
 async fn profile_initial_state(app: AppHandle) -> Result<ProfileInitialState, String> {
     let layout = store_layout(&app)?;
-    let (active_id, userdata) = profile::read_active(&layout)
+    let (active_id, userdata) = profile::read_active(&layout, &SEVEN_DAYS)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let profiles = profile::list_profiles(&layout)
+    let profiles = profile::list_profiles(&layout, Some(&SEVEN_DAYS))
         .await
         .map_err(|e| format!("{e:#}"))?;
     if profiles.is_empty() && active_id.is_none() {
@@ -1094,7 +1104,7 @@ async fn profile_initial_state(app: AppHandle) -> Result<ProfileInitialState, St
 #[tauri::command]
 async fn profile_list(app: AppHandle) -> Result<Vec<ProfileSummary>, String> {
     let layout = store_layout(&app)?;
-    profile::list_profiles(&layout)
+    profile::list_profiles(&layout, Some(&SEVEN_DAYS))
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1102,7 +1112,7 @@ async fn profile_list(app: AppHandle) -> Result<Vec<ProfileSummary>, String> {
 #[tauri::command]
 async fn profile_active(app: AppHandle) -> Result<Option<ProfileMeta>, String> {
     let layout = store_layout(&app)?;
-    profile::active_profile(&layout)
+    profile::active_profile(&layout, &SEVEN_DAYS)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1114,7 +1124,7 @@ async fn profile_create(app: AppHandle, name: String) -> Result<ProfileMeta, Str
         return Err("Name is required.".to_string());
     }
     let layout = store_layout(&app)?;
-    profile::create_profile(&layout, &trimmed)
+    profile::create_profile(&layout, &SEVEN_DAYS, &trimmed)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1141,7 +1151,7 @@ async fn profile_import_current(
         ));
     }
     let layout = store_layout(&app)?;
-    profile::import_current_as_profile(&layout, &dir, &trimmed)
+    profile::import_current_as_profile(&layout, &SEVEN_DAYS, &dir, &trimmed)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1149,7 +1159,7 @@ async fn profile_import_current(
 #[tauri::command]
 async fn profile_switch(app: AppHandle, id: String) -> Result<(), String> {
     let layout = store_layout(&app)?;
-    profile::switch_profile(&layout, &id)
+    profile::switch_profile(&layout, &SEVEN_DAYS, &id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1174,15 +1184,23 @@ async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Live game `Mods/` dirs whose sidecar the cache GC must also count:
-/// the active profile's configured userdata `Mods/`, plus the
-/// platform default (where installs land when profiles aren't set
-/// up). The active pack's files can exist only there, so leaving
-/// them out would let GC delete blobs the running pack still uses.
+/// Live mods slots whose sidecar the cache GC must also count: every
+/// game's configured live mods slot (7DTD's userdata `Mods/`,
+/// Valheim's `BepInEx/`), plus 7DTD's platform default (where installs
+/// land when profiles aren't set up). The active pack's files can
+/// exist only there, so leaving them out would let GC delete blobs the
+/// running pack still uses.
 async fn gc_live_mods_dirs(layout: &StoreLayout) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok((_, Some(userdata))) = profile::read_active(layout).await {
-        dirs.push(PathBuf::from(userdata).join("Mods"));
+    for game in GAMES {
+        if let Ok((_, Some(root))) = profile::read_active(layout, game).await {
+            let root = PathBuf::from(root);
+            dirs.push(if game.mods_live.is_empty() {
+                root
+            } else {
+                root.join(game.mods_live)
+            });
+        }
     }
     if let Some(p) = canonical_mods_path() {
         if !dirs.contains(&p) {
@@ -1254,7 +1272,7 @@ async fn profile_snapshot_active(
     label: Option<String>,
 ) -> Result<ProfileSnapshot, String> {
     let layout = store_layout(&app)?;
-    profile::snapshot_active(&layout, label.as_deref(), SNAPSHOT_KEEP_LAST)
+    profile::snapshot_active(&layout, &SEVEN_DAYS, label.as_deref(), SNAPSHOT_KEEP_LAST)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1269,7 +1287,7 @@ async fn profile_set_active_pack(
     pack_slug: Option<String>,
 ) -> Result<(), String> {
     let layout = store_layout(&app)?;
-    profile::set_active_pack(&layout, &profile_id, pack_slug.as_deref())
+    profile::set_active_pack(&layout, &SEVEN_DAYS, &profile_id, pack_slug.as_deref())
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1294,7 +1312,7 @@ async fn profile_restore_snapshot(
     snapshot_id: String,
 ) -> Result<(), String> {
     let layout = store_layout(&app)?;
-    profile::restore_snapshot(&layout, &profile_id, &pack_slug, &snapshot_id)
+    profile::restore_snapshot(&layout, &SEVEN_DAYS, &profile_id, &pack_slug, &snapshot_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1340,7 +1358,7 @@ async fn launch_game(
     let layout = store_layout(&app)?;
     let alignment = match &server_pack {
         Some(p) => Some(
-            profile::align_for_server(&layout, p.slug.as_deref())
+            profile::align_for_server(&layout, &SEVEN_DAYS, p.slug.as_deref())
                 .await
                 .map_err(|e| format!("{e:#}"))?,
         ),
@@ -1351,7 +1369,9 @@ async fn launch_game(
     // system is initialized — first-time users without profiles
     // get the existing launch behavior unchanged. After alignment,
     // so it captures the pack actually being played.
-    match profile::snapshot_active(&layout, Some("pre-launch"), SNAPSHOT_KEEP_LAST).await {
+    match profile::snapshot_active(&layout, &SEVEN_DAYS, Some("pre-launch"), SNAPSHOT_KEEP_LAST)
+        .await
+    {
         Ok(_) => {}
         Err(e) => {
             // Common shapes: no active profile (expected pre-onboarding),
