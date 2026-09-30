@@ -7,7 +7,7 @@
 <h1 align="center">PackRelay Launcher</h1>
 
 <p align="center">
-  <strong>One-click installer + auto-updater for signed 7 Days to Die mod packs.</strong><br/>
+  <strong>One-click installer + auto-updater for signed 7 Days to Die and Valheim mod packs.</strong><br/>
   Browse the catalog at <a href="https://packrelay.cloud">packrelay.cloud</a>, install, join — every file SHA-256 verified against an Ed25519-signed manifest.
 </p>
 
@@ -36,6 +36,7 @@
   <img src="https://img.shields.io/badge/React-19-61dafb?labelColor=171717&logo=react&logoColor=black" alt="React 19" />
   <img src="https://img.shields.io/badge/Rust-stable-orange?labelColor=171717&logo=rust&logoColor=white" alt="Rust" />
   <img src="https://img.shields.io/badge/7D2D-V2.0-orange?labelColor=171717" alt="7 Days to Die V2" />
+  <img src="https://img.shields.io/badge/Valheim-BepInEx-3b82f6?labelColor=171717" alt="Valheim with BepInEx" />
 </p>
 
 <p align="center">
@@ -50,18 +51,18 @@
 
 ## Why it exists
 
-The 7 Days to Die mod ecosystem is great. The *install* experience for new players is not — find a modpack, download a zip, hope it's the right one, hope the files aren't tampered with, drag-drop into the right folder, hope you remembered to remove the last server's mods first, get kicked on connect because the server is on a slightly newer version anyway.
+The 7 Days to Die and Valheim mod ecosystems are great. The *install* experience for new players is not — find a modpack, download a zip, hope it's the right one, hope the files aren't tampered with, drag-drop into the right folder, hope you remembered to remove the last server's mods first, get kicked on connect because the server is on a slightly newer version anyway.
 
 PackRelay replaces all of that with: click, install, join. Every file is content-addressed and SHA-256 verified. Pack publishers sign manifests with an Ed25519 key the launcher verifies before laying down a single byte.
 
 ## What it does
 
 - **Browse** a public catalog of modpacks. Filter by tag, sort by popularity or recency, search by name.
-- **Install** a pack into your 7DTD `Mods/` folder. Each file streams through both the SHA-256 hasher and the on-disk write in one pass — corrupt or tampered files abort the install before any further bytes are written.
+- **Install** a pack into your game: 7DTD's `Mods/` folder, or Valheim's `BepInEx/` (the launcher installs BepInExPack itself, at the version the pack was built on). Each file streams through both the SHA-256 hasher and the on-disk write in one pass — corrupt or tampered files abort the install before any further bytes are written.
 - **Verify** an installed pack at any time. Mismatches surface inline; one-click **Repair** refetches only the broken files.
 - **Smart update** when a new version ships. Diffs the installed manifest against the new one and refetches only changed files; unchanged files stay put. Removed files get deleted; the sidecar manifest rolls forward.
 - **Uninstall** cleanly. Reads the sidecar to know exactly which files to delete — never touches a file the launcher didn't install, so a shared `Mods/` folder containing other packs stays safe.
-- **Browse servers** running PackRelay packs. Filter by region, online status, "not full". One-click **Join** opens 7DTD via Steam with the connect address pre-copied to your clipboard. Kicked-from-server links open the launcher directly to the right pack-version + connect flow via `packrelay://join/<slug>`.
+- **Browse servers** running PackRelay packs. Filter by region, online status, "not full". One-click **Join** opens the game via Steam with the connect address pre-copied to your clipboard. Kicked-from-server links open the launcher directly to the right pack-version + connect flow via `packrelay://join/<slug>`.
 
 ## How it works
 
@@ -152,5 +153,5 @@ Source-available, **not** open source. See [`LICENSE`](LICENSE) — short versio
 ---
 
 <p align="center">
-  <sub>Built by <a href="https://github.com/AdaInTheLab">AdaInTheLab</a> for the 7DTD modding community.</sub>
+  <sub>Built by <a href="https://github.com/AdaInTheLab">AdaInTheLab</a> for the 7DTD and Valheim modding communities.</sub>
 </p>
