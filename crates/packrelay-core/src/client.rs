@@ -49,6 +49,20 @@ impl Client {
         format!("{}/api/v1/files/{}", self.api_url, sha256)
     }
 
+    /// A pack's manifest, latest or pinned. Names every game this
+    /// launcher has a layout for: the cloud refuses another game's pack
+    /// to a client that doesn't say it can handle it, because launchers
+    /// from before multi-game would install anything into 7DTD's Mods/.
+    /// Which game's folder a pack may go in is then checked here, by
+    /// InstallContext::check_game.
+    pub fn manifest_url(&self, slug: &str, version: Option<&str>) -> String {
+        let base = match version {
+            Some(v) => format!("{}/api/v1/packs/{}/manifest/{}", self.api_url, slug, v),
+            None => format!("{}/api/v1/packs/{}/manifest", self.api_url, slug),
+        };
+        format!("{base}?game={}", supported_games_param())
+    }
+
     /// A game's mod loader, as the cloud re-hosts it (framework.rs).
     pub fn framework_url(&self, id: &str, version: &str) -> String {
         format!("{}/api/v1/frameworks/{}/{}", self.api_url, id, version)
@@ -102,10 +116,7 @@ impl Client {
         slug: &str,
         version: Option<&str>,
     ) -> Result<VerifiedManifest> {
-        let url = match version {
-            Some(v) => format!("{}/api/v1/packs/{}/manifest/{}", self.api_url, slug, v),
-            None => format!("{}/api/v1/packs/{}/manifest", self.api_url, slug),
-        };
+        let url = self.manifest_url(slug, version);
         let res = self
             .http
             .get(&url)
@@ -204,5 +215,33 @@ impl Client {
         res.json::<PublisherKey>()
             .await
             .with_context(|| format!("parsing signing key '{key_id}'"))
+    }
+}
+
+/// "7d2d,valheim": every game games.rs has a layout for, as the cloud's
+/// `?game=` takes them.
+pub fn supported_games_param() -> String {
+    crate::games::GAMES
+        .iter()
+        .map(|g| g.id)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_urls_name_every_supported_game() {
+        let c = Client::new("https://packrelay.cloud/");
+        assert_eq!(
+            c.manifest_url("viking-pack", None),
+            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest?game=7d2d,valheim"
+        );
+        assert_eq!(
+            c.manifest_url("viking-pack", Some("1.2.0")),
+            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest/1.2.0?game=7d2d,valheim"
+        );
     }
 }

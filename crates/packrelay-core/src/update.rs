@@ -82,6 +82,7 @@ where
     } = client
         .fetch_verified_manifest_at(slug, target_version)
         .await?;
+    ctx.check_game(&new_manifest)?;
     // Checked ahead of the no-op exit below, so installs from before
     // key pinning get their key pinned on the first update check. The
     // installed copy's signer only counts if it's this pack's sidecar.

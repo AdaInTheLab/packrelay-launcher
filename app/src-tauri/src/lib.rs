@@ -21,8 +21,9 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::auth::{clear_stored_token, load_stored_token, save_token, validate_token, AuthState};
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
+use packrelay_core::client::supported_games_param;
 use packrelay_core::client::Client;
-use packrelay_core::games::{GameLayout, GAMES, SEVEN_DAYS};
+use packrelay_core::games::{self, GameLayout, GAMES, SEVEN_DAYS};
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::key_pins::{KeyChanged, KeyPinStore, PinnedKey, TrustedKey};
 use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
@@ -55,14 +56,20 @@ fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
 /// cache_root — the cache survives any user state; only
 /// profile_mods is conditional on the profile system being
 /// initialized.
-async fn build_install_context(app: &AppHandle) -> Result<InstallContext, String> {
+async fn build_install_context(
+    app: &AppHandle,
+    game: &'static GameLayout,
+) -> Result<InstallContext, String> {
     let layout = store_layout(app)?;
-    let profile_mods = active_pack_mods_dir(&layout).await;
+    let profile_mods = active_pack_mods_dir(&layout, game).await;
     Ok(InstallContext {
         cache_root: Some(layout.cache_dir()),
         profile_mods,
         key_pins: Some(key_pin_store(app)?),
         trust_key: None,
+        // install/update refuse a pack for any other game than the one
+        // whose folder `dest` is.
+        game: Some(game),
     })
 }
 
@@ -113,6 +120,17 @@ async fn forget_trusted_key(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// The game a command acts for: the frontend's `game` (a catalog
+/// pack's or server's), or 7DTD when it sends none, as every launcher
+/// UI from before multi-game does.
+fn game_of(game: Option<&str>) -> Result<&'static GameLayout, String> {
+    match game {
+        None => Ok(&SEVEN_DAYS),
+        Some(id) => games::game_by_id(id)
+            .ok_or_else(|| format!("this launcher doesn't support the game '{id}'")),
+    }
+}
+
 /// Error shape for `install_pack` / `update_pack`. `keyChanged` means
 /// the pack is validly signed but by a key the player hasn't trusted
 /// for it yet; the UI shows both keys and can retry with `trustKey`
@@ -158,11 +176,8 @@ impl From<String> for InstallError {
 /// active profile has no active pack (vanilla mode). Both cases
 /// produce an InstallContext with no profile mirror, which the install
 /// flow handles by writing only to the user-picked destination.
-async fn active_pack_mods_dir(layout: &StoreLayout) -> Option<PathBuf> {
-    let m = profile::active_profile(layout, &SEVEN_DAYS)
-        .await
-        .ok()
-        .flatten()?;
+async fn active_pack_mods_dir(layout: &StoreLayout, game: &GameLayout) -> Option<PathBuf> {
+    let m = profile::active_profile(layout, game).await.ok().flatten()?;
     let active_slug = m.active_pack_slug.as_deref()?;
     let profile_paths = profile::ProfilePaths::from_root(&layout.profile_dir(&m.id));
     Some(profile_paths.pack_paths(active_slug).mods)
@@ -206,6 +221,14 @@ pub struct CatalogPack {
     #[serde(default)]
     pub is_featured: bool,
     pub created_at: String,
+    /// The game the pack is for (games.rs id). Absent on catalogs from
+    /// before multi-game, which were all 7DTD.
+    #[serde(default = "default_game_id")]
+    pub game: String,
+}
+
+fn default_game_id() -> String {
+    SEVEN_DAYS.id.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,6 +266,9 @@ pub struct CatalogServer {
     #[serde(default)]
     pub favorite_count: i64,
     pub attached_pack: Option<AttachedPack>,
+    /// The game the server runs; see CatalogPack.game.
+    #[serde(default = "default_game_id")]
+    pub game: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,8 +310,14 @@ struct InstallProgressPayload {
 /// is missing, in which case the frontend falls back to a hardcoded
 /// guess.
 #[tauri::command]
-fn default_install_dest() -> Option<String> {
-    let path = canonical_mods_path()?;
+fn default_install_dest(game: Option<String>) -> Option<String> {
+    let game = game_of(game.as_deref()).ok()?;
+    let path = match game.live_root_in_install {
+        // A game whose pack lives inside its install (Valheim: BepInEx/
+        // in the game folder): wherever Steam has it.
+        Some(_) => steam::live_root_in(game, &find_game_install(game)?)?,
+        None => canonical_mods_path()?,
+    };
     Some(path.display().to_string())
 }
 
@@ -344,7 +376,12 @@ async fn list_packs() -> Result<Vec<CatalogPack>, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = format!("{DEFAULT_API_URL}/api/v1/packs");
+    // Only the games this launcher can install (the cloud's default is
+    // 7DTD alone, for launchers from before multi-game).
+    let url = format!(
+        "{DEFAULT_API_URL}/api/v1/packs?game={}",
+        supported_games_param()
+    );
     let resp = http
         .get(&url)
         .send()
@@ -367,7 +404,10 @@ async fn list_servers() -> Result<Vec<CatalogServer>, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = format!("{DEFAULT_API_URL}/api/v1/servers");
+    let url = format!(
+        "{DEFAULT_API_URL}/api/v1/servers?game={}",
+        supported_games_param()
+    );
     let resp = http
         .get(&url)
         .send()
@@ -386,6 +426,69 @@ async fn list_servers() -> Result<Vec<CatalogServer>, String> {
     Ok(body.servers)
 }
 
+/// What a game whose pack lives inside its install (Valheim) needs before
+/// a pack goes in; nothing for 7DTD.
+///
+/// 1. The pack must be for this game. install/update check it too, but
+///    this runs first, before anything below touches the player's folder.
+/// 2. The profile system must be set up for the game, so joins can swap
+///    packs. The first time, whatever mods the player already had under
+///    BepInEx/ are imported as the `_imported` pack (never mixed into a
+///    PackRelay pack, never lost), and install_pack's swap to vanilla
+///    then gives the pack a clean folder.
+/// 3. The pack's mod loader (manifest `framework`) must be installed in
+///    the game folder, from the cloud's re-hosted copy.
+async fn prepare_game_install(
+    app: &AppHandle,
+    game: &'static GameLayout,
+    client: &Client,
+    slug: &str,
+    version: Option<&str>,
+    dest: &Path,
+) -> Result<(), InstallError> {
+    if game.live_root_in_install.is_none() {
+        return Ok(());
+    }
+    let (_, manifest) = client.fetch_manifest_at(slug, version).await?;
+    if manifest.game != game.id {
+        return Err(InstallError::Failed {
+            message: format!(
+                "this pack is for {}, not {}; install it from there",
+                manifest.game_layout().display_name,
+                game.display_name
+            ),
+        });
+    }
+
+    let layout = store_layout(app)?;
+    let (active, _) = profile::read_active(&layout, game)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if active.is_none() {
+        let set_up = if dest.exists() {
+            profile::import_current_as_profile(&layout, game, dest, game.display_name)
+                .await
+                .map(|_| ())
+        } else {
+            match profile::create_profile(&layout, game, game.display_name).await {
+                Ok(meta) => profile::set_active(&layout, game, Some(&meta.id), Some(dest)).await,
+                Err(e) => Err(e),
+            }
+        };
+        set_up.map_err(|e| format!("setting up {} profiles: {e:#}", game.display_name))?;
+    }
+
+    if let Some(framework) = &manifest.framework {
+        let game_root = dest
+            .parent()
+            .ok_or_else(|| format!("{} has no parent folder", dest.display()))?;
+        packrelay_core::framework::ensure_framework(client, game_root, framework)
+            .await
+            .map_err(|e| format!("installing {} {}: {e:#}", framework.id, framework.version))?;
+    }
+    Ok(())
+}
+
 /// `version` is an optional pin: when set, the installer fetches the
 /// manifest at that specific version instead of the publisher's latest.
 /// Used by the deep-link join flow so a server pinned to v0.2.0 doesn't
@@ -398,9 +501,12 @@ async fn install_pack(
     dest: String,
     version: Option<String>,
     trust_key: Option<TrustedKey>,
+    game: Option<String>,
 ) -> Result<InstallReport, InstallError> {
+    let game = game_of(game.as_deref())?;
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
+    prepare_game_install(&app, game, &client, &slug, version.as_deref(), &dest_path).await?;
 
     // Multi-pack guard (#230): if the active profile already has a
     // DIFFERENT pack active, swap to vanilla mode first. Without
@@ -421,16 +527,10 @@ async fn install_pack(
     // Worst case the user gets the pre-#230 mixed-state behavior;
     // they can manually clear via Profiles -> Switch to vanilla.
     if let Ok(layout) = store_layout(&app) {
-        if let Some(meta) = profile::active_profile(&layout, &SEVEN_DAYS)
-            .await
-            .ok()
-            .flatten()
-        {
+        if let Some(meta) = profile::active_profile(&layout, game).await.ok().flatten() {
             if let Some(current_active) = meta.active_pack_slug.as_deref() {
                 if current_active != slug {
-                    if let Err(e) =
-                        profile::set_active_pack(&layout, &SEVEN_DAYS, &meta.id, None).await
-                    {
+                    if let Err(e) = profile::set_active_pack(&layout, game, &meta.id, None).await {
                         eprintln!(
                             "[install_pack] pre-install vanilla swap failed (non-fatal): {e:#}"
                         );
@@ -452,7 +552,7 @@ async fn install_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let mut ctx = build_install_context(&app).await?;
+    let mut ctx = build_install_context(&app, game).await?;
     ctx.trust_key = trust_key;
     let report = install(
         &client,
@@ -509,7 +609,7 @@ async fn install_pack(
     // Best-effort: tell the active profile what pack lives here now.
     // Failures are non-fatal — the install itself succeeded.
     if let Ok(layout) = store_layout(&app) {
-        let _ = profile::bind_pack_to_active(&layout, &SEVEN_DAYS, &slug, &report.version).await;
+        let _ = profile::bind_pack_to_active(&layout, game, &slug, &report.version).await;
     }
 
     Ok(report)
@@ -532,9 +632,12 @@ async fn update_pack(
     dest: String,
     version: Option<String>,
     trust_key: Option<TrustedKey>,
+    game: Option<String>,
 ) -> Result<UpdateReport, InstallError> {
+    let game = game_of(game.as_deref())?;
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
+    prepare_game_install(&app, game, &client, &slug, version.as_deref(), &dest_path).await?;
 
     // Same atomic-counter shape as install_pack so the frontend's
     // progress listener doesn't have to differentiate between
@@ -548,7 +651,7 @@ async fn update_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let mut ctx = build_install_context(&app).await?;
+    let mut ctx = build_install_context(&app, game).await?;
     ctx.trust_key = trust_key;
     let report = update(
         &client,
@@ -602,7 +705,7 @@ async fn update_pack(
 
     // Update the profile's bound version to the new one.
     if let Ok(layout) = store_layout(&app) {
-        let _ = profile::bind_pack_to_active(&layout, &SEVEN_DAYS, &slug, &report.to_version).await;
+        let _ = profile::bind_pack_to_active(&layout, game, &slug, &report.to_version).await;
     }
 
     Ok(report)
@@ -640,9 +743,13 @@ async fn check_pack_present(dest: String) -> Result<PresenceReport, String> {
 /// (see install::download_and_verify), so a half-applied repair
 /// can't leave the dest worse than it started.
 #[tauri::command]
-async fn repair_pack(app: AppHandle, dest: String) -> Result<RepairReport, String> {
+async fn repair_pack(
+    app: AppHandle,
+    dest: String,
+    game: Option<String>,
+) -> Result<RepairReport, String> {
     let client = Client::new(DEFAULT_API_URL);
-    let ctx = build_install_context(&app).await?;
+    let ctx = build_install_context(&app, game_of(game.as_deref())?).await?;
     repair(&client, &PathBuf::from(dest), ctx)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -654,20 +761,25 @@ async fn repair_pack(app: AppHandle, dest: String) -> Result<RepairReport, Strin
 /// per-file failures (locked, read-only, etc.) so the frontend can
 /// surface them without re-querying the filesystem.
 #[tauri::command]
-async fn uninstall_pack(app: AppHandle, dest: String) -> Result<UninstallReport, String> {
+async fn uninstall_pack(
+    app: AppHandle,
+    dest: String,
+    game: Option<String>,
+) -> Result<UninstallReport, String> {
+    let game = game_of(game.as_deref())?;
     // Resolve the active profile's mods dir (if any) so the
     // uninstall also clears the profile's mirror — otherwise
     // switching back to this profile later would re-install the
     // pack we just removed.
     let layout = store_layout(&app)?;
-    let profile_mods = active_pack_mods_dir(&layout).await;
+    let profile_mods = active_pack_mods_dir(&layout, game).await;
     let report = uninstall(&PathBuf::from(dest), profile_mods.as_deref())
         .await
         .map_err(|e| format!("{e:#}"))?;
 
     // Clear the profile's bound pack so it doesn't claim a pack
     // that's no longer there.
-    let _ = profile::clear_active_pack(&layout, &SEVEN_DAYS).await;
+    let _ = profile::clear_active_pack(&layout, game).await;
     Ok(report)
 }
 
@@ -1386,11 +1498,13 @@ async fn launch_game(
     app: AppHandle,
     connect_address: Option<String>,
     server_pack: Option<ServerPack>,
+    game: Option<String>,
 ) -> Result<Option<profile::Alignment>, String> {
+    let game = game_of(game.as_deref())?;
     let layout = store_layout(&app)?;
     let alignment = match &server_pack {
         Some(p) => Some(
-            profile::align_for_server(&layout, &SEVEN_DAYS, p.slug.as_deref())
+            profile::align_for_server(&layout, game, p.slug.as_deref())
                 .await
                 .map_err(|e| format!("{e:#}"))?,
         ),
@@ -1401,9 +1515,7 @@ async fn launch_game(
     // system is initialized — first-time users without profiles
     // get the existing launch behavior unchanged. After alignment,
     // so it captures the pack actually being played.
-    match profile::snapshot_active(&layout, &SEVEN_DAYS, Some("pre-launch"), SNAPSHOT_KEEP_LAST)
-        .await
-    {
+    match profile::snapshot_active(&layout, game, Some("pre-launch"), SNAPSHOT_KEEP_LAST).await {
         Ok(_) => {}
         Err(e) => {
             // Common shapes: no active profile (expected pre-onboarding),
@@ -1418,7 +1530,7 @@ async fn launch_game(
     // address — bare-launch goes through Steam so the user lands
     // on the main menu with Steam's launch flow intact.
     if let Some(addr) = connect_address.as_deref() {
-        match try_spawn(&SEVEN_DAYS, addr) {
+        match try_spawn(game, addr) {
             Ok(()) => return Ok(alignment),
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
@@ -1426,10 +1538,10 @@ async fn launch_game(
         }
     }
 
-    let url = launch::steam_url(&SEVEN_DAYS, connect_address.as_deref());
+    let url = launch::steam_url(game, connect_address.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
-        .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))?;
+        .map_err(|e| format!("failed to launch {} via Steam: {e}", game.short_name))?;
     Ok(alignment)
 }
 

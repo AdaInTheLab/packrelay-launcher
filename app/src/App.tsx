@@ -35,7 +35,18 @@ type CatalogPack = {
   // #[serde(default)] so older API responses still parse.
   isFeatured: boolean;
   createdAt: string;
+  /** The game the pack is for ("7d2d", "valheim"). The Rust side
+   *  defaults it to "7d2d" for catalogs from before multi-game. */
+  game: string;
 };
+
+/** Display names for the games this launcher handles; mirrors the
+ *  Rust side's games.rs. */
+const GAME_NAMES: Record<string, string> = {
+  "7d2d": "7 Days to Die",
+  valheim: "Valheim",
+};
+const gameName = (id: string | undefined) => GAME_NAMES[id ?? "7d2d"] ?? id ?? "7 Days to Die";
 
 // Mirrors the Rust CatalogServer struct.
 type AttachedPack = {
@@ -64,6 +75,8 @@ type CatalogServer = {
   uptimePct: number;
   favoriteCount: number;
   attachedPack: AttachedPack | null;
+  /** The game the server runs; see CatalogPack.game. */
+  game: string;
 };
 
 // Top-level view the main pane renders when nothing has been
@@ -332,6 +345,9 @@ type LastJoinedServer = {
    *  Quick Launch swaps Mods/ the same way Connect does. Absent on
    *  records saved before this existed: those launch without a swap. */
   packSlug?: string | null;
+  /** The game the server runs, so Quick Launch opens the right one.
+   *  Absent on records saved before multi-game: 7DTD. */
+  game?: string;
   /** Drives the status dot on the tile. "ok" when launch_game
    *  returned without error; "failed" if it threw. The launcher
    *  doesn't yet know whether the IN-GAME connect succeeded (that
@@ -403,6 +419,9 @@ type InstallRecord = {
    *  unreachable) still render their cover from history. Older
    *  records may not have this — loadHistory() backfills `null`. */
   coverImage: string | null;
+  /** The game the pack is for. Absent on records from before
+   *  multi-game, which were all 7DTD. */
+  game?: string;
 };
 
 const HISTORY_STORAGE_KEY = "packrelay.installHistory.v1";
@@ -1101,7 +1120,7 @@ function App() {
   }, [servers, pendingJoinSlug]);
 
   const recordInstall = useCallback(
-    (slug: string, report: InstallReport, coverImage: string | null) => {
+    (slug: string, report: InstallReport, coverImage: string | null, game: string) => {
       const entry: InstallRecord = {
         slug,
         name: report.displayName,
@@ -1111,6 +1130,7 @@ function App() {
         fileCount: report.fileCount,
         installedAt: new Date().toISOString(),
         coverImage,
+        game,
       };
       setHistory((prev) => {
         // Dedup: drop any prior entry for the same slug — the latest
@@ -1259,7 +1279,7 @@ function App() {
             }
           }}
           onInstalled={(report) =>
-            recordInstall(selectedPack.slug, report, selectedPack.coverImage)
+            recordInstall(selectedPack.slug, report, selectedPack.coverImage, selectedPack.game)
           }
           onUpdated={(report) =>
             recordUpdate(selectedPack.slug, report, selectedPack.coverImage)
@@ -1437,8 +1457,8 @@ function App() {
               await invoke(
                 "launch_game",
                 lastJoined.packSlug === undefined
-                  ? { connectAddress: lastJoined.address }
-                  : joinArgs(lastJoined.address, lastJoined.packSlug),
+                  ? { connectAddress: lastJoined.address, game: lastJoined.game ?? null }
+                  : joinArgs(lastJoined.address, lastJoined.packSlug, lastJoined.game),
               );
             } catch {
               status = "failed";
@@ -2188,6 +2208,7 @@ function LibraryTile({
     try {
       const report = await invoke<RepairReport>("repair_pack", {
         dest: record.dest,
+        game: record.game ?? null,
       });
       setVerify({ kind: "repaired", report });
     } catch (e) {
@@ -2206,6 +2227,7 @@ function LibraryTile({
     try {
       const report = await invoke<UninstallReport>("uninstall_pack", {
         dest: record.dest,
+        game: record.game ?? null,
       });
       if (report.filesFailed.length === 0) {
         onRemove(record);
@@ -2747,6 +2769,12 @@ function BrowseView({
                   )}
                 </div>
                 <div className="p-4">
+                  {(p.game ?? "7d2d") !== "7d2d" && (
+                    // Every pack used to be 7DTD's; say so when it isn't.
+                    <div className="text-[9px] tracking-[0.18em] uppercase font-semibold text-[var(--color-accent-soft)] mb-1">
+                      {gameName(p.game)}
+                    </div>
+                  )}
                   <div className="flex items-baseline gap-2 mb-1">
                     <span className="font-medium text-[var(--color-text-bright)] truncate">
                       {p.name}
@@ -2913,7 +2941,29 @@ function InstallView({
   })();
   const destLocked = mode === "update";
 
-  const [dest, setDest] = useState(defaultDest);
+  // 7DTD installs to the app-wide default (its per-user Mods/). Any
+  // other game's pack goes in that game's own folder (Valheim: BepInEx/
+  // inside its Steam install), which the Rust side looks up; null
+  // means the game isn't installed where Steam can find it.
+  const isOtherGame = (pack.game ?? "7d2d") !== "7d2d";
+  const [dest, setDest] = useState(isOtherGame && !installedRecord ? "" : defaultDest);
+  const [gameMissing, setGameMissing] = useState(false);
+  useEffect(() => {
+    if (!isOtherGame || installedRecord) return;
+    let cancelled = false;
+    void invoke<string | null>("default_install_dest", { game: pack.game })
+      .then((found) => {
+        if (cancelled) return;
+        if (found) setDest(found);
+        else setGameMissing(true);
+      })
+      .catch(() => {
+        if (!cancelled) setGameMissing(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOtherGame, installedRecord, pack.game]);
   // If App says there's a live install for this pack (user came back
   // via the dock), pre-populate as "running" with the latest progress
   // so the view doesn't flash an "idle" form before re-engaging.
@@ -2943,7 +2993,9 @@ function InstallView({
       const picked = await openDialog({
         directory: true,
         multiple: false,
-        title: "Pick your 7DTD Mods/ directory",
+        title: isOtherGame
+          ? `Pick ${gameName(pack.game)}'s BepInEx/ folder`
+          : "Pick your 7DTD Mods/ directory",
       });
       if (typeof picked === "string" && picked) {
         setDest(picked);
@@ -3012,6 +3064,7 @@ function InstallView({
           dest,
           version: targetVersion,
           trustKey: trustKey ?? null,
+          game: pack.game ?? null,
         });
         // Thicc check: even with the Rust-side guard, sanity-check the
         // returned report against the caller's pin before showing a
@@ -3032,6 +3085,7 @@ function InstallView({
           dest,
           version: targetVersion,
           trustKey: trustKey ?? null,
+          game: pack.game ?? null,
         });
         if (targetVersion && report.version !== targetVersion) {
           throw new Error(
@@ -3151,7 +3205,11 @@ function InstallView({
             onChange={(e) => setDest(e.currentTarget.value)}
             disabled={running || destLocked}
             className="flex-1 min-w-0 rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
-            placeholder="Path to your 7DTD Mods/ directory"
+            placeholder={
+              isOtherGame
+                ? `Path to ${gameName(pack.game)}'s BepInEx/ folder`
+                : "Path to your 7DTD Mods/ directory"
+            }
             spellCheck={false}
           />
           <button
@@ -3172,6 +3230,20 @@ function InstallView({
               only changed files are refetched. To install fresh
               elsewhere, uninstall first.
             </>
+          ) : isOtherGame ? (
+            gameMissing ? (
+              <span className="text-[var(--color-status-danger)]">
+                {gameName(pack.game)} isn't installed where Steam can find it.
+                Install it through Steam, or pick its BepInEx/ folder here.
+              </span>
+            ) : (
+              <>
+                {gameName(pack.game)}'s own folder in your Steam library. The
+                launcher installs BepInEx there first if the game doesn't
+                have it, and keeps any mods you already had as a separate
+                pack you can switch back to.
+              </>
+            )
           ) : (
             <>
               The pack folder lands inside this directory. On Windows the
@@ -3259,7 +3331,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in 7DTD
                   </div>
-                  <LaunchPanel address={connectAddress} serverPack={pack.slug} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
                 </div>
               )}
             </div>
@@ -3283,7 +3355,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in 7DTD
                   </div>
-                  <LaunchPanel address={connectAddress} serverPack={pack.slug} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
                 </div>
               )}
             </div>
@@ -4322,6 +4394,7 @@ function ServerDetailView({
         packName: server.attachedPack?.name ?? null,
         packCover: server.attachedPack?.coverImage ?? null,
         packSlug: server.attachedPack?.slug ?? null,
+        game: server.game,
         lastStatus: status,
         lastAttemptAt: new Date().toISOString(),
       });
@@ -4569,6 +4642,7 @@ function ServerDetailView({
               <ConnectButton
                 address={server.connectAddress}
                 serverPack={server.attachedPack?.slug ?? null}
+                game={server.game}
                 onLaunched={onLaunched}
               />
             ) : (
@@ -4820,18 +4894,21 @@ function alignmentNote(a: Alignment | null | undefined): string | null {
 
 /** Tauri args for a JOIN: the server's pack (null = it runs none).
  *  Bare launches don't send this, so they never touch Mods/. */
-function joinArgs(address: string, serverPack: string | null) {
-  return { connectAddress: address, serverPack: { slug: serverPack } };
+function joinArgs(address: string, serverPack: string | null, game?: string) {
+  return { connectAddress: address, serverPack: { slug: serverPack }, game: game ?? null };
 }
 
 function ConnectButton({
   address,
   serverPack,
+  game,
   onLaunched,
 }: {
   address: string;
   /** Slug of the pack this server runs; null when it runs none. */
   serverPack: string | null;
+  /** The game the server runs; launch_game opens that one. */
+  game?: string;
   /** Optional. Called after launch_game returns, with "ok" or
    *  "failed" depending on the invoke result. Drives the sidebar
    *  Quick Launch tile (#217) -- ServerDetailView passes a closure
@@ -4857,7 +4934,7 @@ function ConnectButton({
     try {
       const a = await invoke<Alignment | null>(
         "launch_game",
-        joinArgs(address, serverPack),
+        joinArgs(address, serverPack, game),
       );
       setState({ kind: "launched", note: alignmentNote(a) });
       onLaunched?.("ok");
@@ -4865,7 +4942,7 @@ function ConnectButton({
       setState({ kind: "error", message: String(e) });
       onLaunched?.("failed");
     }
-  }, [address, serverPack, onLaunched]);
+  }, [address, serverPack, game, onLaunched]);
 
   return (
     <div className="space-y-2">
@@ -4917,10 +4994,13 @@ function ConnectButton({
 function LaunchPanel({
   address,
   serverPack,
+  game,
 }: {
   address: string;
   /** Slug of the pack this server runs; null when it runs none. */
   serverPack: string | null;
+  /** The game the pack is for; launch_game opens that one. */
+  game?: string;
 }) {
   const [state, setState] = useState<
     | { kind: "idle" }
@@ -4945,13 +5025,13 @@ function LaunchPanel({
       // so the clipboard prime above is the reliable fallback.
       const a = await invoke<Alignment | null>(
         "launch_game",
-        joinArgs(address, serverPack),
+        joinArgs(address, serverPack, game),
       );
       setState({ kind: "launched", note: alignmentNote(a) });
     } catch (e) {
       setState({ kind: "error", message: String(e) });
     }
-  }, [address, serverPack]);
+  }, [address, serverPack, game]);
 
   return (
     <div className="space-y-3">
