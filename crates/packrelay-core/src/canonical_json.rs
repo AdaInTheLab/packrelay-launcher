@@ -157,7 +157,10 @@ mod tests {
 
     #[test]
     fn escapes_control_chars_as_lowercase_hex() {
-        let s: String = [0x01u8, 0x08, 0x0c, 0x1f].iter().map(|b| *b as char).collect();
+        let s: String = [0x01u8, 0x08, 0x0c, 0x1f]
+            .iter()
+            .map(|b| *b as char)
+            .collect();
         assert_eq!(canonicalize(&json!(s)).unwrap(), r#""\u0001\b\f\u001f""#);
     }
 }

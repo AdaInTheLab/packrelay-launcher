@@ -472,10 +472,7 @@ pub async fn active_profile(layout: &StoreLayout) -> Result<Option<ProfileMeta>>
 ///   2. Mirror the incoming profile's active pack's mods/saves +
 ///      the profile's shared worlds into the live locations.
 ///   3. Update the active pointer.
-pub async fn switch_profile(
-    layout: &StoreLayout,
-    incoming_id: &str,
-) -> Result<()> {
+pub async fn switch_profile(layout: &StoreLayout, incoming_id: &str) -> Result<()> {
     let active = load_active(layout).await?;
     let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
         anyhow::bail!(
@@ -586,9 +583,7 @@ pub async fn set_active_pack(
     }
     if let Some(slug) = target_slug {
         if !meta.packs.iter().any(|p| p.slug == slug) {
-            anyhow::bail!(
-                "Pack '{slug}' isn't installed in this profile. Install it first."
-            );
+            anyhow::bail!("Pack '{slug}' isn't installed in this profile. Install it first.");
         }
     }
 
@@ -679,11 +674,7 @@ pub async fn add_pack_to_profile(
 /// Convenience wrapper: add a pack to the *currently active* profile.
 /// Returns Ok with no-op if no profile is active (the launcher will
 /// have installed the pack outside the profile system in that case).
-pub async fn bind_pack_to_active(
-    layout: &StoreLayout,
-    slug: &str,
-    version: &str,
-) -> Result<()> {
+pub async fn bind_pack_to_active(layout: &StoreLayout, slug: &str, version: &str) -> Result<()> {
     let active = load_active(layout).await?;
     let Some(id) = active.active_profile_id.as_deref() else {
         return Ok(());
@@ -804,11 +795,7 @@ pub async fn clear_active_pack(layout: &StoreLayout) -> Result<()> {
 }
 
 /// Rename a profile. Pure metadata edit.
-pub async fn rename_profile(
-    layout: &StoreLayout,
-    id: &str,
-    new_name: &str,
-) -> Result<ProfileMeta> {
+pub async fn rename_profile(layout: &StoreLayout, id: &str, new_name: &str) -> Result<ProfileMeta> {
     let paths = ProfilePaths::from_root(&layout.profile_dir(id));
     let mut meta = read_meta_migrated(layout, &paths).await?;
     meta.name = new_name.trim().to_string();
@@ -821,9 +808,7 @@ pub async fn rename_profile(
 pub async fn delete_profile(layout: &StoreLayout, id: &str) -> Result<()> {
     let active = load_active(layout).await?;
     if active.active_profile_id.as_deref() == Some(id) {
-        anyhow::bail!(
-            "Can't delete the active profile. Switch to another profile first."
-        );
+        anyhow::bail!("Can't delete the active profile. Switch to another profile first.");
     }
     let dir = layout.profile_dir(id);
     if fs::metadata(&dir).await.is_ok() {
@@ -925,9 +910,7 @@ pub async fn restore_snapshot(
 ) -> Result<()> {
     let active = load_active(layout).await?;
     if active.active_profile_id.as_deref() != Some(profile_id) {
-        anyhow::bail!(
-            "Snapshot's profile isn't currently active. Switch to it before restoring."
-        );
+        anyhow::bail!("Snapshot's profile isn't currently active. Switch to it before restoring.");
     }
     let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
         anyhow::bail!("7DTD userdata dir not configured.");
@@ -1063,10 +1046,7 @@ async fn migrate_profile_v0_to_v1(paths: &ProfilePaths) -> Result<()> {
 
         // Add the PackInstallation entry. Version comes from v0's
         // pack_version if present; sentinel "0" for the imported case.
-        let version = meta
-            .pack_version
-            .clone()
-            .unwrap_or_else(|| "0".to_string());
+        let version = meta.pack_version.clone().unwrap_or_else(|| "0".to_string());
         meta.packs.push(PackInstallation {
             slug: dest_slug.clone(),
             version,
@@ -1094,10 +1074,7 @@ async fn migrate_profile_v0_to_v1(paths: &ProfilePaths) -> Result<()> {
 
 /// Read meta + auto-migrate if needed. Most callers use this rather
 /// than `read_meta` directly.
-async fn read_meta_migrated(
-    _layout: &StoreLayout,
-    paths: &ProfilePaths,
-) -> Result<ProfileMeta> {
+async fn read_meta_migrated(_layout: &StoreLayout, paths: &ProfilePaths) -> Result<ProfileMeta> {
     let meta = read_meta(paths).await?;
     if meta.schema_version >= PROFILE_SCHEMA_VERSION {
         return Ok(meta);
@@ -1248,8 +1225,7 @@ async fn remove_dir_all_safe(path: &Path) -> Result<()> {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("reading {}", dir.display()));
+                return Err(e).with_context(|| format!("reading {}", dir.display()));
             }
         };
         while let Some(entry) = rd
@@ -1287,8 +1263,7 @@ async fn remove_dir_all_safe(path: &Path) -> Result<()> {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("removing dir {}", d.display()));
+                return Err(e).with_context(|| format!("removing dir {}", d.display()));
             }
         }
     }

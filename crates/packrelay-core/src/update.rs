@@ -79,12 +79,14 @@ where
         raw: new_raw,
         manifest: new_manifest,
         key,
-    } = client.fetch_verified_manifest_at(slug, target_version).await?;
+    } = client
+        .fetch_verified_manifest_at(slug, target_version)
+        .await?;
     // Checked ahead of the no-op exit below, so installs from before
     // key pinning get their key pinned on the first update check. The
     // installed copy's signer only counts if it's this pack's sidecar.
-    let installed_key_id = (old_manifest.name == slug)
-        .then_some(old_manifest.signature.public_key_id.as_str());
+    let installed_key_id =
+        (old_manifest.name == slug).then_some(old_manifest.signature.public_key_id.as_str());
     ctx.check_signing_key(slug, &key, installed_key_id).await?;
 
     // No-op early exit when the catalog matches what's installed.

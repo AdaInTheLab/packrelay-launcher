@@ -106,10 +106,7 @@ pub async fn clear_stored_token(app: &AppHandle) -> Result<()> {
 /// an error the frontend can show inline next to the paste field.
 pub async fn validate_token(api_url: &str, token: &str) -> Result<MeResponse> {
     let http = reqwest::Client::builder()
-        .user_agent(format!(
-            "packrelay-launcher/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(format!("packrelay-launcher/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let url = format!("{api_url}/api/v1/me");
     let res = http
@@ -125,9 +122,6 @@ pub async fn validate_token(api_url: &str, token: &str) -> Result<MeResponse> {
     if !status.is_success() {
         anyhow::bail!("Token validation failed: HTTP {status}");
     }
-    let me: MeResponse = res
-        .json()
-        .await
-        .with_context(|| "parsing /me response")?;
+    let me: MeResponse = res.json().await.with_context(|| "parsing /me response")?;
     Ok(me)
 }

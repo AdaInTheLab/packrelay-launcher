@@ -51,10 +51,7 @@ pub struct UninstallFailure {
 /// doesn't restore the uninstalled pack. Profile deletes are
 /// best-effort — the user-visible report tracks the dest sweep,
 /// since that's what affects whether 7DTD will see the pack.
-pub async fn uninstall(
-    dest: &Path,
-    profile_mods: Option<&Path>,
-) -> Result<UninstallReport> {
+pub async fn uninstall(dest: &Path, profile_mods: Option<&Path>) -> Result<UninstallReport> {
     let sidecar = dest.join("_packrelay-manifest.json");
     let raw = fs::read_to_string(&sidecar)
         .await

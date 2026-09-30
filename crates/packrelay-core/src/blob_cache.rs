@@ -52,11 +52,7 @@ pub async fn has_blob(cache_root: &Path, sha256: &str) -> bool {
 ///
 /// Returns the blob's path in the cache. Idempotent: if the blob is
 /// already present we leave it alone.
-pub async fn add_blob_from_file(
-    cache_root: &Path,
-    sha256: &str,
-    source: &Path,
-) -> Result<PathBuf> {
+pub async fn add_blob_from_file(cache_root: &Path, sha256: &str, source: &Path) -> Result<PathBuf> {
     let target = blob_path(cache_root, sha256);
     if fs::metadata(&target).await.is_ok() {
         return Ok(target);
@@ -76,10 +72,7 @@ pub async fn add_blob_from_file(
 /// computed SHA-256 alongside the cached path. Use when the caller
 /// doesn't know the hash up front (e.g. discovering pre-existing
 /// files during "import current state as profile").
-pub async fn add_blob_unknown_hash(
-    cache_root: &Path,
-    source: &Path,
-) -> Result<(String, PathBuf)> {
+pub async fn add_blob_unknown_hash(cache_root: &Path, source: &Path) -> Result<(String, PathBuf)> {
     let mut file = fs::File::open(source)
         .await
         .with_context(|| format!("opening {}", source.display()))?;
@@ -105,17 +98,10 @@ pub async fn add_blob_unknown_hash(
 /// The target's parent dirs are created if missing. If the target
 /// already exists, it's replaced — install/repair/update flows
 /// expect overwrite semantics.
-pub async fn link_into(
-    cache_root: &Path,
-    sha256: &str,
-    target: &Path,
-) -> Result<()> {
+pub async fn link_into(cache_root: &Path, sha256: &str, target: &Path) -> Result<()> {
     let src = blob_path(cache_root, sha256);
     if !fs::metadata(&src).await.is_ok() {
-        anyhow::bail!(
-            "blob {sha256} not in cache at {}",
-            src.display()
-        );
+        anyhow::bail!("blob {sha256} not in cache at {}", src.display());
     }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
@@ -138,11 +124,9 @@ pub async fn link_into(
             // Cross-volume, FAT32 (no hard links), or some other
             // restriction. Plain copy is correct; we just lose
             // dedup for this file.
-            fs::copy(&src, target)
-                .await
-                .with_context(|| {
-                    format!("fallback-copy {} → {}", src.display(), target.display())
-                })?;
+            fs::copy(&src, target).await.with_context(|| {
+                format!("fallback-copy {} → {}", src.display(), target.display())
+            })?;
             Ok(())
         }
     }
@@ -159,11 +143,7 @@ pub async fn link_into(
 /// duplicate at `landed_at` and re-link from the canonical cache
 /// copy, ensuring the dest is always the hardlink (not the
 /// standalone copy).
-pub async fn promote_to_cache(
-    cache_root: &Path,
-    sha256: &str,
-    landed_at: &Path,
-) -> Result<()> {
+pub async fn promote_to_cache(cache_root: &Path, sha256: &str, landed_at: &Path) -> Result<()> {
     let target = blob_path(cache_root, sha256);
     if fs::metadata(&target).await.is_ok() {
         // Already cached. Replace landed_at with a hardlink to the
@@ -186,11 +166,9 @@ pub async fn promote_to_cache(
         Err(_) => {
             // Cross-volume: copy into cache. landed_at stays as its
             // own standalone file. Less efficient but correct.
-            fs::copy(landed_at, &target)
-                .await
-                .with_context(|| {
-                    format!("caching {} → {}", landed_at.display(), target.display())
-                })?;
+            fs::copy(landed_at, &target).await.with_context(|| {
+                format!("caching {} → {}", landed_at.display(), target.display())
+            })?;
             Ok(())
         }
     }
@@ -450,8 +428,13 @@ fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
     // we don't try to be lenient about timezones or sub-second
     // precision.
     let b = s.as_bytes();
-    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
-        || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
     {
         return None;
     }
@@ -594,11 +577,7 @@ async fn walk_blobs(cache_root: &Path) -> Result<Vec<(String, u64, PathBuf)>> {
             }
             let rest = blob_entry.file_name().to_string_lossy().to_string();
             let hash = format!("{prefix_name}{rest}").to_lowercase();
-            let size = blob_entry
-                .metadata()
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let size = blob_entry.metadata().await.map(|m| m.len()).unwrap_or(0);
             out.push((hash, size, blob_entry.path()));
         }
     }

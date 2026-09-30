@@ -19,16 +19,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::auth::{
-    clear_stored_token, load_stored_token, save_token, validate_token, AuthState,
-};
+use crate::auth::{clear_stored_token, load_stored_token, save_token, validate_token, AuthState};
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::key_pins::{KeyChanged, KeyPinStore, TrustedKey};
-use packrelay_core::profile::{
-    self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout,
-};
+use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::update::{update, UpdateReport};
 use packrelay_core::verify::{
@@ -256,8 +252,7 @@ fn default_install_dest() -> Option<String> {
 fn canonical_mods_path() -> Option<PathBuf> {
     // %APPDATA% is where 7DTD reads per-user mods from on Windows.
     // Concretely: C:\Users\<name>\AppData\Roaming\7DaysToDie\Mods
-    std::env::var_os("APPDATA")
-        .map(|appdata| Path::new(&appdata).join("7DaysToDie").join("Mods"))
+    std::env::var_os("APPDATA").map(|appdata| Path::new(&appdata).join("7DaysToDie").join("Mods"))
 }
 
 #[cfg(target_os = "macos")]
@@ -338,7 +333,10 @@ async fn list_servers() -> Result<Vec<CatalogServer>, String> {
         .await
         .map_err(|e| format!("network error: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("server catalog fetch failed: HTTP {}", resp.status()));
+        return Err(format!(
+            "server catalog fetch failed: HTTP {}",
+            resp.status()
+        ));
     }
     let body: ServersResponse = resp
         .json()
@@ -385,9 +383,7 @@ async fn install_pack(
         if let Some(meta) = profile::active_profile(&layout).await.ok().flatten() {
             if let Some(current_active) = meta.active_pack_slug.as_deref() {
                 if current_active != slug {
-                    if let Err(e) =
-                        profile::set_active_pack(&layout, &meta.id, None).await
-                    {
+                    if let Err(e) = profile::set_active_pack(&layout, &meta.id, None).await {
                         eprintln!(
                             "[install_pack] pre-install vanilla swap failed (non-fatal): {e:#}"
                         );
@@ -411,49 +407,56 @@ async fn install_pack(
 
     let mut ctx = build_install_context(&app).await?;
     ctx.trust_key = trust_key;
-    let report = install(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
-        let payload = match ev {
-            ProgressEvent::Started {
-                total_bytes,
-                file_count: fc,
-                ..
-            } => {
-                total_clone.store(total_bytes, Ordering::Relaxed);
-                file_count_clone.store(fc as u64, Ordering::Relaxed);
-                InstallProgressPayload {
-                    bytes_so_far: 0,
+    let report = install(
+        &client,
+        &slug,
+        &dest_path,
+        8,
+        version.as_deref(),
+        ctx,
+        move |ev: ProgressEvent| {
+            let payload = match ev {
+                ProgressEvent::Started {
                     total_bytes,
                     file_count: fc,
-                    last_completed_file: None,
+                    ..
+                } => {
+                    total_clone.store(total_bytes, Ordering::Relaxed);
+                    file_count_clone.store(fc as u64, Ordering::Relaxed);
+                    InstallProgressPayload {
+                        bytes_so_far: 0,
+                        total_bytes,
+                        file_count: fc,
+                        last_completed_file: None,
+                    }
                 }
-            }
-            ProgressEvent::Bytes { delta } => {
-                let new_total =
-                    bytes_clone.fetch_add(delta, Ordering::Relaxed) + delta;
-                InstallProgressPayload {
-                    bytes_so_far: new_total,
+                ProgressEvent::Bytes { delta } => {
+                    let new_total = bytes_clone.fetch_add(delta, Ordering::Relaxed) + delta;
+                    InstallProgressPayload {
+                        bytes_so_far: new_total,
+                        total_bytes: total_clone.load(Ordering::Relaxed),
+                        file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                        last_completed_file: None,
+                    }
+                }
+                ProgressEvent::FileDone { path } => InstallProgressPayload {
+                    bytes_so_far: bytes_clone.load(Ordering::Relaxed),
+                    total_bytes: total_clone.load(Ordering::Relaxed),
+                    file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                    last_completed_file: Some(path),
+                },
+                ProgressEvent::Done { .. } => InstallProgressPayload {
+                    bytes_so_far: total_clone.load(Ordering::Relaxed),
                     total_bytes: total_clone.load(Ordering::Relaxed),
                     file_count: file_count_clone.load(Ordering::Relaxed) as u32,
                     last_completed_file: None,
-                }
-            }
-            ProgressEvent::FileDone { path } => InstallProgressPayload {
-                bytes_so_far: bytes_clone.load(Ordering::Relaxed),
-                total_bytes: total_clone.load(Ordering::Relaxed),
-                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
-                last_completed_file: Some(path),
-            },
-            ProgressEvent::Done { .. } => InstallProgressPayload {
-                bytes_so_far: total_clone.load(Ordering::Relaxed),
-                total_bytes: total_clone.load(Ordering::Relaxed),
-                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
-                last_completed_file: None,
-            },
-        };
-        // Ignore emit errors — frontend may have closed the window
-        // mid-install; the install itself still completes on disk.
-        let _ = app_clone.emit("install://progress", payload);
-    })
+                },
+            };
+            // Ignore emit errors — frontend may have closed the window
+            // mid-install; the install itself still completes on disk.
+            let _ = app_clone.emit("install://progress", payload);
+        },
+    )
     .await?;
 
     // Best-effort: tell the active profile what pack lives here now.
@@ -500,47 +503,54 @@ async fn update_pack(
 
     let mut ctx = build_install_context(&app).await?;
     ctx.trust_key = trust_key;
-    let report = update(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
-        let payload = match ev {
-            ProgressEvent::Started {
-                total_bytes,
-                file_count: fc,
-                ..
-            } => {
-                total_clone.store(total_bytes, Ordering::Relaxed);
-                file_count_clone.store(fc as u64, Ordering::Relaxed);
-                InstallProgressPayload {
-                    bytes_so_far: 0,
+    let report = update(
+        &client,
+        &slug,
+        &dest_path,
+        8,
+        version.as_deref(),
+        ctx,
+        move |ev: ProgressEvent| {
+            let payload = match ev {
+                ProgressEvent::Started {
                     total_bytes,
                     file_count: fc,
-                    last_completed_file: None,
+                    ..
+                } => {
+                    total_clone.store(total_bytes, Ordering::Relaxed);
+                    file_count_clone.store(fc as u64, Ordering::Relaxed);
+                    InstallProgressPayload {
+                        bytes_so_far: 0,
+                        total_bytes,
+                        file_count: fc,
+                        last_completed_file: None,
+                    }
                 }
-            }
-            ProgressEvent::Bytes { delta } => {
-                let new_total =
-                    bytes_clone.fetch_add(delta, Ordering::Relaxed) + delta;
-                InstallProgressPayload {
-                    bytes_so_far: new_total,
+                ProgressEvent::Bytes { delta } => {
+                    let new_total = bytes_clone.fetch_add(delta, Ordering::Relaxed) + delta;
+                    InstallProgressPayload {
+                        bytes_so_far: new_total,
+                        total_bytes: total_clone.load(Ordering::Relaxed),
+                        file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                        last_completed_file: None,
+                    }
+                }
+                ProgressEvent::FileDone { path } => InstallProgressPayload {
+                    bytes_so_far: bytes_clone.load(Ordering::Relaxed),
+                    total_bytes: total_clone.load(Ordering::Relaxed),
+                    file_count: file_count_clone.load(Ordering::Relaxed) as u32,
+                    last_completed_file: Some(path),
+                },
+                ProgressEvent::Done { .. } => InstallProgressPayload {
+                    bytes_so_far: total_clone.load(Ordering::Relaxed),
                     total_bytes: total_clone.load(Ordering::Relaxed),
                     file_count: file_count_clone.load(Ordering::Relaxed) as u32,
                     last_completed_file: None,
-                }
-            }
-            ProgressEvent::FileDone { path } => InstallProgressPayload {
-                bytes_so_far: bytes_clone.load(Ordering::Relaxed),
-                total_bytes: total_clone.load(Ordering::Relaxed),
-                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
-                last_completed_file: Some(path),
-            },
-            ProgressEvent::Done { .. } => InstallProgressPayload {
-                bytes_so_far: total_clone.load(Ordering::Relaxed),
-                total_bytes: total_clone.load(Ordering::Relaxed),
-                file_count: file_count_clone.load(Ordering::Relaxed) as u32,
-                last_completed_file: None,
-            },
-        };
-        let _ = app_clone.emit("install://progress", payload);
-    })
+                },
+            };
+            let _ = app_clone.emit("install://progress", payload);
+        },
+    )
     .await?;
 
     // Update the profile's bound version to the new one.
@@ -725,10 +735,7 @@ async fn fetch_my_favorites(app: AppHandle) -> Result<MyFavorites, String> {
         return Err("Your token was rejected — sign in again.".to_string());
     }
     if !res.status().is_success() {
-        return Err(format!(
-            "fetching favorites failed: HTTP {}",
-            res.status()
-        ));
+        return Err(format!("fetching favorites failed: HTTP {}", res.status()));
     }
     res.json::<MyFavorites>()
         .await
@@ -753,10 +760,7 @@ async fn toggle_server_favorite(
     toggle_favorite_impl(&token, &format!("/api/v1/servers/{slug}/favorite")).await
 }
 
-async fn toggle_favorite_impl(
-    token: &str,
-    path: &str,
-) -> Result<FavoriteToggleResult, String> {
+async fn toggle_favorite_impl(token: &str, path: &str) -> Result<FavoriteToggleResult, String> {
     let http = reqwest::Client::builder()
         .user_agent(user_agent_string())
         .build()
@@ -981,10 +985,8 @@ pub fn reduce_to_dirs(manifest: &packrelay_core::manifest::Manifest) -> Vec<Pack
     // flavour on Windows-published packs (Zod doesn't normalize);
     // canonicalize before splitting so a backslash-in-path
     // doesn't end up as its own bogus "dir".
-    let mut by_dir: std::collections::HashMap<
-        String,
-        (u32, u64, Option<DirEntrySource>),
-    > = std::collections::HashMap::new();
+    let mut by_dir: std::collections::HashMap<String, (u32, u64, Option<DirEntrySource>)> =
+        std::collections::HashMap::new();
     let mut root_count: u32 = 0;
     let mut root_bytes: u64 = 0;
     let mut root_source: Option<DirEntrySource> = None;
@@ -1077,8 +1079,8 @@ async fn profile_initial_state(app: AppHandle) -> Result<ProfileInitialState, St
         // default_install_dest() to get Mods/ — we duplicate the
         // derivation here so the suggestion's always available
         // even if the frontend hasn't queried yet.
-        let suggested = canonical_mods_path()
-            .and_then(|p| p.parent().map(|x| x.display().to_string()));
+        let suggested =
+            canonical_mods_path().and_then(|p| p.parent().map(|x| x.display().to_string()));
         return Ok(ProfileInitialState::Uninitialized {
             suggested_userdata_dir: suggested,
         });
@@ -1153,11 +1155,7 @@ async fn profile_switch(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn profile_rename(
-    app: AppHandle,
-    id: String,
-    name: String,
-) -> Result<ProfileMeta, String> {
+async fn profile_rename(app: AppHandle, id: String, name: String) -> Result<ProfileMeta, String> {
     let trimmed = name.trim().to_string();
     if trimmed.is_empty() {
         return Err("Name is required.".to_string());
@@ -1239,11 +1237,7 @@ const BACKGROUND_GC_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const BACKGROUND_GC_STARTUP_DELAY_SECS: u64 = 60;
 
 #[tauri::command]
-async fn profile_clone(
-    app: AppHandle,
-    id: String,
-    name: String,
-) -> Result<ProfileMeta, String> {
+async fn profile_clone(app: AppHandle, id: String, name: String) -> Result<ProfileMeta, String> {
     let trimmed = name.trim().to_string();
     if trimmed.is_empty() {
         return Err("Name is required.".to_string());
@@ -1419,7 +1413,9 @@ fn try_spawn_seven_days(connect_address: &str) -> Result<(), String> {
     }
 
     // cwd matters — 7DTD looks for sibling _Data dir at startup.
-    let cwd = exe.parent().ok_or_else(|| "exe has no parent dir".to_string())?;
+    let cwd = exe
+        .parent()
+        .ok_or_else(|| "exe has no parent dir".to_string())?;
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.current_dir(cwd)
@@ -1546,9 +1542,7 @@ fn build_launch_url(connect_address: Option<&str>) -> String {
     // `steam://run/<appid>//<args>` — args go after the second
     // slash. The leading "// " keeps the args block syntactically
     // visible to Steam as a single field.
-    format!(
-        "steam://run/{SEVEN_DAYS_STEAM_APPID}//-connecttoip={host_enc}%20-connecttoport={port}"
-    )
+    format!("steam://run/{SEVEN_DAYS_STEAM_APPID}//-connecttoip={host_enc}%20-connecttoport={port}")
 }
 
 /// Split a `host[:port]` address into its parts. Defaults to
@@ -1574,9 +1568,9 @@ fn parse_connect_address(raw: &str) -> (String, u16) {
 fn is_safe_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
-        && host.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
-        })
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
 }
 
 /// Conservative percent-encoder: keeps unreserved URL chars,
@@ -1876,10 +1870,7 @@ mod tests {
         let out = resolve_source(&sources, &f).unwrap();
         assert_eq!(out.kind, "github");
         assert_eq!(out.label, "GitHub");
-        assert_eq!(
-            out.url.as_deref(),
-            Some("https://github.com/ada/foo-mod")
-        );
+        assert_eq!(out.url.as_deref(), Some("https://github.com/ada/foo-mod"));
     }
 
     #[test]
@@ -2009,10 +2000,7 @@ mod tests {
         // v1 manifests have no sources[] AND files have no
         // source_ref. The launcher should still produce the dir
         // list without crashing; just no source line in the render.
-        let manifest = build_manifest(
-            vec![],
-            vec![file("Mods/FooMod/ModInfo.xml", None)],
-        );
+        let manifest = build_manifest(vec![], vec![file("Mods/FooMod/ModInfo.xml", None)]);
         let dirs = reduce_to_dirs(&manifest);
         assert_eq!(dirs.len(), 1);
         assert!(dirs[0].source.is_none());
@@ -2020,10 +2008,7 @@ mod tests {
 
     #[test]
     fn reduce_to_dirs_normalizes_windows_backslash_paths() {
-        let manifest = build_manifest(
-            vec![],
-            vec![file("Mods\\FooMod\\ModInfo.xml", None)],
-        );
+        let manifest = build_manifest(vec![], vec![file("Mods\\FooMod\\ModInfo.xml", None)]);
         let dirs = reduce_to_dirs(&manifest);
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].name, "Mods");
@@ -2103,4 +2088,3 @@ mod tests {
         );
     }
 }
-

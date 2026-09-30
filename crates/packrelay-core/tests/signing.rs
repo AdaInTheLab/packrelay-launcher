@@ -69,7 +69,10 @@ fn tampered(raw: &str, edit: impl FnOnce(&mut Value)) -> String {
 
 fn assert_err_contains(result: anyhow::Result<()>, needle: &str) {
     let err = format!("{:#}", result.expect_err("expected an error"));
-    assert!(err.contains(needle), "error {err:?} should mention {needle:?}");
+    assert!(
+        err.contains(needle),
+        "error {err:?} should mention {needle:?}"
+    );
 }
 
 // ---- canonical JSON ----
@@ -120,7 +123,10 @@ fn tampered_file_entry_fails() {
     let raw = tampered(&f.manifests.v2, |m| {
         m["files"][1]["sha256"] = json!("f".repeat(64));
     });
-    assert_err_contains(check(&raw, &key(&f, &f.public_key)), "doesn't match publisher key");
+    assert_err_contains(
+        check(&raw, &key(&f, &f.public_key)),
+        "doesn't match publisher key",
+    );
 }
 
 #[test]
@@ -133,7 +139,10 @@ fn added_file_fails() {
             "size": 1,
         }));
     });
-    assert_err_contains(check(&raw, &key(&f, &f.public_key)), "doesn't match publisher key");
+    assert_err_contains(
+        check(&raw, &key(&f, &f.public_key)),
+        "doesn't match publisher key",
+    );
 }
 
 #[test]
@@ -144,7 +153,10 @@ fn tampered_field_the_launcher_does_not_model_fails() {
     let raw = tampered(&f.manifests.v2, |m| {
         m["sources"][1]["scanAttestation"]["scanner"] = json!("Totally Real AV");
     });
-    assert_err_contains(check(&raw, &key(&f, &f.public_key)), "doesn't match publisher key");
+    assert_err_contains(
+        check(&raw, &key(&f, &f.public_key)),
+        "doesn't match publisher key",
+    );
 }
 
 #[test]
@@ -250,7 +262,10 @@ async fn fetch_manifest_returns_verified_manifest() {
         key_route(&f),
     ])
     .await;
-    let (raw, manifest) = Client::new(&api).fetch_manifest("fixture-pack").await.unwrap();
+    let (raw, manifest) = Client::new(&api)
+        .fetch_manifest("fixture-pack")
+        .await
+        .unwrap();
     assert_eq!(raw, f.manifests.v2);
     assert_eq!(manifest.files.len(), 4);
 }

@@ -65,7 +65,10 @@ async fn cloud(f: &Fixture, manifest: &str) -> Client {
         )
     };
     let mut routes = vec![
-        (format!("/api/v1/packs/{SLUG}/manifest"), manifest.to_string()),
+        (
+            format!("/api/v1/packs/{SLUG}/manifest"),
+            manifest.to_string(),
+        ),
         key(&f.key_id, &f.public_key),
         key(&f.e2e.rotated_key_id, &f.e2e.rotated_public_key),
     ];
@@ -103,18 +106,34 @@ async fn first_install_pins_and_same_key_updates_pass() {
     let pins = KeyPinStore::in_dir(data.path());
 
     let client = cloud(&f, &f.e2e.manifests.v100).await;
-    install(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap();
+    install(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap();
     let pinned_keys = pins.pins_for(SLUG).await.unwrap();
     assert_eq!(pinned_keys.len(), 1);
     assert_eq!(pinned_keys[0].key_id, f.key_id);
     assert_eq!(pinned_keys[0].public_key, f.public_key);
 
     let client = cloud(&f, &f.e2e.manifests.v110).await;
-    let report = update(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap();
+    let report = update(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap();
     assert_eq!(report.to_version, "1.1.0");
     assert_eq!(pins.pins_for(SLUG).await.unwrap().len(), 1);
 }
@@ -126,15 +145,31 @@ async fn rotated_key_update_is_refused_until_the_player_trusts_it() {
     let pins = KeyPinStore::in_dir(data.path());
 
     let client = cloud(&f, &f.e2e.manifests.v100).await;
-    install(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap();
+    install(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap();
 
     // Signed by a key this pack has never used: refused, disk untouched.
     let client = cloud(&f, &f.e2e.manifests.v110_rotated).await;
-    let err = update(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap_err();
+    let err = update(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     let refusal = key_changed(err);
     assert_eq!(refusal.slug, SLUG);
     assert_eq!(
@@ -181,16 +216,32 @@ async fn pins_survive_uninstall_and_cover_fresh_installs() {
 
     let first = TempDir::new("dest");
     let client = cloud(&f, &f.e2e.manifests.v100).await;
-    install(&client, SLUG, first.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap();
+    install(
+        &client,
+        SLUG,
+        first.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap();
     drop(first); // the install dir is gone; the pin isn't
 
     let second = TempDir::new("dest");
     let client = cloud(&f, &f.e2e.manifests.v110_rotated).await;
-    let err = install(&client, SLUG, second.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap_err();
+    let err = install(
+        &client,
+        SLUG,
+        second.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     key_changed(err);
     assert!(!second.path().join("_packrelay-manifest.json").exists());
 }
@@ -202,17 +253,33 @@ async fn install_from_before_pinning_counts_its_signer_as_known() {
 
     // Installed by a launcher without key pinning.
     let client = cloud(&f, &f.e2e.manifests.v100).await;
-    install(&client, SLUG, dest.path(), 2, None, InstallContext::default(), |_| {})
-        .await
-        .unwrap();
+    install(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        InstallContext::default(),
+        |_| {},
+    )
+    .await
+    .unwrap();
 
     // First update with pinning on is signed by a different key than
     // the installed copy: that's a key change, not a first install.
     let pins = KeyPinStore::in_dir(data.path());
     let client = cloud(&f, &f.e2e.manifests.v110_rotated).await;
-    let err = update(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap_err();
+    let err = update(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     let refusal = key_changed(err);
     assert_eq!(
         refusal.trusted,
@@ -231,9 +298,17 @@ async fn approving_a_different_key_than_served_does_not_help() {
     let pins = KeyPinStore::in_dir(data.path());
 
     let client = cloud(&f, &f.e2e.manifests.v100).await;
-    install(&client, SLUG, dest.path(), 2, None, pinned(&pins, None), |_| {})
-        .await
-        .unwrap();
+    install(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, None),
+        |_| {},
+    )
+    .await
+    .unwrap();
 
     // The player approved the rotated key id, but with other bytes
     // (as if the cloud swapped keys between the prompt and the retry).
@@ -242,9 +317,17 @@ async fn approving_a_different_key_than_served_does_not_help() {
         public_key: f.public_key.clone(),
     };
     let client = cloud(&f, &f.e2e.manifests.v110_rotated).await;
-    let err = update(&client, SLUG, dest.path(), 2, None, pinned(&pins, Some(wrong)), |_| {})
-        .await
-        .unwrap_err();
+    let err = update(
+        &client,
+        SLUG,
+        dest.path(),
+        2,
+        None,
+        pinned(&pins, Some(wrong)),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
     key_changed(err);
     assert_eq!(installed_version(dest.path()), "1.0.0");
 }
