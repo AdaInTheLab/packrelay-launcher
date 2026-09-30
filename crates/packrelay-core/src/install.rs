@@ -51,10 +51,7 @@ pub enum ProgressEvent {
     FileDone { path: String },
     /// Sent once after every file has been verified and the sidecar
     /// manifest has been written.
-    Done {
-        file_count: u32,
-        total_bytes: u64,
-    },
+    Done { file_count: u32, total_bytes: u64 },
 }
 
 /// Summary returned from a successful install. The caller can render
@@ -142,11 +139,14 @@ where
         raw: manifest_raw,
         manifest,
         key,
-    } = client.fetch_verified_manifest_at(slug, target_version).await?;
+    } = client
+        .fetch_verified_manifest_at(slug, target_version)
+        .await?;
     // A reinstall over an existing copy counts that copy's signer as
     // already known, for installs from before key pinning.
     let installed = installed_key_id(dest, slug).await;
-    ctx.check_signing_key(slug, &key, installed.as_deref()).await?;
+    ctx.check_signing_key(slug, &key, installed.as_deref())
+        .await?;
 
     fs::create_dir_all(dest)
         .await
@@ -179,12 +179,7 @@ where
     // called from inside a Tauri command (HRTB error). Cloning the
     // file metadata up front is cheap; the file bytes are streamed
     // separately at download time.
-    let work: Vec<(usize, FileEntry)> = manifest
-        .files
-        .iter()
-        .cloned()
-        .enumerate()
-        .collect();
+    let work: Vec<(usize, FileEntry)> = manifest.files.iter().cloned().enumerate().collect();
 
     let results: Vec<Result<()>> = stream::iter(work.into_iter().map(|(idx, file)| {
         let http = http.clone();
@@ -302,10 +297,7 @@ where
             .await
             .with_context(|| format!("creating parent {}", parent.display()))?;
     }
-    let profile_target = ctx
-        .profile_mods
-        .as_ref()
-        .map(|root| root.join(&normalized));
+    let profile_target = ctx.profile_mods.as_ref().map(|root| root.join(&normalized));
 
     // Fast path: cache already has this blob. Link it into dest +
     // profile mirror without touching the network.
@@ -339,11 +331,7 @@ where
         .await
         .with_context(|| format!("GET {url}"))?;
     if !res.status().is_success() {
-        anyhow::bail!(
-            "download failed for {}: HTTP {}",
-            file.path,
-            res.status()
-        );
+        anyhow::bail!("download failed for {}: HTTP {}", file.path, res.status());
     }
 
     let mut hasher = Sha256::new();
@@ -356,9 +344,11 @@ where
     // for the multi-MB texture entries in real packs.
     let mut total: u64 = 0;
     let mut stream = res.bytes_stream();
-    while let Some(chunk) = stream.try_next().await.with_context(|| {
-        format!("reading {} from network", file.path)
-    })? {
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .with_context(|| format!("reading {} from network", file.path))?
+    {
         hasher.update(&chunk);
         out.write_all(&chunk).await?;
         total += chunk.len() as u64;
@@ -397,9 +387,7 @@ where
         if let Some(ptarget) = &profile_target {
             blob_cache::link_into(cache, &file.sha256, ptarget)
                 .await
-                .with_context(|| {
-                    format!("mirroring blob to profile for {}", file.path)
-                })?;
+                .with_context(|| format!("mirroring blob to profile for {}", file.path))?;
         }
     } else if let Some(ptarget) = &profile_target {
         // No cache — fall back to a direct copy into profile.

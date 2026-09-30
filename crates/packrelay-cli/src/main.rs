@@ -111,48 +111,56 @@ async fn run_install(
 
     // CLI defaults to latest — no --version flag yet. When/if the CLI
     // grows a pin/version arg, thread Some(&v) through here.
-    let report = install(client, slug, dest, concurrency, None, ctx, move |ev: ProgressEvent| {
-        match ev {
-            ProgressEvent::Started {
-                display_name,
-                version,
-                file_count,
-                total_bytes,
-            } => {
-                println!(
-                    "[install] manifest: {} v{} ({} files, {:.1} MB)",
+    let report = install(
+        client,
+        slug,
+        dest,
+        concurrency,
+        None,
+        ctx,
+        move |ev: ProgressEvent| {
+            match ev {
+                ProgressEvent::Started {
                     display_name,
                     version,
                     file_count,
-                    total_bytes as f64 / (1024.0 * 1024.0),
-                );
-                let pb = ProgressBar::new(total_bytes);
-                pb.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
+                    total_bytes,
+                } => {
+                    println!(
+                        "[install] manifest: {} v{} ({} files, {:.1} MB)",
+                        display_name,
+                        version,
+                        file_count,
+                        total_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                    let pb = ProgressBar::new(total_bytes);
+                    pb.set_style(
+                        ProgressStyle::with_template(
+                            "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
                          {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} eta {eta:>4}",
-                    )
-                    .unwrap()
-                    .progress_chars("##-"),
-                );
-                *bar_for_cb.lock().unwrap() = Some(pb);
-            }
-            ProgressEvent::Bytes { delta } => {
-                if let Some(pb) = bar_for_cb.lock().unwrap().as_ref() {
-                    pb.inc(delta);
+                        )
+                        .unwrap()
+                        .progress_chars("##-"),
+                    );
+                    *bar_for_cb.lock().unwrap() = Some(pb);
+                }
+                ProgressEvent::Bytes { delta } => {
+                    if let Some(pb) = bar_for_cb.lock().unwrap().as_ref() {
+                        pb.inc(delta);
+                    }
+                }
+                ProgressEvent::FileDone { .. } => {
+                    // No per-file CLI output — the byte counter is enough
+                    // signal. GUI uses these for the file list view.
+                }
+                ProgressEvent::Done { .. } => {
+                    if let Some(pb) = bar_for_cb.lock().unwrap().take() {
+                        pb.finish_and_clear();
+                    }
                 }
             }
-            ProgressEvent::FileDone { .. } => {
-                // No per-file CLI output — the byte counter is enough
-                // signal. GUI uses these for the file list view.
-            }
-            ProgressEvent::Done { .. } => {
-                if let Some(pb) = bar_for_cb.lock().unwrap().take() {
-                    pb.finish_and_clear();
-                }
-            }
-        }
-    })
+        },
+    )
     .await
     .map_err(|e| match e.downcast_ref::<KeyChanged>() {
         Some(change) => anyhow!(

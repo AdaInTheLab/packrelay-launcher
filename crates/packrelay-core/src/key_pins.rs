@@ -217,8 +217,7 @@ impl KeyPinStore {
             a.key_id == offered.key_id
                 && normalize_key(&a.public_key).is_ok_and(|k| k == offered.public_key)
         });
-        let first_use =
-            pins.is_empty() && installed_key_id.is_none_or(|id| id == offered.key_id);
+        let first_use = pins.is_empty() && installed_key_id.is_none_or(|id| id == offered.key_id);
         if !approved && !first_use {
             let trusted = if pins.is_empty() {
                 installed_key_id
@@ -244,14 +243,17 @@ impl KeyPinStore {
             .into());
         }
 
-        file.packs.entry(slug.to_string()).or_default().push(PinnedKey {
-            key_id: offered.key_id,
-            public_key: offered.public_key,
-            pinned_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default(),
-        });
+        file.packs
+            .entry(slug.to_string())
+            .or_default()
+            .push(PinnedKey {
+                key_id: offered.key_id,
+                public_key: offered.public_key,
+                pinned_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            });
         self.save(&file).await?;
         Ok(if approved {
             PinOutcome::PinnedApproved
@@ -322,7 +324,12 @@ pub async fn installed_key_id(dest: &Path, slug: &str) -> Option<String> {
     if value.get("name")?.as_str()? != slug {
         return None;
     }
-    Some(value.pointer("/signature/publicKeyId")?.as_str()?.to_string())
+    Some(
+        value
+            .pointer("/signature/publicKeyId")?
+            .as_str()?
+            .to_string(),
+    )
 }
 
 /// Re-encode as standard padded base64, so the same key always
@@ -386,16 +393,25 @@ mod tests {
         );
         let pinned = pins.pins_for("pack").await.unwrap();
         assert_eq!(pinned.len(), 1);
-        assert_eq!((pinned[0].key_id.as_str(), pinned[0].public_key.as_str()), ("pub/a", KEY_A));
+        assert_eq!(
+            (pinned[0].key_id.as_str(), pinned[0].public_key.as_str()),
+            ("pub/a", KEY_A)
+        );
     }
 
     #[tokio::test]
     async fn a_different_key_is_refused_until_approved() {
         let (_dir, pins) = store();
-        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None).await.unwrap();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
 
         let b = key("pub/b", KEY_B);
-        let refusal = key_changed(pins.check_and_pin("pack", &b, None, None).await.unwrap_err());
+        let refusal = key_changed(
+            pins.check_and_pin("pack", &b, None, None)
+                .await
+                .unwrap_err(),
+        );
         assert_eq!(refusal.offered, trusted("pub/b", KEY_B));
         assert_eq!(refusal.trusted[0].key_id, "pub/a");
         // Refusing doesn't pin anything.
@@ -419,17 +435,29 @@ mod tests {
     #[tokio::test]
     async fn approval_must_match_the_served_key_exactly() {
         let (_dir, pins) = store();
-        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None).await.unwrap();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
         let b = key("pub/b", KEY_B);
-        for approval in [trusted("pub/b", KEY_A), trusted("pub/other", KEY_B), trusted("pub/b", "junk")] {
-            key_changed(pins.check_and_pin("pack", &b, None, Some(&approval)).await.unwrap_err());
+        for approval in [
+            trusted("pub/b", KEY_A),
+            trusted("pub/other", KEY_B),
+            trusted("pub/b", "junk"),
+        ] {
+            key_changed(
+                pins.check_and_pin("pack", &b, None, Some(&approval))
+                    .await
+                    .unwrap_err(),
+            );
         }
     }
 
     #[tokio::test]
     async fn same_key_name_with_new_bytes_is_a_key_change() {
         let (_dir, pins) = store();
-        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None).await.unwrap();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
         let err = pins
             .check_and_pin("pack", &key("pub/a", KEY_B), None, None)
             .await
@@ -441,9 +469,13 @@ mod tests {
     #[tokio::test]
     async fn pins_are_per_pack() {
         let (_dir, pins) = store();
-        pins.check_and_pin("one", &key("pub/a", KEY_A), None, None).await.unwrap();
+        pins.check_and_pin("one", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
         assert_eq!(
-            pins.check_and_pin("two", &key("pub/b", KEY_B), None, None).await.unwrap(),
+            pins.check_and_pin("two", &key("pub/b", KEY_B), None, None)
+                .await
+                .unwrap(),
             PinOutcome::PinnedFirstUse
         );
     }
@@ -452,8 +484,11 @@ mod tests {
     async fn pre_pinning_install_signed_by_another_key_is_a_key_change() {
         let (_dir, pins) = store();
         let b = key("pub/b", KEY_B);
-        let refusal =
-            key_changed(pins.check_and_pin("pack", &b, Some("pub/a"), None).await.unwrap_err());
+        let refusal = key_changed(
+            pins.check_and_pin("pack", &b, Some("pub/a"), None)
+                .await
+                .unwrap_err(),
+        );
         assert_eq!(
             refusal.trusted,
             vec![KnownKey {
@@ -463,7 +498,9 @@ mod tests {
         );
         // Same key id as the installed copy: just pin it.
         assert_eq!(
-            pins.check_and_pin("pack", &b, Some("pub/b"), None).await.unwrap(),
+            pins.check_and_pin("pack", &b, Some("pub/b"), None)
+                .await
+                .unwrap(),
             PinOutcome::PinnedFirstUse
         );
     }

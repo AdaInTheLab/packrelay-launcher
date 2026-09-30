@@ -148,11 +148,7 @@ pub async fn run(dest: &Path) -> Result<()> {
 ///
 /// Returns a `RepairReport` summarizing what changed. If the pack
 /// was already healthy this is a fast no-op.
-pub async fn repair(
-    client: &Client,
-    dest: &Path,
-    ctx: InstallContext,
-) -> Result<RepairReport> {
+pub async fn repair(client: &Client, dest: &Path, ctx: InstallContext) -> Result<RepairReport> {
     let manifest = read_sidecar(dest).await?;
 
     // Identify what needs refetching. We rerun verify rather than
@@ -311,11 +307,7 @@ async fn check_file(path: &Path, expected_sha: &str, expected_size: u64) -> Resu
     let metadata = match fs::metadata(path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CheckError::Missing),
-        Err(e) => {
-            return Err(CheckError::Corrupt(format!(
-                "stat failed: {e}"
-            )))
-        }
+        Err(e) => return Err(CheckError::Corrupt(format!("stat failed: {e}"))),
     };
     if metadata.len() != expected_size {
         return Err(CheckError::Corrupt(format!(

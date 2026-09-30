@@ -28,10 +28,7 @@ pub struct VerifiedManifest {
 impl Client {
     pub fn new(api_url: &str) -> Self {
         let http = HttpClient::builder()
-            .user_agent(format!(
-                "packrelay-launcher/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("packrelay-launcher/{}", env!("CARGO_PKG_VERSION")))
             // Aggressive enough that a stalled CDN edge won't lock the
             // whole install up; gentle enough to ride out brief blips.
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -127,10 +124,7 @@ impl Client {
         if !res.status().is_success() {
             anyhow::bail!("Manifest fetch failed: HTTP {}", res.status());
         }
-        let raw = res
-            .text()
-            .await
-            .with_context(|| "reading manifest body")?;
+        let raw = res.text().await.with_context(|| "reading manifest body")?;
         let refusing = || format!("Refusing to install '{slug}'");
         let (value, manifest) = parse_manifest(&raw).with_context(refusing)?;
         let key = self
