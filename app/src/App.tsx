@@ -1363,6 +1363,7 @@ function App() {
         auth={auth}
         onSignOut={handleSignOut}
         updater={updater}
+        packBySlug={packBySlug}
       />
     );
   } else {
@@ -5263,9 +5264,12 @@ function SettingsView({
   auth,
   onSignOut,
   updater,
+  packBySlug,
 }: {
   auth: AuthState;
   onSignOut: () => void;
+  /** Catalog lookup, so trusted keys show pack names, not slugs. */
+  packBySlug: Map<string, CatalogPack>;
   /** Lifted update hook (App-level) -- so the "Check for updates"
    *  button below shares state with the AutoUpdate toast and the
    *  per-version dismiss memory. Single source of truth (#231). */
@@ -5313,6 +5317,188 @@ function SettingsView({
       </div>
 
       <CacheSection />
+
+      <TrustedKeysSection packBySlug={packBySlug} />
+    </div>
+  );
+}
+
+// Wire type for list_trusted_keys (Rust TrustedPackKeys / PinnedKey).
+// pinnedAt is seconds since the Unix epoch.
+type TrustedPackKeys = {
+  slug: string;
+  keys: { keyId: string; publicKey: string; pinnedAt: number }[];
+};
+
+// Settings card listing the signing keys the launcher trusts for each
+// pack (packrelay-core key_pins.rs), with a way to forget them. The
+// first install of a pack trusts the key that signed it; a version
+// signed by any other key stops at KeyChangedCard until the player
+// trusts that key too.
+function TrustedKeysSection({
+  packBySlug,
+}: {
+  packBySlug: Map<string, CatalogPack>;
+}) {
+  const [packs, setPacks] = useState<TrustedPackKeys[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // The row being forgotten: a slug for "forget all", or
+  // slug:keyId:publicKey for one key.
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setPacks(await invoke<TrustedPackKeys[]>("list_trusted_keys"));
+      setError(null);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function forget(pack: TrustedPackKeys, key: TrustedKey | null) {
+    const name = packBySlug.get(pack.slug)?.name ?? pack.slug;
+    // Forgetting a pack's last key resets it to a first install, so
+    // that case gets the same warning as "Forget all".
+    const wholePack = key === null || pack.keys.length === 1;
+    const message = wholePack
+      ? `Forget ${key ? `${key.keyId}, the only key trusted` : "every key trusted"} for ${name}?\n\n` +
+        `Its next install will trust whichever key signs it, like a first install. ` +
+        `If ${name} is still installed, a version signed by a different key than the ` +
+        `installed copy will still ask you first.`
+      : `Stop trusting ${key!.keyId} for ${name}?\n\n` +
+        `If a future version of ${name} is signed with this key, the launcher will ` +
+        `ask you again before installing it.`;
+    const ok = await ask(message, {
+      title: wholePack ? "Forget trusted keys" : "Forget trusted key",
+      kind: "warning",
+    });
+    if (!ok) return;
+    setBusy(key ? `${pack.slug}:${key.keyId}:${key.publicKey}` : pack.slug);
+    setError(null);
+    try {
+      await invoke<number>("forget_trusted_key", { slug: pack.slug, key });
+      await refresh();
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const forgetButton =
+    "shrink-0 inline-flex items-center px-2.5 py-1 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-status-danger)]/50 hover:text-[var(--color-status-danger)] disabled:opacity-40 disabled:cursor-not-allowed text-[var(--color-text-bright)]/85 text-[10px] tracking-[0.14em] uppercase transition-colors";
+
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1">
+        Trusted signing keys
+      </h2>
+      <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed mb-4">
+        The first time you install a pack, the launcher remembers the key
+        that signed it. If a later version is signed by a different key, it
+        stops and asks you before installing anything. Forget a key you no
+        longer trust, and you&apos;ll be asked again if it ever signs that
+        pack.
+      </p>
+
+      {packs === null && error === null && (
+        <div className="text-[11px] text-[var(--color-text-dim)]">
+          Reading trusted keys…
+        </div>
+      )}
+      {error && (
+        <div className="mb-3 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)]">
+          {error}
+        </div>
+      )}
+      {packs && packs.length === 0 && (
+        <div className="text-[11px] text-[var(--color-text-dim)]">
+          No trusted keys yet. Install a pack and the key that signed it
+          shows up here.
+        </div>
+      )}
+      {packs && packs.length > 0 && (
+        <ul className="space-y-3">
+          {packs.map((pack) => {
+            const name = packBySlug.get(pack.slug)?.name;
+            return (
+              <li
+                key={pack.slug}
+                className="rounded-md border border-[var(--color-bg-raised)] bg-[var(--color-bg-page)]/40 px-3 py-2.5"
+              >
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <div className="min-w-0 truncate text-sm text-[var(--color-text-bright)]">
+                    {name ?? pack.slug}
+                    {name && (
+                      <span className="ml-2 font-mono text-[10px] text-[var(--color-text-dim)]">
+                        {pack.slug}
+                      </span>
+                    )}
+                  </div>
+                  {pack.keys.length > 1 && (
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => void forget(pack, null)}
+                      className={forgetButton}
+                    >
+                      {busy === pack.slug ? "Forgetting…" : "Forget all"}
+                    </button>
+                  )}
+                </div>
+                <ul className="space-y-2">
+                  {pack.keys.map((k) => {
+                    const id = `${pack.slug}:${k.keyId}:${k.publicKey}`;
+                    return (
+                      <li
+                        key={id}
+                        className="flex items-start justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono text-xs text-[var(--color-text-bright)]">
+                            {k.keyId}
+                          </div>
+                          <div className="font-mono text-[10px] text-[var(--color-text-dim)] break-all select-text">
+                            {k.publicKey}
+                          </div>
+                          {k.pinnedAt > 0 && (
+                            <div
+                              className="text-[10px] text-[var(--color-text-dim)] mt-0.5"
+                              title={new Date(k.pinnedAt * 1000).toLocaleString()}
+                            >
+                              Trusted{" "}
+                              {formatRelativeTime(
+                                new Date(k.pinnedAt * 1000).toISOString()
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          disabled={busy !== null}
+                          onClick={() =>
+                            void forget(pack, {
+                              keyId: k.keyId,
+                              publicKey: k.publicKey,
+                            })
+                          }
+                          className={forgetButton}
+                        >
+                          {busy === id ? "Forgetting…" : "Forget"}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }

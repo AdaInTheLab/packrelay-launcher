@@ -178,6 +178,47 @@ impl KeyPinStore {
         Ok(self.load().await?.packs.remove(slug).unwrap_or_default())
     }
 
+    /// Every pinned key, by pack slug (sorted), oldest pin first.
+    pub async fn all_pins(&self) -> Result<BTreeMap<String, Vec<PinnedKey>>> {
+        let _guard = PIN_FILE_LOCK.lock().await;
+        Ok(self.load().await?.packs)
+    }
+
+    /// Stop trusting `key` for `slug`, or every key for `slug` when
+    /// `key` is None. Returns how many pins were removed (0 when
+    /// nothing matched, in which case the file isn't touched).
+    ///
+    /// Forgetting all of a pack's keys makes its next install a first
+    /// install again, trusting whichever key signs it. The installed
+    /// copy's signer still counts as known (see `check_and_pin`), so a
+    /// pack that's on disk still asks if its key has changed.
+    pub async fn forget(&self, slug: &str, key: Option<&TrustedKey>) -> Result<usize> {
+        let wanted = key
+            .map(|k| normalize_key(&k.public_key).map(|pk| (k.key_id.as_str(), pk)))
+            .transpose()?;
+
+        let _guard = PIN_FILE_LOCK.lock().await;
+        let mut file = self.load().await?;
+        let Some(pins) = file.packs.get_mut(slug) else {
+            return Ok(0);
+        };
+        let before = pins.len();
+        match &wanted {
+            Some((key_id, public_key)) => {
+                pins.retain(|p| !(p.key_id == *key_id && p.public_key == *public_key))
+            }
+            None => pins.clear(),
+        }
+        let removed = before - pins.len();
+        if pins.is_empty() {
+            file.packs.remove(slug);
+        }
+        if removed > 0 {
+            self.save(&file).await?;
+        }
+        Ok(removed)
+    }
+
     /// Check that `key` (the verified signer of a manifest for `slug`)
     /// is trusted for the pack, pinning it when this is the pack's
     /// first install or the player approved it.
@@ -517,6 +558,120 @@ mod tests {
         assert!(err.downcast_ref::<KeyChanged>().is_none());
         // And the broken file is left alone for the player to look at.
         assert_eq!(std::fs::read_to_string(pins.path()).unwrap(), "{ not json");
+    }
+
+    #[tokio::test]
+    async fn all_pins_lists_every_pack() {
+        let (_dir, pins) = store();
+        assert!(pins.all_pins().await.unwrap().is_empty());
+        pins.check_and_pin("two", &key("pub/b", KEY_B), None, None)
+            .await
+            .unwrap();
+        pins.check_and_pin("one", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
+        let all = pins.all_pins().await.unwrap();
+        assert_eq!(all.keys().collect::<Vec<_>>(), vec!["one", "two"]);
+        assert_eq!(all["one"][0].key_id, "pub/a");
+    }
+
+    #[tokio::test]
+    async fn forgetting_one_key_keeps_the_others_and_asks_again() {
+        let (_dir, pins) = store();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
+        pins.check_and_pin(
+            "pack",
+            &key("pub/b", KEY_B),
+            None,
+            Some(&trusted("pub/b", KEY_B)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pins.forget("pack", Some(&trusted("pub/b", KEY_B)))
+                .await
+                .unwrap(),
+            1
+        );
+        let left = pins.pins_for("pack").await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key_id, "pub/a");
+
+        // The forgotten key is a key change again, not trusted.
+        key_changed(
+            pins.check_and_pin("pack", &key("pub/b", KEY_B), None, None)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_matches_id_and_bytes() {
+        let (_dir, pins) = store();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
+        for other in [trusted("pub/a", KEY_B), trusted("pub/other", KEY_A)] {
+            assert_eq!(pins.forget("pack", Some(&other)).await.unwrap(), 0);
+        }
+        assert!(pins
+            .forget("pack", Some(&trusted("pub/a", "junk")))
+            .await
+            .is_err());
+        assert_eq!(pins.pins_for("pack").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_whole_pack_makes_the_next_install_a_first_install() {
+        let (_dir, pins) = store();
+        pins.check_and_pin("pack", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
+        pins.check_and_pin("other", &key("pub/a", KEY_A), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(pins.forget("pack", None).await.unwrap(), 1);
+        let all = pins.all_pins().await.unwrap();
+        assert!(
+            !all.contains_key("pack"),
+            "empty packs are dropped from the file"
+        );
+        assert!(all.contains_key("other"), "other packs are untouched");
+
+        assert_eq!(
+            pins.check_and_pin("pack", &key("pub/b", KEY_B), None, None)
+                .await
+                .unwrap(),
+            PinOutcome::PinnedFirstUse
+        );
+        // Unless the pack is still on disk, signed by another key.
+        pins.forget("pack", None).await.unwrap();
+        key_changed(
+            pins.check_and_pin("pack", &key("pub/b", KEY_B), Some("pub/a"), None)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_nothing_leaves_the_file_alone() {
+        let (_dir, pins) = store();
+        assert_eq!(pins.forget("pack", None).await.unwrap(), 0);
+        assert!(
+            !pins.path().exists(),
+            "no file is created by a no-op forget"
+        );
+
+        std::fs::write(pins.path(), "{ not json").unwrap();
+        assert!(
+            pins.forget("pack", None).await.is_err(),
+            "unreadable file fails closed"
+        );
+        assert!(pins.all_pins().await.is_err());
     }
 
     #[test]
