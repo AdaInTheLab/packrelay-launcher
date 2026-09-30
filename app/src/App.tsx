@@ -47,6 +47,16 @@ const GAME_NAMES: Record<string, string> = {
   valheim: "Valheim",
 };
 const gameName = (id: string | undefined) => GAME_NAMES[id ?? "7d2d"] ?? id ?? "7 Days to Die";
+/** Short names, for buttons and tight copy ("Launch 7DTD"). */
+const GAME_SHORT: Record<string, string> = { "7d2d": "7DTD", valheim: "Valheim" };
+const gameShort = (id: string | undefined) => GAME_SHORT[id ?? "7d2d"] ?? gameName(id);
+/** Where each game's own direct-connect lives, for the manual fallback. */
+const CONNECT_MENU: Record<string, string> = {
+  "7d2d": "Join a Game → Connect to IP",
+  valheim: "Join Game → Join IP",
+};
+const connectMenu = (id: string | undefined) =>
+  CONNECT_MENU[id ?? "7d2d"] ?? "the game's direct-connect";
 
 // Mirrors the Rust CatalogServer struct.
 type AttachedPack = {
@@ -2634,7 +2644,7 @@ function BrowseView({
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Browse packs</h1>
           <p className="text-xs text-[var(--color-text-dim)] mt-1">
-            Click a pack to install it into your 7DTD Mods/ directory.
+            Click a pack to install it into your game.
           </p>
         </div>
         <div className="text-[11px] text-[var(--color-text-dim)] tabular-nums">
@@ -3329,7 +3339,7 @@ function InstallView({
               {connectAddress && (
                 <div className="rounded-md border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/10 px-4 py-3">
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
-                    Now connect in 7DTD
+                    Now connect in {gameShort(pack.game)}
                   </div>
                   <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
                 </div>
@@ -3353,7 +3363,7 @@ function InstallView({
               {connectAddress && (
                 <div className="rounded-md border border-[var(--color-accent-soft)]/40 bg-[var(--color-accent)]/10 px-4 py-3">
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
-                    Now connect in 7DTD
+                    Now connect in {gameShort(pack.game)}
                   </div>
                   <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
                 </div>
@@ -4659,7 +4669,7 @@ function ServerDetailView({
                 <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
                   {installState === "needs-update"
                     ? "Smart update only refetches the changed files. We'll surface the direct-connect address when it lands."
-                    : "We'll lay down the pack files, then surface the direct-connect address so you can paste it into the 7DTD launcher."}
+                    : `We'll lay down the pack files, then surface the direct-connect address so you can paste it into ${gameShort(server.game)}.`}
                 </p>
               </>
             )}
@@ -4956,7 +4966,7 @@ function ConnectButton({
       </button>
       {state.kind === "idle" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Launches 7DTD and joins this server. If the auto-connect
+          Launches {gameShort(game)} and joins this server. If the auto-connect
           drops you on the main menu, the address is on your
           clipboard for a manual paste.
         </p>
@@ -4968,17 +4978,17 @@ function ConnectButton({
       )}
       {state.kind === "launched" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          7DTD is launching with the connect args. If the menu
+          {gameShort(game)} is launching with the connect args. If the menu
           loads instead of the server, paste the address into{" "}
           <span className="text-[var(--color-text-bright)]">
-            Join a Game → Connect to IP
+            {connectMenu(game)}
           </span>
           .
         </p>
       )}
       {state.kind === "error" && (
         <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed break-words">
-          Couldn&apos;t launch 7DTD: {state.message}. Address is on
+          Couldn&apos;t launch {gameShort(game)}: {state.message}. Address is on
           your clipboard for a manual launch.
         </p>
       )}
@@ -5042,7 +5052,7 @@ function LaunchPanel({
         disabled={state.kind === "launching"}
         className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
       >
-        {state.kind === "launching" ? "Opening Steam…" : "Launch 7DTD"}
+        {state.kind === "launching" ? "Opening Steam…" : `Launch ${gameShort(game)}`}
       </button>
       {state.kind === "launched" && state.note && (
         <p className="text-[11px] text-[var(--color-accent-soft)] leading-relaxed">
@@ -5051,21 +5061,21 @@ function LaunchPanel({
       )}
       {state.kind === "launched" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Steam is launching 7DTD with the connect args. If it lands
+          Steam is launching {gameShort(game)} with the connect args. If it lands
           on the main menu instead, the address is on your clipboard —
-          paste it into <span className="text-[var(--color-text-bright)]">Join a Game → Connect to IP</span>.
+          paste it into <span className="text-[var(--color-text-bright)]">{connectMenu(game)}</span>.
         </p>
       )}
       {state.kind === "error" && (
         <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed">
           Couldn&apos;t open Steam: {state.message}. The address is
-          still on your clipboard — launch 7DTD manually and paste it
-          into Join a Game.
+          still on your clipboard — launch {gameShort(game)} manually and paste it
+          into {connectMenu(game)}.
         </p>
       )}
       {state.kind === "idle" && (
         <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Asks Steam to launch 7DTD and connect to this server. If
+          Asks Steam to launch {gameShort(game)} and connect to this server. If
           Steam strips the connect args the address is on your
           clipboard for a manual paste.
         </p>
@@ -5146,11 +5156,11 @@ function DashboardView({
               Connect · Sync · Survive
             </div>
             <h2 className="text-xl font-semibold tracking-tight mb-2 text-[var(--color-text-bright)]">
-              Signed pack delivery for 7DTD.
+              Signed pack delivery for 7DTD and Valheim.
             </h2>
             <p className="text-sm text-[var(--color-text-dim)] leading-relaxed max-w-md mb-5">
               Browse a catalog of community-built modpacks, install
-              into your Mods/ directory in one click, and jump into a
+              into your game in one click, and jump into a
               server with the connect address already on your
               clipboard.
             </p>
