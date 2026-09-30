@@ -49,6 +49,11 @@ impl Client {
         format!("{}/api/v1/files/{}", self.api_url, sha256)
     }
 
+    /// A game's mod loader, as the cloud re-hosts it (framework.rs).
+    pub fn framework_url(&self, id: &str, version: &str) -> String {
+        format!("{}/api/v1/frameworks/{}/{}", self.api_url, id, version)
+    }
+
     /// Fetch the latest signed manifest for a pack slug. Returns both
     /// the typed manifest and the raw JSON bytes — the raw bytes are
     /// what we save to disk for the sidecar, so the signature can be

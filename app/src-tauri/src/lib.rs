@@ -22,7 +22,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::auth::{clear_stored_token, load_stored_token, save_token, validate_token, AuthState};
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
-use packrelay_core::games::{GAMES, SEVEN_DAYS};
+use packrelay_core::games::{GameLayout, GAMES, SEVEN_DAYS};
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::key_pins::{KeyChanged, KeyPinStore, PinnedKey, TrustedKey};
 use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
@@ -31,6 +31,7 @@ use packrelay_core::update::{update, UpdateReport};
 use packrelay_core::verify::{
     presence_check, repair, verify, PresenceReport, RepairReport, VerifyReport,
 };
+use packrelay_core::{launch, steam};
 
 /// How many pre-launch snapshots we keep per profile before
 /// pruning the oldest. User-tweakable in a future settings panel;
@@ -166,11 +167,6 @@ async fn active_pack_mods_dir(layout: &StoreLayout) -> Option<PathBuf> {
     let profile_paths = profile::ProfilePaths::from_root(&layout.profile_dir(&m.id));
     Some(profile_paths.pack_paths(active_slug).mods)
 }
-
-/// Steam app id for 7 Days to Die. Encoded in the launch URI so
-/// Steam handles install-validation/family-share/already-running
-/// for us — we don't try to locate the binary ourselves.
-const SEVEN_DAYS_STEAM_APPID: u32 = 251570;
 
 /// The frontend always talks to packrelay.cloud unless we override
 /// for local dev. Wrapped in a single constant so a future "switch
@@ -1358,11 +1354,6 @@ async fn profile_restore_snapshot(
         .map_err(|e| format!("{e:#}"))
 }
 
-/// Default 7DTD client port. Used when a server's `connectAddress`
-/// is just an IP / hostname with no port — every documented 7DTD
-/// server install binds 26900 by default.
-const SEVEN_DAYS_DEFAULT_PORT: u16 = 26900;
-
 /// Open 7DTD via the Steam protocol. If `connect_address` is
 /// provided (server-browse one-click-join flow), we ride Steam's
 /// `steam://run/<appid>//<args>` form to pass
@@ -1427,7 +1418,7 @@ async fn launch_game(
     // address — bare-launch goes through Steam so the user lands
     // on the main menu with Steam's launch flow intact.
     if let Some(addr) = connect_address.as_deref() {
-        match try_spawn_seven_days(addr) {
+        match try_spawn(&SEVEN_DAYS, addr) {
             Ok(()) => return Ok(alignment),
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
@@ -1435,7 +1426,7 @@ async fn launch_game(
         }
     }
 
-    let url = build_launch_url(connect_address.as_deref());
+    let url = launch::steam_url(&SEVEN_DAYS, connect_address.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("failed to launch 7DTD via Steam: {e}"))?;
@@ -1449,41 +1440,38 @@ struct ServerPack {
     slug: Option<String>,
 }
 
-/// Try to spawn 7DaysToDie.exe directly with `-connecttoip` /
-/// `-connecttoport`. Direct spawn dodges Steam URI's habit of
-/// silently stripping args — we hand the game its arg vector and
-/// the OS, not Steam's URI parser, decides what reaches it.
+/// Try to spawn the game's client directly with its connect args
+/// (launch::connect_args: 7DTD's `-connecttoip`/`-connecttoport`,
+/// Valheim's `+connect host:port`). Direct spawn dodges Steam URI's
+/// habit of silently stripping args -- we hand the game its arg vector
+/// and the OS, not Steam's URI parser, decides what reaches it.
 ///
 /// Returns Ok(()) if the spawn succeeded (the game is now its own
 /// process; we don't wait on it). Returns Err with a message if
-/// we couldn't find the exe or the spawn itself failed — caller
+/// we couldn't find the exe or the spawn itself failed -- caller
 /// then falls back to the Steam URI path.
 ///
 /// Steam still needs to be running for the client's session
 /// validation; in the common case Steam was the thing that
-/// installed 7DTD so it's already up. If not the user sees
-/// 7DTD's own "Steam is required" prompt rather than us
+/// installed the game so it's already up. If not the user sees
+/// the game's own "Steam is required" prompt rather than us
 /// silently failing.
-fn try_spawn_seven_days(connect_address: &str) -> Result<(), String> {
-    let Some(exe) = find_seven_days_exe() else {
+fn try_spawn(game: &GameLayout, connect_address: &str) -> Result<(), String> {
+    let Some(install) = find_game_install(game) else {
         return Err("client install not located".to_string());
     };
-    let (host, port) = parse_connect_address(connect_address);
-    if host.is_empty() || !is_safe_host(&host) {
+    let (host, port) = launch::parse_connect_address(game, connect_address);
+    if !launch::is_safe_host(&host) {
         return Err("connect address didn't pass safety check".to_string());
     }
 
-    // cwd matters — 7DTD looks for sibling _Data dir at startup.
-    let cwd = exe
-        .parent()
-        .ok_or_else(|| "exe has no parent dir".to_string())?;
+    // cwd matters -- 7DTD looks for its sibling _Data dir at startup,
+    // and Valheim's BepInEx loader resolves from the game folder.
+    let mut cmd = std::process::Command::new(install.join(game.exe));
+    cmd.current_dir(&install)
+        .args(launch::connect_args(game, &host, port));
 
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.current_dir(cwd)
-        .arg(format!("-connecttoip={host}"))
-        .arg(format!("-connecttoport={port}"));
-
-    // Detach the child so closing the launcher doesn't take 7DTD
+    // Detach the child so closing the launcher doesn't take the game
     // down with it. On Windows DETACHED_PROCESS gives the child
     // no console; CREATE_NEW_PROCESS_GROUP keeps Ctrl-C in the
     // parent from propagating.
@@ -1498,157 +1486,49 @@ fn try_spawn_seven_days(connect_address: &str) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| format!("spawn: {e}"))
 }
 
-/// Locate 7DaysToDie.exe by walking every Steam library on the
-/// machine. Steam stores library paths in
-/// `<steam>/steamapps/libraryfolders.vdf`; we parse it loosely
-/// (find every `"path" "<value>"` entry) and probe the canonical
-/// `steamapps/common/7 Days To Die/7DaysToDie.exe` subpath in
-/// each. Returns the first hit.
+/// Locate the game's install by walking every Steam library on the
+/// machine (steam::find_install reads each library's app manifest).
 ///
-/// We don't cache the result — call sites fire on user click
+/// We don't cache the result -- call sites fire on user click
 /// (rare), and an install can move between calls (e.g. Steam
 /// rebalances libraries). The whole probe is a few stats; cheap.
-fn find_seven_days_exe() -> Option<PathBuf> {
-    let mut steam_roots: Vec<PathBuf> = Vec::new();
+fn find_game_install(game: &GameLayout) -> Option<PathBuf> {
+    steam::find_install(game, &steam::steam_libraries(&steam_roots()))
+}
+
+/// Where Steam is installed: the path Steam records in the registry
+/// (HKCU\Software\Valve\Steam SteamPath), then the default Program
+/// Files locations.
+fn steam_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if let Ok(out) = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(path) = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("SteamPath"))
+                .and_then(|l| l.split("REG_SZ").nth(1))
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                roots.push(PathBuf::from(path));
+            }
+        }
+    }
     if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
-        steam_roots.push(PathBuf::from(pf86).join("Steam"));
+        roots.push(PathBuf::from(pf86).join("Steam"));
     }
     if let Some(pf) = std::env::var_os("ProgramFiles") {
-        steam_roots.push(PathBuf::from(pf).join("Steam"));
+        roots.push(PathBuf::from(pf).join("Steam"));
     }
-
-    let mut libraries: Vec<PathBuf> = Vec::new();
-    for root in &steam_roots {
-        // Default Steam install also IS a library — include it
-        // even if libraryfolders.vdf doesn't list it.
-        libraries.push(root.clone());
-        let vdf = root.join("steamapps").join("libraryfolders.vdf");
-        if let Ok(raw) = std::fs::read_to_string(&vdf) {
-            libraries.extend(parse_vdf_library_paths(&raw));
-        }
-    }
-
-    // Dedup with a HashSet so a path that appears in multiple
-    // Steam VDFs isn't probed twice.
-    let mut seen = std::collections::HashSet::new();
-    for lib in libraries {
-        if !seen.insert(lib.clone()) {
-            continue;
-        }
-        let exe = lib
-            .join("steamapps")
-            .join("common")
-            .join("7 Days To Die")
-            .join("7DaysToDie.exe");
-        if exe.exists() {
-            return Some(exe);
-        }
-    }
-    None
-}
-
-/// Pull every `"path" "<value>"` quoted-string pair out of a
-/// libraryfolders.vdf. We don't try to fully parse the Valve
-/// KeyValues format — only the path entries matter, and they
-/// always sit on a single line in the format Steam writes.
-fn parse_vdf_library_paths(raw: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        // Each library entry has `"path"   "<value>"` on its own
-        // line — be tolerant about the variable whitespace between
-        // the key and value, and accept the rare uppercase key
-        // that older Steam versions wrote.
-        let Some(rest) = line
-            .strip_prefix("\"path\"")
-            .or_else(|| line.strip_prefix("\"Path\""))
-        else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        // VDF escapes backslashes — "C:\\Program Files\\Steam".
-        // Unescape so the resulting PathBuf round-trips back to
-        // a usable Windows path.
-        let unescaped = rest[..end].replace("\\\\", "\\");
-        out.push(PathBuf::from(unescaped));
-    }
-    out
-}
-
-/// Build the Steam URI we open to launch 7DTD. Without a connect
-/// address we use the bare `rungameid` form (no args). With one,
-/// we parse `<host>[:<port>]` and pass `-connecttoip` /
-/// `-connecttoport` via Steam's `steam://run/<appid>//<args>`
-/// form. Args are space-separated inside the URI; Steam decodes
-/// percent-encoding before handing them to the game.
-fn build_launch_url(connect_address: Option<&str>) -> String {
-    let bare = format!("steam://rungameid/{SEVEN_DAYS_STEAM_APPID}");
-    let Some(raw) = connect_address.map(str::trim).filter(|s| !s.is_empty()) else {
-        return bare;
-    };
-    let (host, port) = parse_connect_address(raw);
-    // Refuse to forward anything that isn't a plausible host —
-    // belt-and-suspenders against a malformed catalog entry
-    // smuggling shell-like content into the Steam URI.
-    if host.is_empty() || !is_safe_host(&host) {
-        return bare;
-    }
-    let host_enc = percent_encode_arg(&host);
-    // `steam://run/<appid>//<args>` — args go after the second
-    // slash. The leading "// " keeps the args block syntactically
-    // visible to Steam as a single field.
-    format!("steam://run/{SEVEN_DAYS_STEAM_APPID}//-connecttoip={host_enc}%20-connecttoport={port}")
-}
-
-/// Split a `host[:port]` address into its parts. Defaults to
-/// 26900 when the port is missing. We split on the LAST colon so
-/// IPv6 literals (which contain multiple colons) survive — though
-/// 7DTD's connect args don't actually support IPv6 today, so
-/// IPv6-only addresses will fail at the game side and the user
-/// falls back to clipboard paste.
-fn parse_connect_address(raw: &str) -> (String, u16) {
-    match raw.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port = port_str.parse::<u16>().unwrap_or(SEVEN_DAYS_DEFAULT_PORT);
-            (host.trim().to_string(), port)
-        }
-        None => (raw.trim().to_string(), SEVEN_DAYS_DEFAULT_PORT),
-    }
-}
-
-/// Plausibility check: ASCII letters, digits, `.`, `-`, `:` (for
-/// IPv6 in brackets if we ever support it). Rejects spaces,
-/// quotes, command separators — anything that could escape the
-/// Steam URI into shell-like territory.
-fn is_safe_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-}
-
-/// Conservative percent-encoder: keeps unreserved URL chars,
-/// escapes everything else. We only call this on a host that's
-/// already passed `is_safe_host`, so the encoded output is
-/// effectively a no-op except for the rare case of square
-/// brackets in IPv6 literals.
-fn percent_encode_arg(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    roots
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1815,6 +1695,9 @@ mod tests {
             asset_name: None,
             mod_slug: None,
             upstream_url: None,
+            community: None,
+            namespace: None,
+            name: None,
         }
     }
 
@@ -1832,6 +1715,9 @@ mod tests {
             asset_name: Some("mod.zip".to_string()),
             mod_slug: None,
             upstream_url: None,
+            community: None,
+            namespace: None,
+            name: None,
         }
     }
 
@@ -1849,6 +1735,9 @@ mod tests {
             asset_name: None,
             mod_slug: None,
             upstream_url: None,
+            community: None,
+            namespace: None,
+            name: None,
         }
     }
 
@@ -1875,6 +1764,7 @@ mod tests {
             description: None,
             tags: vec![],
             sources,
+            framework: None,
             files,
             signature: Signature {
                 algo: "ed25519".to_string(),
@@ -2001,6 +1891,9 @@ mod tests {
             asset_name: None,
             mod_slug: None,
             upstream_url: None,
+            community: None,
+            namespace: None,
+            name: None,
         };
         let sources = vec![src];
         let f = file("Mods/Foo/ModInfo.xml", Some("future-1"));

@@ -130,18 +130,61 @@ const v1 = signManifest({
   files: [{ path: "Mods/Old/ModInfo.xml", sha256: sha("5"), size: 99 }],
 });
 
-// Validly signed, but for a game the cloud (and launcher) don't
-// support yet. parseManifest would reject it, so it's stored as-is.
+// Validly signed, but for a game neither the cloud nor the launcher
+// knows. parseManifest would reject it, so it's stored as-is.
 const otherGame = signManifest({
+  schemaVersion: 3,
+  name: "fixture-minecraft",
+  displayName: "Fixture Minecraft",
+  version: "1.0.0",
+  game: "minecraft",
+  gameVersion: "1.21",
+  publisher: "Fixture Publisher",
+  publishedAt: "2026-09-30T12:00:00Z",
+  files: [{ path: "mods/x.jar", sha256: sha("6"), size: 10 }],
+});
+
+// Validly signed, v2, claiming Valheim: v1 and v2 are 7DTD-only, so
+// the cloud rejects it and it's stored as-is.
+const v2Valheim = signManifest({
   schemaVersion: 2,
+  name: "fixture-v2-valheim",
+  displayName: "Fixture v2 Valheim",
+  version: "1.0.0",
+  game: "valheim",
+  gameVersion: "0.220.5",
+  publisher: "Fixture Publisher",
+  publishedAt: "2026-09-30T12:00:00Z",
+  files: [{ path: "plugins/x.dll", sha256: sha("6"), size: 10 }],
+});
+
+// A v3 Valheim pack exactly as the cloud accepts it: a Thunderstore
+// source, BepInEx as its framework, paths relative to BepInEx/.
+const v3Valheim = signManifest({
+  schemaVersion: 3,
   name: "fixture-valheim",
   displayName: "Fixture Valheim",
   version: "1.0.0",
   game: "valheim",
-  gameVersion: "0.219",
+  gameVersion: "0.220.5",
+  framework: { id: "bepinexpack-valheim", version: "5.4.2333" },
   publisher: "Fixture Publisher",
   publishedAt: "2026-09-30T12:00:00Z",
-  files: [{ path: "BepInEx/plugins/x.dll", sha256: sha("6"), size: 10 }],
+  sources: [
+    {
+      id: "ts-jotunn",
+      source: "thunderstore",
+      community: "valheim",
+      namespace: "ValheimModding",
+      name: "Jotunn",
+      version: "2.29.2",
+      sha256: sha("b"),
+    },
+  ],
+  files: [
+    { path: "plugins/ValheimModding-Jotunn/Jotunn.dll", sha256: sha("7"), size: 796116, sourceRef: "ts-jotunn" },
+    { path: "config/com.jotunn.jotunn.cfg", sha256: sha("8"), size: 120, sourceRef: "ts-jotunn" },
+  ],
 });
 
 // Canonical-JSON cross-check cases. Keys cover UTF-16 vs code-point
@@ -210,6 +253,8 @@ const fixture = {
     v2: await stored(v2),
     v1: await stored(v1),
     otherGame: JSON.stringify(otherGame),
+    v2Valheim: JSON.stringify(v2Valheim),
+    v3Valheim: await stored(v3Valheim),
   },
   canonical: canonicalInputs.map((input) => ({ input, canonical: canonicalize(input) })),
   e2e: {

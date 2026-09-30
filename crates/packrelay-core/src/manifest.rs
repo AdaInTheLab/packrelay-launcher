@@ -12,39 +12,50 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Manifest schema versions this launcher understands. Matches the
-/// cloud's discriminated union in parseManifest().
-pub const SUPPORTED_SCHEMA_VERSIONS: [u64; 2] = [1, 2];
+use crate::games::{game_by_id, GameLayout, SEVEN_DAYS};
 
-/// The only game this launcher installs into (7 Days to Die). Packs
-/// for anything else would land in 7DTD's Mods folder.
-pub const SUPPORTED_GAME: &str = "7d2d";
+/// Manifest schema versions this launcher understands. Matches the
+/// cloud's discriminated union in parseManifest(). v1 and v2 are 7DTD
+/// only; v3 is multi-game (PackRelayCloud docs/multi-game/DESIGN.md §4.1).
+pub const SUPPORTED_SCHEMA_VERSIONS: [u64; 3] = [1, 2, 3];
 
 /// Parse manifest JSON as served by the cloud, refusing schema
-/// versions and games this launcher doesn't support. Returns the raw
-/// JSON value (what the signature covers) alongside the typed view.
+/// versions and games this launcher doesn't support: a game must be one
+/// games.rs has a layout for (a pack for anything else would be written
+/// into some other game's folder), and a v1/v2 manifest must be 7DTD's,
+/// as the cloud guarantees. Returns the raw JSON value (what the
+/// signature covers) alongside the typed view.
 ///
 /// This does NOT check the signature — see
 /// `signature::verify_manifest_signature`, which `Client::
 /// fetch_manifest_at` runs on the result.
 pub fn parse_manifest(raw: &str) -> Result<(Value, Manifest)> {
     let value: Value = serde_json::from_str(raw).context("parsing manifest JSON")?;
-    match value.get("schemaVersion").and_then(Value::as_u64) {
-        Some(v) if SUPPORTED_SCHEMA_VERSIONS.contains(&v) => {}
+    let schema = match value.get("schemaVersion").and_then(Value::as_u64) {
+        Some(v) if SUPPORTED_SCHEMA_VERSIONS.contains(&v) => v,
         Some(v) => bail!(
             "this pack uses manifest schema version {v}, which this launcher \
              version doesn't support. Update the launcher and try again."
         ),
         None => bail!("manifest has no valid schemaVersion"),
-    }
-    match value.get("game").and_then(Value::as_str) {
-        Some(SUPPORTED_GAME) => {}
-        Some(game) => {
-            // Untrusted text going into a user-facing message; keep it short.
-            let game: String = game.chars().take(60).collect();
-            bail!("this pack is for {game}, which this launcher version doesn't support")
-        }
+    };
+    let game = match value.get("game").and_then(Value::as_str) {
+        Some(id) => match game_by_id(id) {
+            Some(game) => game,
+            None => {
+                // Untrusted text going into a user-facing message; keep it short.
+                let id: String = id.chars().take(60).collect();
+                bail!("this pack is for {id}, which this launcher version doesn't support")
+            }
+        },
         None => bail!("manifest doesn't say which game it's for"),
+    };
+    if schema < 3 && game.id != SEVEN_DAYS.id {
+        bail!(
+            "this pack claims {} on manifest schema version {schema}, which is \
+             7 Days to Die only",
+            game.display_name
+        );
     }
     let manifest = Manifest::deserialize(&value).context("parsing manifest JSON")?;
     Ok((value, manifest))
@@ -69,8 +80,28 @@ pub struct Manifest {
     /// v1 manifests; the launcher treats those as legacy-blob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<ManifestSource>,
+    /// The mod loader the pack runs on (v3; BepInExPack for Valheim),
+    /// installed into the game before the pack (framework.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<Framework>,
     pub files: Vec<FileEntry>,
     pub signature: Signature,
+}
+
+impl Manifest {
+    /// The game's layout. parse_manifest refuses a game without one, so
+    /// this only falls back for a Manifest built some other way.
+    pub fn game_layout(&self) -> &'static GameLayout {
+        game_by_id(&self.game).unwrap_or(&SEVEN_DAYS)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Framework {
+    /// The cloud's framework id, e.g. "bepinexpack-valheim".
+    pub id: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -132,6 +163,14 @@ pub struct ManifestSource {
     pub mod_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
+
+    // ---- Thunderstore fields (v3; `version` is shared above) ----
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

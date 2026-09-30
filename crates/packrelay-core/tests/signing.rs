@@ -9,7 +9,7 @@
 
 use packrelay_core::canonical_json::canonicalize;
 use packrelay_core::client::Client;
-use packrelay_core::manifest::{parse_manifest, Signature};
+use packrelay_core::manifest::{parse_manifest, Framework, Signature};
 use packrelay_core::signature::{verify_manifest_signature, PublisherKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,6 +33,8 @@ struct Manifests {
     v2: String,
     v1: String,
     other_game: String,
+    v2_valheim: String,
+    v3_valheim: String,
 }
 
 #[derive(Deserialize)]
@@ -214,25 +216,65 @@ fn unknown_game_fails_even_with_a_valid_signature() {
     let value: Value = serde_json::from_str(&f.manifests.other_game).unwrap();
     let signature: Signature = serde_json::from_value(value["signature"].clone()).unwrap();
     verify_manifest_signature(&value, &signature, &key(&f, &f.public_key)).unwrap();
-    // ...but it's a Valheim pack, and this launcher only knows 7DTD.
+    // ...but no game layout exists for it, so there's nowhere safe to
+    // install it.
     assert_err_contains(
         check(&f.manifests.other_game, &key(&f, &f.public_key)),
-        "this pack is for valheim, which this launcher version doesn't support",
+        "this pack is for minecraft, which this launcher version doesn't support",
+    );
+}
+
+#[test]
+fn a_v3_valheim_pack_the_cloud_accepts_verifies_and_parses() {
+    let f = fixture();
+    check(&f.manifests.v3_valheim, &key(&f, &f.public_key)).unwrap();
+    let (_, manifest) = parse_manifest(&f.manifests.v3_valheim).unwrap();
+    assert_eq!(manifest.game_layout().id, "valheim");
+    assert_eq!(
+        manifest.framework,
+        Some(Framework {
+            id: "bepinexpack-valheim".into(),
+            version: "5.4.2333".into()
+        })
+    );
+    let source = &manifest.sources[0];
+    assert_eq!(source.source, "thunderstore");
+    assert_eq!(source.namespace.as_deref(), Some("ValheimModding"));
+    assert_eq!(source.name.as_deref(), Some("Jotunn"));
+    assert_eq!(source.version.as_deref(), Some("2.29.2"));
+}
+
+#[test]
+fn a_v3_manifest_altered_after_signing_fails() {
+    let f = fixture();
+    // The framework is signed too: swapping the loader version breaks it.
+    let raw = tampered(&f.manifests.v3_valheim, |m| {
+        m["framework"]["version"] = json!("5.4.1")
+    });
+    assert!(check(&raw, &key(&f, &f.public_key)).is_err());
+}
+
+#[test]
+fn v1_and_v2_stay_7dtd_only() {
+    let f = fixture();
+    assert_err_contains(
+        check(&f.manifests.v2_valheim, &key(&f, &f.public_key)),
+        "7 Days to Die only",
     );
 }
 
 #[test]
 fn unsupported_schema_version_fails() {
     let f = fixture();
-    for version in [json!(0), json!(3), json!("2"), Value::Null] {
+    for version in [json!(0), json!(4), json!("2"), Value::Null] {
         let raw = tampered(&f.manifests.v2, |m| m["schemaVersion"] = version.clone());
         assert!(
             parse_manifest(&raw).is_err(),
             "schemaVersion {version} should be rejected"
         );
     }
-    let raw = tampered(&f.manifests.v2, |m| m["schemaVersion"] = json!(3));
-    assert_err_contains(parse_manifest(&raw).map(|_| ()), "schema version 3");
+    let raw = tampered(&f.manifests.v2, |m| m["schemaVersion"] = json!(4));
+    assert_err_contains(parse_manifest(&raw).map(|_| ()), "schema version 4");
 }
 
 // ---- end to end through Client::fetch_manifest_at ----
