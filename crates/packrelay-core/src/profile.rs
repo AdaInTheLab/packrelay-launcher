@@ -26,6 +26,14 @@
 // both. Worlds copies duplicate across snapshots; `prune_snapshots`
 // keeps the count bounded (SNAPSHOT_KEEP_LAST default in callers).
 //
+// Games (multi-game): a profile belongs to one game (meta.json `game`,
+// absent = 7DTD, so every profile from before stays 7DTD's), and each
+// game has its own active profile and live root. What "mods", "saves"
+// and "worlds" mean live comes from the game's GameLayout (games.rs):
+// 7DTD's are the Mods/, Saves/ and GeneratedWorlds/ described above;
+// Valheim swaps only its pack-owned entries under BepInEx/ and has no
+// saves or worlds a pack owns.
+//
 // Migration: profiles with schema_version absent (or 0) are in the
 // legacy single-pack layout (`mods/`, `saves/`, `worlds/`, `snapshots/`
 // directly under the profile root). `migrate_profile_v0_to_v1` moves
@@ -35,8 +43,11 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+use crate::games::{GameLayout, SEVEN_DAYS};
 
 /// On-disk schema version for profile meta.json. v0 (legacy) is
 /// implied by the absence of this field; v1 is the multi-pack
@@ -164,6 +175,11 @@ pub struct ProfileMeta {
     #[serde(default)]
     pub schema_version: u32,
 
+    /// The game this profile is for (games.rs id). Absent on every
+    /// profile from before multi-game, which were all 7DTD's.
+    #[serde(default = "default_game")]
+    pub game: String,
+
     /// Installed packs in this profile. Empty for a "vanilla"
     /// profile with no pack content.
     #[serde(default)]
@@ -194,6 +210,7 @@ pub struct ProfileSummary {
     pub id: String,
     pub name: String,
     pub schema_version: u32,
+    pub game: String,
     pub packs: Vec<PackSummary>,
     pub active_pack_slug: Option<String>,
     pub created_at: String,
@@ -216,14 +233,64 @@ pub struct PackSummary {
     pub snapshot_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivePointer {
+    /// 7DTD's active profile. Kept at the top level, where every
+    /// active.json from before multi-game has it.
     active_profile_id: Option<String>,
     /// 7DTD userdata dir (the parent of Mods/Saves/GeneratedWorlds).
     /// Lets profile.switch know where to mirror into without the
     /// caller having to pass it on every call.
     seven_dtd_userdata_dir: Option<String>,
+    /// Every other game's pointer, by game id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    games: BTreeMap<String, GamePointer>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GamePointer {
+    active_profile_id: Option<String>,
+    /// The game's live root (Valheim: <install>/BepInEx).
+    live_root: Option<String>,
+}
+
+impl ActivePointer {
+    /// (active profile id, live root) for `game`.
+    fn for_game(&self, game: &str) -> (Option<&str>, Option<&str>) {
+        if game == SEVEN_DAYS.id {
+            (
+                self.active_profile_id.as_deref(),
+                self.seven_dtd_userdata_dir.as_deref(),
+            )
+        } else {
+            self.games.get(game).map_or((None, None), |g| {
+                (g.active_profile_id.as_deref(), g.live_root.as_deref())
+            })
+        }
+    }
+
+    /// Set `game`'s active profile; the live root only when given, as
+    /// set_active always has.
+    fn set_for_game(&mut self, game: &str, profile_id: Option<String>, live_root: Option<String>) {
+        if game == SEVEN_DAYS.id {
+            self.active_profile_id = profile_id;
+            if live_root.is_some() {
+                self.seven_dtd_userdata_dir = live_root;
+            }
+        } else {
+            let g = self.games.entry(game.to_string()).or_default();
+            g.active_profile_id = profile_id;
+            if live_root.is_some() {
+                g.live_root = live_root;
+            }
+        }
+    }
+}
+
+fn default_game() -> String {
+    SEVEN_DAYS.id.to_string()
 }
 
 /// A pre-launch snapshot of a pack's saves + the profile's worlds
@@ -243,16 +310,21 @@ pub struct ProfileSnapshot {
 
 // ---------- High-level operations ----------
 
-/// Create a new empty profile. The caller decides the name; we
-/// generate the id. New profiles start in v1 shape with empty
+/// Create a new empty profile for `game`. The caller decides the name;
+/// we generate the id. New profiles start in v1 shape with empty
 /// packs[] and no active pack -- the caller adds packs via
 /// `add_pack_to_profile` (typically through the install flow).
-pub async fn create_profile(layout: &StoreLayout, name: &str) -> Result<ProfileMeta> {
+pub async fn create_profile(
+    layout: &StoreLayout,
+    game: &GameLayout,
+    name: &str,
+) -> Result<ProfileMeta> {
     let id = new_profile_id();
     let meta = ProfileMeta {
         id: id.clone(),
         name: name.trim().to_string(),
         schema_version: PROFILE_SCHEMA_VERSION,
+        game: game.id.to_string(),
         packs: Vec::new(),
         active_pack_slug: None,
         pack_slug: None,
@@ -267,46 +339,49 @@ pub async fn create_profile(layout: &StoreLayout, name: &str) -> Result<ProfileM
     Ok(meta)
 }
 
-/// Import the user's existing 7DTD state as a profile. Used on
+/// Import the user's existing state for `game` as a profile. Used on
 /// first opt-in so the user doesn't lose their current setup. The
-/// imported state lands in a single pack entry with the
-/// `_imported` slug; users can later rename / re-bind via the UI.
-/// `seven_dtd_userdata_dir` is the parent that contains Mods/,
-/// Saves/, GeneratedWorlds/ (or however many of those exist).
+/// imported state lands in a single pack entry with the `_imported`
+/// slug; users can later rename / re-bind via the UI. `live_root` is
+/// the game's live root (7DTD: the userdata dir holding Mods/, Saves/,
+/// GeneratedWorlds/; Valheim: <install>/BepInEx).
 pub async fn import_current_as_profile(
     layout: &StoreLayout,
-    seven_dtd_userdata_dir: &Path,
+    game: &GameLayout,
+    live_root: &Path,
     name: &str,
 ) -> Result<ProfileMeta> {
-    let mut meta = create_profile(layout, name).await?;
+    let mut meta = create_profile(layout, game, name).await?;
     let paths = ProfilePaths::from_root(&layout.profile_dir(&meta.id));
 
-    let live_mods = seven_dtd_userdata_dir.join("Mods");
-    let live_saves = seven_dtd_userdata_dir.join("Saves");
-    let live_worlds = seven_dtd_userdata_dir.join("GeneratedWorlds");
-
     // Worlds go to profile-shared root.
-    if fs::metadata(&live_worlds).await.is_ok() {
-        copy_dir_all(&live_worlds, &paths.worlds).await?;
+    if let Some(rel) = game.worlds_live {
+        let live_worlds = live_root.join(rel);
+        if fs::metadata(&live_worlds).await.is_ok() {
+            copy_dir_all(&live_worlds, &paths.worlds).await?;
+        }
     }
 
     // Mods + Saves go into an `_imported` pack entry if either
     // exists. If neither exists we leave the profile pack-less
     // (vanilla mode, just worlds).
-    let has_mods = fs::metadata(&live_mods).await.is_ok();
-    let has_saves = fs::metadata(&live_saves).await.is_ok();
+    let live_saves = game.saves_live.map(|rel| live_root.join(rel));
+    let has_mods = live_mods_exist(game, live_root).await;
+    let has_saves = match &live_saves {
+        Some(s) => fs::metadata(s).await.is_ok(),
+        None => false,
+    };
     if has_mods || has_saves {
         let pack_paths = paths.pack_paths(IMPORTED_PACK_SLUG);
         fs::create_dir_all(&pack_paths.snapshots).await?;
         if has_mods {
-            copy_dir_all(&live_mods, &pack_paths.mods).await?;
+            copy_live_mods(game, live_root, &pack_paths.mods).await?;
         } else {
             fs::create_dir_all(&pack_paths.mods).await?;
         }
-        if has_saves {
-            copy_dir_all(&live_saves, &pack_paths.saves).await?;
-        } else {
-            fs::create_dir_all(&pack_paths.saves).await?;
+        match live_saves {
+            Some(s) if has_saves => copy_dir_all(&s, &pack_paths.saves).await?,
+            _ => fs::create_dir_all(&pack_paths.saves).await?,
         }
 
         meta.packs.push(PackInstallation {
@@ -323,14 +398,15 @@ pub async fn import_current_as_profile(
 
     // First imported profile auto-becomes the active one. Caller
     // can override afterwards if they have a reason to.
-    set_active(layout, Some(&meta.id), Some(seven_dtd_userdata_dir)).await?;
+    set_active(layout, game, Some(&meta.id), Some(live_root)).await?;
     Ok(meta)
 }
 
 /// Duplicate an existing profile into a new one. Both the worlds
 /// dir AND every pack-in-profile get cloned. Snapshots are NOT
 /// copied -- per-session safety nets are tied to actual play
-/// history on the source, not the clone.
+/// history on the source, not the clone. The clone is for the same
+/// game as its source.
 pub async fn clone_profile(
     layout: &StoreLayout,
     source_id: &str,
@@ -374,6 +450,7 @@ pub async fn clone_profile(
         id: new_id,
         name: new_name.trim().to_string(),
         schema_version: PROFILE_SCHEMA_VERSION,
+        game: src_meta.game.clone(),
         packs: src_meta.packs.clone(),
         active_pack_slug: src_meta.active_pack_slug.clone(),
         pack_slug: None,
@@ -385,16 +462,19 @@ pub async fn clone_profile(
     Ok(meta)
 }
 
-/// List all profiles with computed summary stats. Triggers
-/// migration on any v0 profile encountered. Per-profile and
-/// per-pack dir sizes are stat'd lazily; fast for small libraries.
-pub async fn list_profiles(layout: &StoreLayout) -> Result<Vec<ProfileSummary>> {
+/// List profiles with computed summary stats -- every game's, or only
+/// `game`'s. Triggers migration on any v0 profile encountered.
+/// Per-profile and per-pack dir sizes are stat'd lazily; fast for
+/// small libraries.
+pub async fn list_profiles(
+    layout: &StoreLayout,
+    game: Option<&GameLayout>,
+) -> Result<Vec<ProfileSummary>> {
     let dir = layout.profiles_dir();
     if !fs::metadata(&dir).await.is_ok() {
         return Ok(Vec::new());
     }
     let active = load_active(layout).await?;
-    let active_id = active.active_profile_id.as_deref();
 
     let mut out = Vec::new();
     let mut rd = fs::read_dir(&dir).await?;
@@ -409,6 +489,9 @@ pub async fn list_profiles(layout: &StoreLayout) -> Result<Vec<ProfileSummary>> 
             Ok(m) => m,
             Err(_) => continue, // skip orphaned dirs / unreadable meta
         };
+        if game.is_some_and(|g| g.id != meta.game) {
+            continue;
+        }
 
         let worlds_bytes = dir_size(&paths.worlds).await.unwrap_or(0);
         let mut pack_summaries = Vec::with_capacity(meta.packs.len());
@@ -428,15 +511,17 @@ pub async fn list_profiles(layout: &StoreLayout) -> Result<Vec<ProfileSummary>> 
             });
         }
 
+        let is_active = active.for_game(&meta.game).0 == Some(id.as_str());
         out.push(ProfileSummary {
             id: meta.id.clone(),
             name: meta.name,
             schema_version: meta.schema_version,
+            game: meta.game,
             packs: pack_summaries,
             active_pack_slug: meta.active_pack_slug,
             created_at: meta.created_at,
             last_played_at: meta.last_played_at,
-            is_active: active_id == Some(id.as_str()),
+            is_active,
             worlds_bytes,
         });
     }
@@ -449,129 +534,158 @@ pub async fn list_profiles(layout: &StoreLayout) -> Result<Vec<ProfileSummary>> 
     Ok(out)
 }
 
-/// Currently-active profile's full meta (migrated to v1 if needed).
-pub async fn active_profile(layout: &StoreLayout) -> Result<Option<ProfileMeta>> {
+/// `game`'s currently-active profile's full meta (migrated to v1 if
+/// needed).
+pub async fn active_profile(
+    layout: &StoreLayout,
+    game: &GameLayout,
+) -> Result<Option<ProfileMeta>> {
     let active = load_active(layout).await?;
-    let Some(id) = active.active_profile_id else {
+    let Some(id) = active.for_game(game.id).0 else {
         return Ok(None);
     };
-    let paths = ProfilePaths::from_root(&layout.profile_dir(&id));
+    let paths = ProfilePaths::from_root(&layout.profile_dir(id));
     Ok(Some(read_meta_migrated(layout, &paths).await?))
 }
 
-/// Switch to a different profile.
+/// The live root `game`'s profile system mirrors into, or an error
+/// saying it isn't set up yet.
+fn require_live_root(active: &ActivePointer, game: &GameLayout) -> Result<PathBuf> {
+    match active.for_game(game.id).1 {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => anyhow::bail!(
+            "Profile system isn't initialized — {} userdata dir not set. Import or set it first.",
+            game.short_name
+        ),
+    }
+}
+
+/// Switch `game` to a different one of its profiles.
 ///
 /// Steps, in order:
-///   1. If a profile is currently active, copy 7DTD's live state
+///   1. If a profile is currently active, copy the game's live state
 ///      back into that profile's pack + worlds dirs:
-///        - Live Mods/ -> outgoing profile's active pack's mods/
-///        - Live Saves/ -> outgoing profile's active pack's saves/
-///        - Live GeneratedWorlds/ -> outgoing profile's worlds/
-///      So anything the user did in-game lands in the outgoing
-///      profile.
+///        - live mods   -> outgoing profile's active pack's mods/
+///        - live saves  -> outgoing profile's active pack's saves/
+///        - live worlds -> outgoing profile's worlds/
+///      (each only where the game has that slot), so anything the
+///      user did in-game lands in the outgoing profile.
 ///   2. Mirror the incoming profile's active pack's mods/saves +
 ///      the profile's shared worlds into the live locations.
 ///   3. Update the active pointer.
-pub async fn switch_profile(layout: &StoreLayout, incoming_id: &str) -> Result<()> {
+pub async fn switch_profile(
+    layout: &StoreLayout,
+    game: &GameLayout,
+    incoming_id: &str,
+) -> Result<()> {
     let active = load_active(layout).await?;
-    let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
-        anyhow::bail!(
-            "Profile system isn't initialized — 7DTD userdata dir not set. Import or set it first."
-        );
-    };
-    let userdata = PathBuf::from(userdata);
+    let userdata = require_live_root(&active, game)?;
+    let live_saves = game.saves_live.map(|rel| userdata.join(rel));
+    let live_worlds = game.worlds_live.map(|rel| userdata.join(rel));
 
-    let live_mods = userdata.join("Mods");
-    let live_saves = userdata.join("Saves");
-    let live_worlds = userdata.join("GeneratedWorlds");
+    // The incoming profile must exist and be this game's; checked before
+    // anything live is touched.
+    let next_paths = ProfilePaths::from_root(&layout.profile_dir(incoming_id));
+    if !fs::metadata(&next_paths.meta).await.is_ok() {
+        anyhow::bail!("Profile {incoming_id} not found.");
+    }
+    let next_meta = read_meta_migrated(layout, &next_paths).await?;
+    if next_meta.game != game.id {
+        anyhow::bail!(
+            "Profile '{}' is for another game, not {}.",
+            next_meta.name,
+            game.display_name
+        );
+    }
 
     // Step 1: capture outgoing profile's state.
-    if let Some(prev_id) = &active.active_profile_id {
+    if let Some(prev_id) = active.for_game(game.id).0 {
         if prev_id != incoming_id {
             let prev_paths = ProfilePaths::from_root(&layout.profile_dir(prev_id));
             let prev_meta = read_meta_migrated(layout, &prev_paths).await?;
 
             // Worlds (always profile-level).
-            if fs::metadata(&live_worlds).await.is_ok() {
-                replace_dir(&prev_paths.worlds, &live_worlds).await?;
+            if let Some(live_worlds) = &live_worlds {
+                if fs::metadata(live_worlds).await.is_ok() {
+                    replace_dir(&prev_paths.worlds, live_worlds).await?;
+                }
             }
             // Mods + Saves go to the outgoing profile's ACTIVE pack.
             // If no active pack, the user was in vanilla mode and we
             // skip the per-pack capture.
             if let Some(active_slug) = &prev_meta.active_pack_slug {
                 let prev_pack = prev_paths.pack_paths(active_slug);
-                if fs::metadata(&live_mods).await.is_ok() {
-                    replace_dir(&prev_pack.mods, &live_mods).await?;
-                }
-                if fs::metadata(&live_saves).await.is_ok() {
-                    replace_dir(&prev_pack.saves, &live_saves).await?;
+                capture_mods(game, &userdata, &prev_pack.mods).await?;
+                if let Some(live_saves) = &live_saves {
+                    if fs::metadata(live_saves).await.is_ok() {
+                        replace_dir(&prev_pack.saves, live_saves).await?;
+                    }
                 }
             }
         }
     }
 
     // Step 2: deploy incoming.
-    let next_paths = ProfilePaths::from_root(&layout.profile_dir(incoming_id));
-    if !fs::metadata(&next_paths.meta).await.is_ok() {
-        anyhow::bail!("Profile {incoming_id} not found.");
-    }
-    let next_meta = read_meta_migrated(layout, &next_paths).await?;
     fs::create_dir_all(&userdata).await?;
 
     // Worlds always mirror.
-    replace_dir(&live_worlds, &next_paths.worlds).await?;
+    if let Some(live_worlds) = &live_worlds {
+        replace_dir(live_worlds, &next_paths.worlds).await?;
+    }
 
     // Mods + Saves come from incoming's active pack. If no active
-    // pack (vanilla mode), CLEAR live Mods + Saves so the user
+    // pack (vanilla mode), CLEAR live mods + saves so the user
     // doesn't inherit the prior profile's leftovers.
     if let Some(next_slug) = &next_meta.active_pack_slug {
         let next_pack = next_paths.pack_paths(next_slug);
-        replace_dir(&live_mods, &next_pack.mods).await?;
-        replace_dir(&live_saves, &next_pack.saves).await?;
+        deploy_mods(game, &userdata, Some(&next_pack.mods)).await?;
+        if let Some(live_saves) = &live_saves {
+            replace_dir(live_saves, &next_pack.saves).await?;
+        }
     } else {
         // Vanilla mode: empty mods + saves.
-        if fs::metadata(&live_mods).await.is_ok() {
-            remove_dir_all_safe(&live_mods).await?;
+        deploy_mods(game, &userdata, None).await?;
+        if let Some(live_saves) = &live_saves {
+            if fs::metadata(live_saves).await.is_ok() {
+                remove_dir_all_safe(live_saves).await?;
+            }
+            fs::create_dir_all(live_saves).await?;
         }
-        if fs::metadata(&live_saves).await.is_ok() {
-            remove_dir_all_safe(&live_saves).await?;
-        }
-        fs::create_dir_all(&live_mods).await?;
-        fs::create_dir_all(&live_saves).await?;
     }
 
     // Step 3: flip the pointer.
-    set_active(layout, Some(incoming_id), Some(&userdata)).await?;
+    set_active(layout, game, Some(incoming_id), Some(&userdata)).await?;
     Ok(())
 }
 
-/// Within a profile, switch which pack is mounted to 7DTD's live
-/// Mods/ + Saves/. Worlds are profile-shared and untouched.
+/// Within a profile, switch which pack is mounted to the game's live
+/// mods (+ saves, where it has them). Worlds are profile-shared and
+/// untouched.
 ///
 /// If `target_slug` is None, switches to vanilla mode (clears live
 /// mods + saves). If `target_slug` isn't in the profile's packs[],
 /// returns an error -- the caller (Tauri command) should install
 /// the pack into the profile first.
 ///
-/// Only valid when the target profile is currently active.
+/// Only valid when the target profile is `game`'s currently active one.
 pub async fn set_active_pack(
     layout: &StoreLayout,
+    game: &GameLayout,
     profile_id: &str,
     target_slug: Option<&str>,
 ) -> Result<()> {
     let active = load_active(layout).await?;
-    if active.active_profile_id.as_deref() != Some(profile_id) {
+    if active.for_game(game.id).0 != Some(profile_id) {
         anyhow::bail!(
             "set_active_pack only works on the currently active profile. \
              Switch profiles first."
         );
     }
-    let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
-        anyhow::bail!("7DTD userdata dir not configured.");
+    let Some(userdata) = active.for_game(game.id).1 else {
+        anyhow::bail!("{} userdata dir not configured.", game.short_name);
     };
     let userdata = PathBuf::from(userdata);
-    let live_mods = userdata.join("Mods");
-    let live_saves = userdata.join("Saves");
+    let live_saves = game.saves_live.map(|rel| userdata.join(rel));
 
     let paths = ProfilePaths::from_root(&layout.profile_dir(profile_id));
     let mut meta = read_meta_migrated(layout, &paths).await?;
@@ -592,28 +706,29 @@ pub async fn set_active_pack(
     // step 1, scoped to the single profile.
     if let Some(outgoing) = &meta.active_pack_slug {
         let outgoing_pack = paths.pack_paths(outgoing);
-        if fs::metadata(&live_mods).await.is_ok() {
-            replace_dir(&outgoing_pack.mods, &live_mods).await?;
-        }
-        if fs::metadata(&live_saves).await.is_ok() {
-            replace_dir(&outgoing_pack.saves, &live_saves).await?;
+        capture_mods(game, &userdata, &outgoing_pack.mods).await?;
+        if let Some(live_saves) = &live_saves {
+            if fs::metadata(live_saves).await.is_ok() {
+                replace_dir(&outgoing_pack.saves, live_saves).await?;
+            }
         }
     }
 
     // Mount the incoming pack (or clear live for vanilla mode).
     if let Some(incoming) = target_slug {
         let incoming_pack = paths.pack_paths(incoming);
-        replace_dir(&live_mods, &incoming_pack.mods).await?;
-        replace_dir(&live_saves, &incoming_pack.saves).await?;
+        deploy_mods(game, &userdata, Some(&incoming_pack.mods)).await?;
+        if let Some(live_saves) = &live_saves {
+            replace_dir(live_saves, &incoming_pack.saves).await?;
+        }
     } else {
-        if fs::metadata(&live_mods).await.is_ok() {
-            remove_dir_all_safe(&live_mods).await?;
+        deploy_mods(game, &userdata, None).await?;
+        if let Some(live_saves) = &live_saves {
+            if fs::metadata(live_saves).await.is_ok() {
+                remove_dir_all_safe(live_saves).await?;
+            }
+            fs::create_dir_all(live_saves).await?;
         }
-        if fs::metadata(&live_saves).await.is_ok() {
-            remove_dir_all_safe(&live_saves).await?;
-        }
-        fs::create_dir_all(&live_mods).await?;
-        fs::create_dir_all(&live_saves).await?;
     }
 
     // Update meta.json.
@@ -622,11 +737,11 @@ pub async fn set_active_pack(
     Ok(())
 }
 
-/// Add (or update) a pack inside the currently-active profile. Called
-/// by the install / update flows so the profile remembers what's been
-/// deployed. Creates the pack's mods/saves/snapshots dirs if they're
-/// missing. If the pack is new and no other pack is active, this new
-/// pack becomes active automatically.
+/// Add (or update) a pack inside a profile. Called by the install /
+/// update flows so the profile remembers what's been deployed.
+/// Creates the pack's mods/saves/snapshots dirs if they're missing.
+/// If the pack is new and no other pack is active, this new pack
+/// becomes active automatically.
 pub async fn add_pack_to_profile(
     layout: &StoreLayout,
     profile_id: &str,
@@ -671,25 +786,30 @@ pub async fn add_pack_to_profile(
     Ok(())
 }
 
-/// Convenience wrapper: add a pack to the *currently active* profile.
-/// Returns Ok with no-op if no profile is active (the launcher will
-/// have installed the pack outside the profile system in that case).
-pub async fn bind_pack_to_active(layout: &StoreLayout, slug: &str, version: &str) -> Result<()> {
+/// Convenience wrapper: add a pack to `game`'s *currently active*
+/// profile. Returns Ok with no-op if no profile is active (the launcher
+/// will have installed the pack outside the profile system in that case).
+pub async fn bind_pack_to_active(
+    layout: &StoreLayout,
+    game: &GameLayout,
+    slug: &str,
+    version: &str,
+) -> Result<()> {
     let active = load_active(layout).await?;
-    let Some(id) = active.active_profile_id.as_deref() else {
+    let Some(id) = active.for_game(game.id).0 else {
         return Ok(());
     };
     add_pack_to_profile(layout, id, slug, version).await
 }
 
-/// What `align_for_server` did to the live Mods folder.
+/// What `align_for_server` did to the live mods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Alignment {
     /// The profile system isn't set up, so there is nothing to swap:
-    /// the launcher leaves live Mods/ exactly as the user has it.
+    /// the launcher leaves live mods exactly as the user has them.
     NoProfile,
-    /// Live Mods/ already holds what the server runs.
+    /// Live mods already hold what the server runs.
     AlreadyAligned,
     /// Swapped from one pack (or vanilla, None) to another.
     Switched {
@@ -698,7 +818,7 @@ pub enum Alignment {
     },
 }
 
-/// Make live Mods/ match the server about to be joined: the server's
+/// Make live mods match the server about to be joined: the server's
 /// pack when it has one, vanilla (no mods) when it doesn't.
 ///
 /// Why this exists: 7DTD loads EVERY mod in the user's Mods/ folder
@@ -709,6 +829,8 @@ pub enum Alignment {
 /// wrong in the server's log. Seen for real 2026-08-23: 13 joins, 0
 /// spawns. Joining through the launcher is the one moment we know
 /// which mod set the player needs, so this is where it gets fixed.
+/// (Valheim's ServerSync mods kick a player whose set differs, the
+/// same problem announced louder.)
 ///
 /// Nothing is lost by swapping: set_active_pack captures the outgoing
 /// pack's live mods + saves back into its own dirs first.
@@ -716,13 +838,14 @@ pub enum Alignment {
 /// Errors (the caller should NOT launch -- joining with the wrong mods
 /// is exactly the silent failure this prevents):
 ///   - the server's pack isn't installed in the active profile;
-///   - the swap itself fails, typically because 7DTD is running and
+///   - the swap itself fails, typically because the game is running and
 ///     has the mod files open.
 pub async fn align_for_server(
     layout: &StoreLayout,
+    game: &GameLayout,
     server_pack: Option<&str>,
 ) -> Result<Alignment> {
-    let Some(meta) = active_profile(layout).await? else {
+    let Some(meta) = active_profile(layout, game).await? else {
         return Ok(Alignment::NoProfile);
     };
     if meta.active_pack_slug.as_deref() == server_pack {
@@ -739,12 +862,15 @@ pub async fn align_for_server(
         }
     }
     let from = meta.active_pack_slug.clone();
-    set_active_pack(layout, &meta.id, server_pack)
+    set_active_pack(layout, game, &meta.id, server_pack)
         .await
-        .context(
-            "Couldn't swap your Mods folder to match this server. If 7 Days \
-             to Die is open, close it and join again.",
-        )?;
+        .with_context(|| {
+            format!(
+                "Couldn't swap your {} mods to match this server. If {} is \
+                 open, close it and join again.",
+                game.short_name, game.display_name
+            )
+        })?;
     Ok(Alignment::Switched {
         from,
         to: server_pack.map(str::to_string),
@@ -779,11 +905,11 @@ pub async fn remove_pack_from_profile(
 }
 
 /// Legacy helper preserved for compatibility -- callers should
-/// migrate to `remove_pack_from_profile`. Removes the active
+/// migrate to `remove_pack_from_profile`. Removes `game`'s active
 /// profile's currently-active pack, if any.
-pub async fn clear_active_pack(layout: &StoreLayout) -> Result<()> {
+pub async fn clear_active_pack(layout: &StoreLayout, game: &GameLayout) -> Result<()> {
     let active = load_active(layout).await?;
-    let Some(id) = active.active_profile_id.as_deref() else {
+    let Some(id) = active.for_game(game.id).0 else {
         return Ok(());
     };
     let paths = ProfilePaths::from_root(&layout.profile_dir(id));
@@ -803,11 +929,18 @@ pub async fn rename_profile(layout: &StoreLayout, id: &str, new_name: &str) -> R
     Ok(meta)
 }
 
-/// Delete a profile entirely. Refuses to delete the currently-active
-/// profile (caller must switch away first).
+/// Delete a profile entirely. Refuses to delete a profile that's
+/// currently active for its game (caller must switch away first).
 pub async fn delete_profile(layout: &StoreLayout, id: &str) -> Result<()> {
     let active = load_active(layout).await?;
-    if active.active_profile_id.as_deref() == Some(id) {
+    let paths = ProfilePaths::from_root(&layout.profile_dir(id));
+    // An unreadable meta can't be anyone's active profile but 7DTD's
+    // legacy pointer; check that one too.
+    let game = read_meta(&paths)
+        .await
+        .map(|m| m.game)
+        .unwrap_or_else(|_| default_game());
+    if active.for_game(&game).0 == Some(id) {
         anyhow::bail!("Can't delete the active profile. Switch to another profile first.");
     }
     let dir = layout.profile_dir(id);
@@ -819,23 +952,31 @@ pub async fn delete_profile(layout: &StoreLayout, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot the active profile's active pack's live state -- its
+/// Snapshot `game`'s active profile's active pack's live state -- its
 /// current saves + the profile's shared worlds -- to a new entry
 /// under that pack's snapshots/ dir.
 ///
-/// Returns Err if no profile is active OR the active profile has
-/// no active pack (vanilla mode has nothing meaningful to snapshot).
+/// Returns Err if no profile is active, the active profile has no
+/// active pack (vanilla mode has nothing meaningful to snapshot), or
+/// the game keeps neither saves nor worlds where a pack owns them.
 pub async fn snapshot_active(
     layout: &StoreLayout,
+    game: &GameLayout,
     label: Option<&str>,
     keep_last: usize,
 ) -> Result<ProfileSnapshot> {
+    if game.saves_live.is_none() && game.worlds_live.is_none() {
+        anyhow::bail!(
+            "{} keeps its saves outside any pack; nothing to snapshot.",
+            game.display_name
+        );
+    }
     let active = load_active(layout).await?;
-    let Some(profile_id) = active.active_profile_id.as_deref() else {
+    let Some(profile_id) = active.for_game(game.id).0 else {
         anyhow::bail!("No active profile to snapshot.");
     };
-    let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
-        anyhow::bail!("7DTD userdata dir not configured.");
+    let Some(userdata) = active.for_game(game.id).1 else {
+        anyhow::bail!("{} userdata dir not configured.", game.short_name);
     };
     let userdata = PathBuf::from(userdata);
     let paths = ProfilePaths::from_root(&layout.profile_dir(profile_id));
@@ -849,13 +990,17 @@ pub async fn snapshot_active(
     let snapshot_root = pack_paths.snapshots.join(&snapshot_id);
     fs::create_dir_all(&snapshot_root).await?;
 
-    let live_saves = userdata.join("Saves");
-    let live_worlds = userdata.join("GeneratedWorlds");
-    if fs::metadata(&live_saves).await.is_ok() {
-        copy_dir_all(&live_saves, &snapshot_root.join("saves")).await?;
+    if let Some(rel) = game.saves_live {
+        let live_saves = userdata.join(rel);
+        if fs::metadata(&live_saves).await.is_ok() {
+            copy_dir_all(&live_saves, &snapshot_root.join("saves")).await?;
+        }
     }
-    if fs::metadata(&live_worlds).await.is_ok() {
-        copy_dir_all(&live_worlds, &snapshot_root.join("worlds")).await?;
+    if let Some(rel) = game.worlds_live {
+        let live_worlds = userdata.join(rel);
+        if fs::metadata(&live_worlds).await.is_ok() {
+            copy_dir_all(&live_worlds, &snapshot_root.join("worlds")).await?;
+        }
     }
 
     let saves_bytes = dir_size(&snapshot_root.join("saves")).await.unwrap_or(0);
@@ -897,23 +1042,24 @@ pub async fn list_snapshots(
     Ok(snaps)
 }
 
-/// Restore a specific snapshot into the active profile's live 7DTD
-/// locations: snapshot saves -> live Saves AND -> the pack's saves
+/// Restore a specific snapshot into `game`'s active profile's live
+/// locations: snapshot saves -> live saves AND -> the pack's saves
 /// (so a future switch-away doesn't capture in-flight state);
-/// snapshot worlds -> live GeneratedWorlds AND -> the profile's
-/// shared worlds (same reasoning).
+/// snapshot worlds -> live worlds AND -> the profile's shared worlds
+/// (same reasoning).
 pub async fn restore_snapshot(
     layout: &StoreLayout,
+    game: &GameLayout,
     profile_id: &str,
     pack_slug: &str,
     snapshot_id: &str,
 ) -> Result<()> {
     let active = load_active(layout).await?;
-    if active.active_profile_id.as_deref() != Some(profile_id) {
+    if active.for_game(game.id).0 != Some(profile_id) {
         anyhow::bail!("Snapshot's profile isn't currently active. Switch to it before restoring.");
     }
-    let Some(userdata) = active.seven_dtd_userdata_dir.as_deref() else {
-        anyhow::bail!("7DTD userdata dir not configured.");
+    let Some(userdata) = active.for_game(game.id).1 else {
+        anyhow::bail!("{} userdata dir not configured.", game.short_name);
     };
     let userdata = PathBuf::from(userdata);
 
@@ -936,37 +1082,168 @@ pub async fn restore_snapshot(
 
     let snap_saves = snap_root.join("saves");
     let snap_worlds = snap_root.join("worlds");
-    if fs::metadata(&snap_saves).await.is_ok() {
-        replace_dir(&userdata.join("Saves"), &snap_saves).await?;
-        replace_dir(&pack_paths.saves, &snap_saves).await?;
+    if let Some(rel) = game.saves_live {
+        if fs::metadata(&snap_saves).await.is_ok() {
+            replace_dir(&userdata.join(rel), &snap_saves).await?;
+            replace_dir(&pack_paths.saves, &snap_saves).await?;
+        }
     }
-    if fs::metadata(&snap_worlds).await.is_ok() {
-        replace_dir(&userdata.join("GeneratedWorlds"), &snap_worlds).await?;
-        replace_dir(&paths.worlds, &snap_worlds).await?;
+    if let Some(rel) = game.worlds_live {
+        if fs::metadata(&snap_worlds).await.is_ok() {
+            replace_dir(&userdata.join(rel), &snap_worlds).await?;
+            replace_dir(&paths.worlds, &snap_worlds).await?;
+        }
     }
     Ok(())
 }
 
-/// Set the active profile pointer. Public so the Tauri command for
-/// "first-time setup" can initialize seven_dtd_userdata_dir.
+/// Set `game`'s active profile pointer. Public so the Tauri command for
+/// "first-time setup" can initialize the game's live root.
 pub async fn set_active(
     layout: &StoreLayout,
+    game: &GameLayout,
     profile_id: Option<&str>,
-    seven_dtd_userdata_dir: Option<&Path>,
+    live_root: Option<&Path>,
 ) -> Result<()> {
     let mut pointer = load_active(layout).await?;
-    pointer.active_profile_id = profile_id.map(|s| s.to_string());
-    if let Some(dir) = seven_dtd_userdata_dir {
-        pointer.seven_dtd_userdata_dir = Some(dir.display().to_string());
-    }
+    pointer.set_for_game(
+        game.id,
+        profile_id.map(|s| s.to_string()),
+        live_root.map(|d| d.display().to_string()),
+    );
     write_active(layout, &pointer).await
 }
 
-/// Read the active pointer; returns empty (None/None) if no file
-/// exists yet.
-pub async fn read_active(layout: &StoreLayout) -> Result<(Option<String>, Option<String>)> {
+/// Read `game`'s active pointer: (active profile id, live root). Both
+/// None if nothing is set up yet.
+pub async fn read_active(
+    layout: &StoreLayout,
+    game: &GameLayout,
+) -> Result<(Option<String>, Option<String>)> {
     let p = load_active(layout).await?;
-    Ok((p.active_profile_id, p.seven_dtd_userdata_dir))
+    let (id, root) = p.for_game(game.id);
+    Ok((id.map(str::to_string), root.map(str::to_string)))
+}
+
+// ---------- Mods slot: whole dir, or a game's list of entries ----------
+
+fn live_mods_path(game: &GameLayout, live_root: &Path) -> PathBuf {
+    if game.mods_live.is_empty() {
+        live_root.to_path_buf()
+    } else {
+        live_root.join(game.mods_live)
+    }
+}
+
+/// Whether there's anything live in the mods slot to capture or import.
+async fn live_mods_exist(game: &GameLayout, live_root: &Path) -> bool {
+    let live = live_mods_path(game, live_root);
+    match game.mods_entries {
+        None => fs::metadata(&live).await.is_ok(),
+        Some(entries) => {
+            for e in entries {
+                if fs::metadata(live.join(e.rel)).await.is_ok() {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Copy (not move) the live mods slot into a pack's store `mods/`.
+async fn copy_live_mods(game: &GameLayout, live_root: &Path, pack_mods: &Path) -> Result<()> {
+    let live = live_mods_path(game, live_root);
+    match game.mods_entries {
+        None => copy_dir_all(&live, pack_mods).await,
+        Some(entries) => {
+            fs::create_dir_all(pack_mods).await?;
+            for e in entries {
+                let from = live.join(e.rel);
+                if fs::metadata(&from).await.is_ok() {
+                    copy_entry(&from, &pack_mods.join(e.rel), e.is_file).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Capture the live mods slot back into a pack's store `mods/`,
+/// replacing what the store held. Entries missing live are left as the
+/// store has them, as the whole-dir case always did.
+async fn capture_mods(game: &GameLayout, live_root: &Path, pack_mods: &Path) -> Result<()> {
+    let live = live_mods_path(game, live_root);
+    match game.mods_entries {
+        None => {
+            if fs::metadata(&live).await.is_ok() {
+                replace_dir(pack_mods, &live).await?;
+            }
+        }
+        Some(entries) => {
+            for e in entries {
+                let from = live.join(e.rel);
+                if fs::metadata(&from).await.is_ok() {
+                    let to = pack_mods.join(e.rel);
+                    if fs::metadata(&to).await.is_ok() {
+                        remove_dir_all_safe(&to).await?;
+                    }
+                    copy_entry(&from, &to, e.is_file).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deploy a pack's store `mods/` to the live slot, or clear the slot
+/// for vanilla (None). For a game with entries, only those are
+/// touched: everything else in the slot (the loader's own files) stays.
+async fn deploy_mods(game: &GameLayout, live_root: &Path, pack_mods: Option<&Path>) -> Result<()> {
+    let live = live_mods_path(game, live_root);
+    match (game.mods_entries, pack_mods) {
+        (None, Some(pack)) => replace_dir(&live, pack).await,
+        (None, None) => {
+            if fs::metadata(&live).await.is_ok() {
+                remove_dir_all_safe(&live).await?;
+            }
+            fs::create_dir_all(&live).await?;
+            Ok(())
+        }
+        (Some(entries), pack) => {
+            fs::create_dir_all(&live).await?;
+            for e in entries {
+                let to = live.join(e.rel);
+                if fs::metadata(&to).await.is_ok() {
+                    remove_dir_all_safe(&to).await?;
+                }
+                let from = pack.map(|p| p.join(e.rel));
+                match from {
+                    Some(from) if fs::metadata(&from).await.is_ok() => {
+                        copy_entry(&from, &to, e.is_file).await?;
+                    }
+                    // Leave an empty folder where the game expects one.
+                    _ if !e.is_file => fs::create_dir_all(&to).await?,
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn copy_entry(from: &Path, to: &Path, is_file: bool) -> Result<()> {
+    if is_file {
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(from, to)
+            .await
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        Ok(())
+    } else {
+        copy_dir_all(from, to).await
+    }
 }
 
 // ---------- Migration v0 -> v1 ----------
@@ -1123,10 +1400,7 @@ async fn load_active(layout: &StoreLayout) -> Result<ActivePointer> {
     let path = layout.active_pointer();
     match fs::read_to_string(&path).await {
         Ok(raw) => Ok(serde_json::from_str(&raw)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ActivePointer {
-            active_profile_id: None,
-            seven_dtd_userdata_dir: None,
-        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ActivePointer::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
@@ -1423,8 +1697,8 @@ mod tests {
         let layout = StoreLayout::new(&root.join("app"));
         let userdata = root.join("7DaysToDie");
         fs::create_dir_all(userdata.join("Mods")).await.unwrap();
-        let meta = create_profile(&layout, "Main").await.unwrap();
-        set_active(&layout, Some(&meta.id), Some(&userdata))
+        let meta = create_profile(&layout, &SEVEN_DAYS, "Main").await.unwrap();
+        set_active(&layout, &SEVEN_DAYS, Some(&meta.id), Some(&userdata))
             .await
             .unwrap();
         // "a" was installed straight into live Mods/ and is active.
@@ -1457,7 +1731,7 @@ mod tests {
     #[tokio::test]
     async fn joining_a_server_with_no_pack_goes_vanilla() {
         let (layout, userdata, _) = fixture("vanilla").await;
-        let r = align_for_server(&layout, None).await.unwrap();
+        let r = align_for_server(&layout, &SEVEN_DAYS, None).await.unwrap();
         assert_eq!(
             r,
             Alignment::Switched {
@@ -1467,14 +1741,18 @@ mod tests {
         );
         assert!(live(&userdata).is_empty());
         // And back: pack "a" was captured, not lost.
-        align_for_server(&layout, Some("a")).await.unwrap();
+        align_for_server(&layout, &SEVEN_DAYS, Some("a"))
+            .await
+            .unwrap();
         assert_eq!(live(&userdata), vec!["a.txt"]);
     }
 
     #[tokio::test]
     async fn joining_a_server_with_another_pack_swaps_to_it() {
         let (layout, userdata, _) = fixture("swap").await;
-        let r = align_for_server(&layout, Some("b")).await.unwrap();
+        let r = align_for_server(&layout, &SEVEN_DAYS, Some("b"))
+            .await
+            .unwrap();
         assert_eq!(
             r,
             Alignment::Switched {
@@ -1489,7 +1767,9 @@ mod tests {
     async fn already_matching_is_left_alone() {
         let (layout, userdata, _) = fixture("same").await;
         assert_eq!(
-            align_for_server(&layout, Some("a")).await.unwrap(),
+            align_for_server(&layout, &SEVEN_DAYS, Some("a"))
+                .await
+                .unwrap(),
             Alignment::AlreadyAligned
         );
         assert_eq!(live(&userdata), vec!["a.txt"]);
@@ -1498,7 +1778,9 @@ mod tests {
     #[tokio::test]
     async fn a_pack_not_in_the_profile_refuses_rather_than_joining_wrong() {
         let (layout, userdata, _) = fixture("missing").await;
-        let err = align_for_server(&layout, Some("zzz")).await.unwrap_err();
+        let err = align_for_server(&layout, &SEVEN_DAYS, Some("zzz"))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("isn't installed"), "{err:#}");
         // Nothing was touched.
         assert_eq!(live(&userdata), vec!["a.txt"]);
@@ -1509,8 +1791,250 @@ mod tests {
         let root = std::env::temp_dir().join(format!("packrelay-align-none-{}", new_profile_id()));
         let layout = StoreLayout::new(&root);
         assert_eq!(
-            align_for_server(&layout, None).await.unwrap(),
+            align_for_server(&layout, &SEVEN_DAYS, None).await.unwrap(),
             Alignment::NoProfile
         );
+    }
+
+    // ---------- Multi-game ----------
+
+    use crate::games::{MANIFEST_SIDECAR, VALHEIM};
+
+    /// A Valheim install's BepInEx/ with the loader's own core/ and a
+    /// file in cache/, one Valheim profile with packs "a" (live) and
+    /// "b" (stored, with a plugin and a config).
+    async fn valheim_fixture(name: &str) -> (StoreLayout, PathBuf, String) {
+        let root =
+            std::env::temp_dir().join(format!("packrelay-valheim-{name}-{}", new_profile_id()));
+        let layout = StoreLayout::new(&root.join("app"));
+        let bepinex = root.join("Valheim").join("BepInEx");
+        fs::create_dir_all(bepinex.join("core")).await.unwrap();
+        fs::write(bepinex.join("core").join("BepInEx.dll"), "loader")
+            .await
+            .unwrap();
+        fs::create_dir_all(bepinex.join("cache")).await.unwrap();
+        fs::write(bepinex.join("cache").join("chainloader.dat"), "c")
+            .await
+            .unwrap();
+        fs::create_dir_all(bepinex.join("plugins").join("A-Mod"))
+            .await
+            .unwrap();
+        fs::write(bepinex.join("plugins").join("A-Mod").join("a.dll"), "a")
+            .await
+            .unwrap();
+        fs::write(bepinex.join(MANIFEST_SIDECAR), "pack a")
+            .await
+            .unwrap();
+
+        let meta = create_profile(&layout, &VALHEIM, "Vikings").await.unwrap();
+        set_active(&layout, &VALHEIM, Some(&meta.id), Some(&bepinex))
+            .await
+            .unwrap();
+        add_pack_to_profile(&layout, &meta.id, "a", "1.0")
+            .await
+            .unwrap();
+        add_pack_to_profile(&layout, &meta.id, "b", "1.0")
+            .await
+            .unwrap();
+        let b = ProfilePaths::from_root(&layout.profile_dir(&meta.id))
+            .pack_paths("b")
+            .mods;
+        fs::create_dir_all(b.join("plugins").join("B-Mod"))
+            .await
+            .unwrap();
+        fs::write(b.join("plugins").join("B-Mod").join("b.dll"), "b")
+            .await
+            .unwrap();
+        fs::create_dir_all(b.join("config")).await.unwrap();
+        fs::write(b.join("config").join("b.cfg"), "b")
+            .await
+            .unwrap();
+        fs::write(b.join(MANIFEST_SIDECAR), "pack b").await.unwrap();
+        (layout, bepinex, meta.id)
+    }
+
+    /// Every file under `dir`, relative with forward slashes, sorted.
+    fn tree(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(dir).unwrap();
+                    let parts: Vec<String> = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    out.push(parts.join("/"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn valheim_swaps_only_what_packs_own_under_bepinex() {
+        let (layout, bepinex, _) = valheim_fixture("swap").await;
+        align_for_server(&layout, &VALHEIM, Some("b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            tree(&bepinex),
+            vec![
+                "_packrelay-manifest.json",
+                "cache/chainloader.dat",
+                "config/b.cfg",
+                "core/BepInEx.dll",
+                "plugins/B-Mod/b.dll",
+            ]
+        );
+        // And back: "a" was captured on the way out.
+        align_for_server(&layout, &VALHEIM, Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            tree(&bepinex),
+            vec![
+                "_packrelay-manifest.json",
+                "cache/chainloader.dat",
+                "core/BepInEx.dll",
+                "plugins/A-Mod/a.dll",
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(bepinex.join(MANIFEST_SIDECAR)).unwrap(),
+            "pack a"
+        );
+    }
+
+    #[tokio::test]
+    async fn valheim_vanilla_empties_the_pack_folders_but_keeps_the_loader() {
+        let (layout, bepinex, _) = valheim_fixture("vanilla").await;
+        align_for_server(&layout, &VALHEIM, None).await.unwrap();
+        assert_eq!(
+            tree(&bepinex),
+            vec!["cache/chainloader.dat", "core/BepInEx.dll"]
+        );
+        assert!(
+            bepinex.join("plugins").is_dir(),
+            "BepInEx expects plugins/ to exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn valheim_has_nothing_to_snapshot() {
+        let (layout, _, _) = valheim_fixture("snap").await;
+        let err = snapshot_active(&layout, &VALHEIM, None, 5)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing to snapshot"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn valheim_import_takes_only_the_pack_folders() {
+        let root = std::env::temp_dir().join(format!("packrelay-vimport-{}", new_profile_id()));
+        let layout = StoreLayout::new(&root.join("app"));
+        let bepinex = root.join("Valheim").join("BepInEx");
+        fs::create_dir_all(bepinex.join("core")).await.unwrap();
+        fs::write(bepinex.join("core").join("BepInEx.dll"), "loader")
+            .await
+            .unwrap();
+        fs::create_dir_all(bepinex.join("plugins")).await.unwrap();
+        fs::write(bepinex.join("plugins").join("mine.dll"), "m")
+            .await
+            .unwrap();
+        let meta = import_current_as_profile(&layout, &VALHEIM, &bepinex, "Mine")
+            .await
+            .unwrap();
+        assert_eq!(meta.game, "valheim");
+        let mods = ProfilePaths::from_root(&layout.profile_dir(&meta.id))
+            .pack_paths(IMPORTED_PACK_SLUG)
+            .mods;
+        assert_eq!(tree(&mods), vec!["plugins/mine.dll"]);
+    }
+
+    #[tokio::test]
+    async fn each_game_keeps_its_own_active_profile() {
+        let (layout, userdata, seven_id) = fixture("both").await;
+        let bepinex = userdata.parent().unwrap().join("Valheim").join("BepInEx");
+        fs::create_dir_all(&bepinex).await.unwrap();
+        let viking = create_profile(&layout, &VALHEIM, "Vikings").await.unwrap();
+        set_active(&layout, &VALHEIM, Some(&viking.id), Some(&bepinex))
+            .await
+            .unwrap();
+
+        // Setting Valheim's pointer left 7DTD's alone.
+        assert_eq!(
+            read_active(&layout, &SEVEN_DAYS).await.unwrap(),
+            (Some(seven_id.clone()), Some(userdata.display().to_string()))
+        );
+        assert_eq!(
+            read_active(&layout, &VALHEIM).await.unwrap(),
+            (Some(viking.id.clone()), Some(bepinex.display().to_string()))
+        );
+        let valheim_only = list_profiles(&layout, Some(&VALHEIM)).await.unwrap();
+        assert_eq!(valheim_only.len(), 1);
+        assert!(valheim_only[0].is_active);
+        assert_eq!(valheim_only[0].game, "valheim");
+        assert_eq!(list_profiles(&layout, None).await.unwrap().len(), 2);
+        // Both are active, each for its own game, so neither can go.
+        assert!(delete_profile(&layout, &viking.id).await.is_err());
+        assert!(delete_profile(&layout, &seven_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_profile_only_switches_in_for_its_own_game() {
+        let (layout, userdata, _) = fixture("cross").await;
+        let viking = create_profile(&layout, &VALHEIM, "Vikings").await.unwrap();
+        let err = switch_profile(&layout, &SEVEN_DAYS, &viking.id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("another game"), "{err:#}");
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn profiles_and_pointers_from_before_multi_game_read_as_7dtd() {
+        let root = std::env::temp_dir().join(format!("packrelay-legacy-{}", new_profile_id()));
+        let layout = StoreLayout::new(&root);
+        let paths = ProfilePaths::from_root(&layout.profile_dir("pold"));
+        fs::create_dir_all(&paths.packs_root).await.unwrap();
+        fs::write(
+            &paths.meta,
+            r#"{"id":"pold","name":"Old","schemaVersion":1,"packs":[],"activePackSlug":null,"createdAt":"2026-01-01T00:00:00Z","lastPlayedAt":null}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            layout.active_pointer(),
+            r#"{"activeProfileId":"pold","sevenDtdUserdataDir":"C:/x/7DaysToDie"}"#,
+        )
+        .await
+        .unwrap();
+        let listed = list_profiles(&layout, Some(&SEVEN_DAYS)).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].game, "7d2d");
+        assert!(listed[0].is_active);
+        assert_eq!(read_active(&layout, &VALHEIM).await.unwrap(), (None, None));
+        // Writing Valheim's pointer keeps the old top-level fields where
+        // an older launcher would look for them.
+        set_active(
+            &layout,
+            &VALHEIM,
+            Some("pv"),
+            Some(Path::new("C:/v/BepInEx")),
+        )
+        .await
+        .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.active_pointer()).unwrap())
+                .unwrap();
+        assert_eq!(raw["activeProfileId"], "pold");
+        assert_eq!(raw["sevenDtdUserdataDir"], "C:/x/7DaysToDie");
+        assert_eq!(raw["games"]["valheim"]["activeProfileId"], "pv");
     }
 }
