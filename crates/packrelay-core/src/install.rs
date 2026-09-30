@@ -108,7 +108,8 @@ where
     // Server pin-aware: when target_version is set, fetch THAT
     // manifest, not whatever the publisher's latest is. fetch_manifest_at
     // also asserts the returned manifest's version field matches the
-    // request, so a cloud-side bug can't sneak the wrong version past us.
+    // request, so a cloud-side bug can't sneak the wrong version past us,
+    // and verifies the publisher's signature before we touch the disk.
     let (manifest_raw, manifest) =
         client.fetch_manifest_at(slug, target_version).await?;
 
@@ -182,9 +183,10 @@ where
     }
 
     // Sidecar: preserve the EXACT manifest bytes the server returned
-    // so a future signature verifier can re-check against them. A
-    // re-serialization through serde would change byte order /
-    // whitespace and break that property.
+    // (already signature-checked by fetch_manifest_at) so the
+    // signature can be re-checked against them later. A
+    // re-serialization through serde would drop fields the structs
+    // don't model and break that property.
     let sidecar = dest.join("_packrelay-manifest.json");
     fs::write(&sidecar, manifest_raw.as_bytes())
         .await

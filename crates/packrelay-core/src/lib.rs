@@ -5,10 +5,12 @@
 // reused.
 
 pub mod blob_cache;
+pub mod canonical_json;
 pub mod client;
 pub mod install;
 pub mod manifest;
 pub mod profile;
+pub mod signature;
 pub mod uninstall;
 pub mod update;
 pub mod verify;

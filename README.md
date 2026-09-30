@@ -67,7 +67,7 @@ PackRelay replaces all of that with: click, install, join. Every file is content
 
 The launcher fetches a signed JSON manifest from packrelay.cloud listing every file in a pack along with its SHA-256 hash and size. It then downloads each file by hash from the cloud's content-addressed file endpoint, streaming bytes through both the hasher and the on-disk write in a single pass. If any file's actual hash doesn't match the manifest, the install aborts before writing further bytes.
 
-The manifest itself is Ed25519-signed by the publisher. The signature is verified against the publisher's registered public key on every install — the launcher refuses to lay down any byte from an unsigned, wrong-key, or tampered manifest. See [`packrelay-core`](crates/packrelay-core) for the verify path.
+The manifest itself is Ed25519-signed by the publisher. On every install and update the launcher looks up the key the manifest names in packrelay.cloud's public key directory and verifies the signature over the manifest's canonical JSON — it refuses to lay down any byte from an unsigned, wrong-key, revoked-key, or tampered manifest, or from one built for a game it doesn't support. See [`signature.rs`](crates/packrelay-core/src/signature.rs) for the verify path.
 
 **No telemetry. No analytics. No background processes when the launcher window is closed.**
 
