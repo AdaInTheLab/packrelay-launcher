@@ -26,6 +26,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::blob_cache;
 use crate::client::{Client, VerifiedManifest};
+use crate::games::GameLayout;
 use crate::key_pins::{installed_key_id, KeyPinStore, TrustedKey};
 use crate::manifest::{FileEntry, Manifest};
 use crate::signature::PublisherKey;
@@ -86,9 +87,29 @@ pub struct InstallContext {
     /// A key the player approved after a `KeyChanged` refusal. Only
     /// takes effect if it's exactly the key the manifest is signed with.
     pub trust_key: Option<TrustedKey>,
+    /// The game `dest` belongs to. When set, install and update refuse
+    /// a pack for any other game before touching the disk: a Valheim
+    /// pack must never land in 7DTD's Mods/, or the reverse. None skips
+    /// the check (the CLI, where the user names the folder outright).
+    pub game: Option<&'static GameLayout>,
 }
 
 impl InstallContext {
+    /// Refuse a manifest for another game than the one being installed
+    /// into (see `game`).
+    pub(crate) fn check_game(&self, manifest: &Manifest) -> Result<()> {
+        if let Some(game) = self.game {
+            if manifest.game != game.id {
+                anyhow::bail!(
+                    "this pack is for {}, not {}; install it from there",
+                    manifest.game_layout().display_name,
+                    game.display_name
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Check the verified signer of `slug` against the pack's pinned
     /// keys, when pinning is on. `installed_key_id` is the signer of
     /// the copy already on disk, if any.
@@ -142,6 +163,7 @@ where
     } = client
         .fetch_verified_manifest_at(slug, target_version)
         .await?;
+    ctx.check_game(&manifest)?;
     // A reinstall over an existing copy counts that copy's signer as
     // already known, for installs from before key pinning.
     let installed = installed_key_id(dest, slug).await;

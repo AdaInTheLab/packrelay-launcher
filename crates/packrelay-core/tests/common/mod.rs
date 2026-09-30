@@ -25,7 +25,10 @@ pub async fn serve(routes: Vec<(String, String)>) -> String {
                     }
                 }
                 let req = String::from_utf8_lossy(&req);
-                let path = req.split_whitespace().nth(1).unwrap_or_default();
+                let target = req.split_whitespace().nth(1).unwrap_or_default();
+                // Routes are paths; a query string (the manifest fetch's
+                // ?game=) doesn't change which one answers.
+                let path = target.split('?').next().unwrap_or_default();
                 let (status, body) = match routes.iter().find(|(p, _)| p == path) {
                     Some((_, body)) => ("200 OK", body.clone()),
                     None => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),

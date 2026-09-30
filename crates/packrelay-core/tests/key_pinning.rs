@@ -331,3 +331,43 @@ async fn approving_a_different_key_than_served_does_not_help() {
     key_changed(err);
     assert_eq!(installed_version(dest.path()), "1.0.0");
 }
+
+// ---- the game being installed into (multi-game) ----
+
+#[tokio::test]
+async fn a_pack_for_another_game_is_refused_before_anything_is_written() {
+    let f = fixture();
+    let (dest, data) = (TempDir::new("dest"), TempDir::new("data"));
+    let pins = KeyPinStore::in_dir(data.path());
+    let client = cloud(&f, &f.e2e.manifests.v100).await;
+    // fixture-e2e is a 7DTD pack; this dest is Valheim's.
+    let ctx = InstallContext {
+        game: Some(&packrelay_core::games::VALHEIM),
+        ..pinned(&pins, None)
+    };
+    let err = install(&client, SLUG, dest.path(), 2, None, ctx, |_| {})
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("this pack is for 7 Days to Die, not Valheim"),
+        "{err:#}"
+    );
+    assert!(
+        std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "nothing written"
+    );
+    assert!(
+        pins.pins_for(SLUG).await.unwrap().is_empty(),
+        "no key pinned"
+    );
+
+    // The same pack into 7DTD's folder installs.
+    let ctx = InstallContext {
+        game: Some(&packrelay_core::games::SEVEN_DAYS),
+        ..pinned(&pins, None)
+    };
+    install(&client, SLUG, dest.path(), 2, None, ctx, |_| {})
+        .await
+        .unwrap();
+}
