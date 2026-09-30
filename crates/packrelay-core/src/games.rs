@@ -22,6 +22,15 @@ pub struct SwapEntry {
     pub is_file: bool,
 }
 
+/// How a game takes "join this server" on its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectArgs {
+    /// `-connecttoip=<host> -connecttoport=<port>` (7DTD).
+    ConnectToIpPort,
+    /// `+connect <host>:<port>` (Valheim, and other Source-style games).
+    PlusConnect,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameLayout {
     /// Manifest `game`, as the cloud's registry names it.
@@ -30,6 +39,18 @@ pub struct GameLayout {
     /// For error text: "7DTD", "Valheim".
     pub short_name: &'static str,
     pub steam_appid: u32,
+    /// The install folder under steamapps/common when the app manifest
+    /// doesn't say otherwise.
+    pub steam_install_dir: &'static str,
+    /// The client executable, relative to the install folder.
+    pub exe: &'static str,
+    /// The client port a server uses when its address names none.
+    pub default_port: u16,
+    pub connect_args: ConnectArgs,
+    /// Where the live root is relative to the install folder, for a game
+    /// whose pack lives inside it (Valheim: "BepInEx"). None: the live
+    /// root is elsewhere (7DTD's %APPDATA%/7DaysToDie).
+    pub live_root_in_install: Option<&'static str>,
     /// Where the mods slot is under the live root. "" = the live root
     /// itself.
     pub mods_live: &'static str,
@@ -53,6 +74,11 @@ pub const SEVEN_DAYS: GameLayout = GameLayout {
     display_name: "7 Days to Die",
     short_name: "7DTD",
     steam_appid: 251570,
+    steam_install_dir: "7 Days To Die",
+    exe: "7DaysToDie.exe",
+    default_port: 26900,
+    connect_args: ConnectArgs::ConnectToIpPort,
+    live_root_in_install: None,
     mods_live: "Mods",
     mods_entries: None,
     saves_live: Some("Saves"),
@@ -91,6 +117,11 @@ pub const VALHEIM: GameLayout = GameLayout {
     display_name: "Valheim",
     short_name: "Valheim",
     steam_appid: 892970,
+    steam_install_dir: "Valheim",
+    exe: "valheim.exe",
+    default_port: 2456,
+    connect_args: ConnectArgs::PlusConnect,
+    live_root_in_install: Some("BepInEx"),
     mods_live: "",
     mods_entries: Some(VALHEIM_ENTRIES),
     // Worlds and characters live in LocalLow/IronGate/Valheim, shared by

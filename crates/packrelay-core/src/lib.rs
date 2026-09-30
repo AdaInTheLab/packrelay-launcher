@@ -7,12 +7,15 @@
 pub mod blob_cache;
 pub mod canonical_json;
 pub mod client;
+pub mod framework;
 pub mod games;
 pub mod install;
 pub mod key_pins;
+pub mod launch;
 pub mod manifest;
 pub mod profile;
 pub mod signature;
+pub mod steam;
 pub mod uninstall;
 pub mod update;
 pub mod verify;
