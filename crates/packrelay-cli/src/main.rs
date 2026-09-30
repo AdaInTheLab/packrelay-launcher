@@ -5,14 +5,15 @@
 // for the terminal; the Tauri GUI app does the same job with
 // frontend events emitted into the React UI.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use packrelay_core::client::Client;
-use packrelay_core::install::{install, ProgressEvent};
+use packrelay_core::install::{install, InstallContext, ProgressEvent};
+use packrelay_core::key_pins::{KeyChanged, KeyPinStore, TrustedKey};
 use packrelay_core::verify;
 
 #[derive(Parser)]
@@ -48,6 +49,15 @@ enum Cmd {
         /// How many file downloads to run in parallel.
         #[arg(long, default_value = "8")]
         concurrency: usize,
+        /// Pin each pack's signing key in this file on first install,
+        /// and refuse later versions signed by a different key until
+        /// you trust it with --trust-key. Off when unset.
+        #[arg(long, env = "PACKRELAY_KEY_PINS")]
+        key_pins: Option<PathBuf>,
+        /// Trust a new signing key for this pack, as
+        /// `<key-id>=<base64-key>`, exactly as a refused install prints it.
+        #[arg(long, value_parser = TrustedKey::parse_cli, requires = "key_pins")]
+        trust_key: Option<TrustedKey>,
     },
     /// Re-verify an already-installed pack against its sidecar manifest.
     Verify {
@@ -68,7 +78,18 @@ async fn main() -> Result<()> {
             slug,
             dest,
             concurrency,
-        } => run_install(&client, &slug, &dest, concurrency).await,
+            key_pins,
+            trust_key,
+        } => {
+            // No profiles or blob cache for headless usage; key pinning
+            // only when asked for.
+            let ctx = InstallContext {
+                key_pins: key_pins.map(KeyPinStore::new),
+                trust_key,
+                ..Default::default()
+            };
+            run_install(&client, &slug, &dest, concurrency, ctx).await
+        }
         Cmd::Verify { dest } => verify::run(&dest).await,
     }
 }
@@ -81,16 +102,13 @@ async fn run_install(
     slug: &str,
     dest: &Path,
     concurrency: usize,
+    ctx: InstallContext,
 ) -> Result<()> {
     println!("[install] fetching manifest for '{slug}'...");
 
     let bar: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
     let bar_for_cb = bar.clone();
 
-    // CLI doesn't manage profiles or a blob cache — pass a default
-    // (empty) context so install behaves exactly as it did before
-    // the Phase 4 changes for headless usage.
-    let ctx = packrelay_core::install::InstallContext::default();
     // CLI defaults to latest — no --version flag yet. When/if the CLI
     // grows a pin/version arg, thread Some(&v) through here.
     let report = install(client, slug, dest, concurrency, None, ctx, move |ev: ProgressEvent| {
@@ -135,7 +153,14 @@ async fn run_install(
             }
         }
     })
-    .await?;
+    .await
+    .map_err(|e| match e.downcast_ref::<KeyChanged>() {
+        Some(change) => anyhow!(
+            "{change}\n\nTo trust the new key, re-run with:\n  --trust-key {}",
+            change.offered
+        ),
+        None => e,
+    })?;
 
     println!(
         "[install] verified {} files, {:.1} MB. Installed into {}",

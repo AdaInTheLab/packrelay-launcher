@@ -15,6 +15,16 @@ pub struct Client {
     api_url: String,
 }
 
+/// A manifest whose signature has been checked, with the key that
+/// signed it.
+#[derive(Debug, Clone)]
+pub struct VerifiedManifest {
+    /// The exact bytes the cloud served (what the sidecar stores).
+    pub raw: String,
+    pub manifest: Manifest,
+    pub key: PublisherKey,
+}
+
 impl Client {
     pub fn new(api_url: &str) -> Self {
         let http = HttpClient::builder()
@@ -78,6 +88,18 @@ impl Client {
         slug: &str,
         version: Option<&str>,
     ) -> Result<(String, Manifest)> {
+        let verified = self.fetch_verified_manifest_at(slug, version).await?;
+        Ok((verified.raw, verified.manifest))
+    }
+
+    /// `fetch_manifest_at`, plus the publisher key the signature was
+    /// verified against. Install and update need the key to check it
+    /// against the pack's pinned keys (see key_pins.rs).
+    pub async fn fetch_verified_manifest_at(
+        &self,
+        slug: &str,
+        version: Option<&str>,
+    ) -> Result<VerifiedManifest> {
         let url = match version {
             Some(v) => format!("{}/api/v1/packs/{}/manifest/{}", self.api_url, slug, v),
             None => format!("{}/api/v1/packs/{}/manifest", self.api_url, slug),
@@ -145,7 +167,7 @@ impl Client {
                 );
             }
         }
-        Ok((raw, manifest))
+        Ok(VerifiedManifest { raw, manifest, key })
     }
 
     /// Resolve a manifest's `signature.publicKeyId` to the publisher's

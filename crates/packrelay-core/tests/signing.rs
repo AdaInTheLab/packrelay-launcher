@@ -13,7 +13,9 @@ use packrelay_core::manifest::{parse_manifest, Signature};
 use packrelay_core::signature::{verify_manifest_signature, PublisherKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod common;
+use common::serve;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,41 +224,6 @@ fn unsupported_schema_version_fails() {
 }
 
 // ---- end to end through Client::fetch_manifest_at ----
-
-/// Minimal HTTP/1.1 server answering GETs from a fixed route table
-/// (anything else is a 404). Returns its base URL.
-async fn serve(routes: Vec<(String, String)>) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = listener.accept().await {
-            let routes = routes.clone();
-            tokio::spawn(async move {
-                let mut req = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match sock.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => req.extend_from_slice(&chunk[..n]),
-                    }
-                }
-                let req = String::from_utf8_lossy(&req);
-                let path = req.split_whitespace().nth(1).unwrap_or_default();
-                let (status, body) = match routes.iter().find(|(p, _)| p == path) {
-                    Some((_, body)) => ("200 OK", body.clone()),
-                    None => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{addr}")
-}
 
 fn key_route(f: &Fixture) -> (String, String) {
     (

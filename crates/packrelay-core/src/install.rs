@@ -25,8 +25,10 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::blob_cache;
-use crate::client::Client;
+use crate::client::{Client, VerifiedManifest};
+use crate::key_pins::{installed_key_id, KeyPinStore, TrustedKey};
 use crate::manifest::{FileEntry, Manifest};
+use crate::signature::PublisherKey;
 
 /// Progress events emitted during an install run.
 ///
@@ -79,6 +81,32 @@ pub struct InstallReport {
 pub struct InstallContext {
     pub cache_root: Option<PathBuf>,
     pub profile_mods: Option<PathBuf>,
+    /// Pinned signing keys (see key_pins.rs). When set, install and
+    /// update refuse a pack signed by a key not pinned for it, with a
+    /// `KeyChanged` error, before touching the disk. None skips
+    /// pinning (the CLI's default).
+    pub key_pins: Option<KeyPinStore>,
+    /// A key the player approved after a `KeyChanged` refusal. Only
+    /// takes effect if it's exactly the key the manifest is signed with.
+    pub trust_key: Option<TrustedKey>,
+}
+
+impl InstallContext {
+    /// Check the verified signer of `slug` against the pack's pinned
+    /// keys, when pinning is on. `installed_key_id` is the signer of
+    /// the copy already on disk, if any.
+    pub(crate) async fn check_signing_key(
+        &self,
+        slug: &str,
+        key: &PublisherKey,
+        installed_key_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(pins) = &self.key_pins {
+            pins.check_and_pin(slug, key, installed_key_id, self.trust_key.as_ref())
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 /// Install a pack into `dest`. Spawns up to `concurrency` parallel
@@ -110,8 +138,15 @@ where
     // also asserts the returned manifest's version field matches the
     // request, so a cloud-side bug can't sneak the wrong version past us,
     // and verifies the publisher's signature before we touch the disk.
-    let (manifest_raw, manifest) =
-        client.fetch_manifest_at(slug, target_version).await?;
+    let VerifiedManifest {
+        raw: manifest_raw,
+        manifest,
+        key,
+    } = client.fetch_verified_manifest_at(slug, target_version).await?;
+    // A reinstall over an existing copy counts that copy's signer as
+    // already known, for installs from before key pinning.
+    let installed = installed_key_id(dest, slug).await;
+    ctx.check_signing_key(slug, &key, installed.as_deref()).await?;
 
     fs::create_dir_all(dest)
         .await
