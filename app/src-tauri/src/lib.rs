@@ -23,7 +23,7 @@ use crate::auth::{clear_stored_token, load_stored_token, save_token, validate_to
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
-use packrelay_core::key_pins::{KeyChanged, KeyPinStore, TrustedKey};
+use packrelay_core::key_pins::{KeyChanged, KeyPinStore, PinnedKey, TrustedKey};
 use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::update::{update, UpdateReport};
@@ -56,18 +56,59 @@ fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
 async fn build_install_context(app: &AppHandle) -> Result<InstallContext, String> {
     let layout = store_layout(app)?;
     let profile_mods = active_pack_mods_dir(&layout).await;
-    // Signing-key pins sit beside the store, not in it: they're about
-    // which publishers the player trusts, not about any profile.
+    Ok(InstallContext {
+        cache_root: Some(layout.cache_dir()),
+        profile_mods,
+        key_pins: Some(key_pin_store(app)?),
+        trust_key: None,
+    })
+}
+
+/// The signing-key pin file. It sits beside the store, not in it:
+/// pins are about which publishers the player trusts, not about any
+/// profile.
+fn key_pin_store(app: &AppHandle) -> Result<KeyPinStore, String> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("resolving app data dir: {e}"))?;
-    Ok(InstallContext {
-        cache_root: Some(layout.cache_dir()),
-        profile_mods,
-        key_pins: Some(KeyPinStore::in_dir(&data_dir)),
-        trust_key: None,
-    })
+    Ok(KeyPinStore::in_dir(&data_dir))
+}
+
+/// One pack's trusted signing keys, for the Settings screen.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustedPackKeys {
+    slug: String,
+    /// Oldest pin first.
+    keys: Vec<PinnedKey>,
+}
+
+/// Every pack's trusted signing keys, sorted by slug.
+#[tauri::command]
+async fn list_trusted_keys(app: AppHandle) -> Result<Vec<TrustedPackKeys>, String> {
+    let pins = key_pin_store(&app)?
+        .all_pins()
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(pins
+        .into_iter()
+        .map(|(slug, keys)| TrustedPackKeys { slug, keys })
+        .collect())
+}
+
+/// Stop trusting one signing key for a pack, or all of its keys when
+/// `key` is null. Returns how many were forgotten.
+#[tauri::command]
+async fn forget_trusted_key(
+    app: AppHandle,
+    slug: String,
+    key: Option<TrustedKey>,
+) -> Result<usize, String> {
+    key_pin_store(&app)?
+        .forget(&slug, key.as_ref())
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Error shape for `install_pack` / `update_pack`. `keyChanged` means
@@ -1720,6 +1761,8 @@ pub fn run() {
             profile_clone,
             cache_stats,
             cache_gc,
+            list_trusted_keys,
+            forget_trusted_key,
             profile_set_active_pack,
             profile_snapshot_active,
             profile_list_snapshots,
