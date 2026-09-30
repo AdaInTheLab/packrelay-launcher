@@ -116,5 +116,18 @@
       },
       "canonical": "{\"outer\":{\"alpha\":{\"b c\":\"d\\ne\"},\"zeta\":[{\"x\":1,\"y\":2}]}}"
     }
-  ]
+  ],
+  "e2e": {
+    "rotatedKeyId": "fixture-pub/rotated",
+    "rotatedPublicKey": "F8t5+ytBIPKx7GXkGY1uCLKOgT/rAeSkAIObheGAgM4=",
+    "files": {
+      "d4abd9406d0dc604b4f88ce56aa6c0352575d74c1b88ab4a06d5171835207142": "hello from the fixture pack\n",
+      "b68658c293276052265002a597412257b3d3a46143224e38561ef6d5287bae60": "added in 1.1.0\n"
+    },
+    "manifests": {
+      "v100": "{\"schemaVersion\":2,\"name\":\"fixture-e2e\",\"displayName\":\"Fixture E2E\",\"version\":\"1.0.0\",\"game\":\"7d2d\",\"gameVersion\":\"V 2.4\",\"publisher\":\"Fixture Publisher\",\"publishedAt\":\"2026-09-30T12:00:00Z\",\"files\":[{\"path\":\"Mods/E2E/hello.txt\",\"sha256\":\"d4abd9406d0dc604b4f88ce56aa6c0352575d74c1b88ab4a06d5171835207142\",\"size\":28}],\"signature\":{\"algo\":\"ed25519\",\"publicKeyId\":\"fixture-pub/main\",\"value\":\"04ef8d44e28bd1c1c65df9a45d790b0189c206edde68aa51eba6a7a6c1c422648fd365c35500884ae2bad550b44233e10db5ca46f6fd5398c188012419511403\"}}",
+      "v110": "{\"schemaVersion\":2,\"name\":\"fixture-e2e\",\"displayName\":\"Fixture E2E\",\"version\":\"1.1.0\",\"game\":\"7d2d\",\"gameVersion\":\"V 2.4\",\"publisher\":\"Fixture Publisher\",\"publishedAt\":\"2026-09-30T12:00:00Z\",\"files\":[{\"path\":\"Mods/E2E/hello.txt\",\"sha256\":\"d4abd9406d0dc604b4f88ce56aa6c0352575d74c1b88ab4a06d5171835207142\",\"size\":28},{\"path\":\"Mods/E2E/second.txt\",\"sha256\":\"b68658c293276052265002a597412257b3d3a46143224e38561ef6d5287bae60\",\"size\":15}],\"signature\":{\"algo\":\"ed25519\",\"publicKeyId\":\"fixture-pub/main\",\"value\":\"416b4144ed480e08d4b8a4a2d43ef84a6133016aaabdb48a5987d2f7caddb7556a065be1f700cdba2d704b028ad5fb37b5715c3f91e83fdb1b287e6973b28800\"}}",
+      "v110Rotated": "{\"schemaVersion\":2,\"name\":\"fixture-e2e\",\"displayName\":\"Fixture E2E\",\"version\":\"1.1.0\",\"game\":\"7d2d\",\"gameVersion\":\"V 2.4\",\"publisher\":\"Fixture Publisher\",\"publishedAt\":\"2026-09-30T12:00:00Z\",\"files\":[{\"path\":\"Mods/E2E/hello.txt\",\"sha256\":\"d4abd9406d0dc604b4f88ce56aa6c0352575d74c1b88ab4a06d5171835207142\",\"size\":28},{\"path\":\"Mods/E2E/second.txt\",\"sha256\":\"b68658c293276052265002a597412257b3d3a46143224e38561ef6d5287bae60\",\"size\":15}],\"signature\":{\"algo\":\"ed25519\",\"publicKeyId\":\"fixture-pub/rotated\",\"value\":\"15d5bc1f384b40e5731c38ecc1278699557e9c5df6862e0c7b76d8ced9117e80360971c8cd0fa8c873a839cf2c6451881693cb0ccc20bf6632c69625d58b0c02\"}}"
+    }
+  }
 }

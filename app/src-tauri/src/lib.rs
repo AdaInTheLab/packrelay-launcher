@@ -25,6 +25,7 @@ use crate::auth::{
 use packrelay_core::blob_cache::{self, CacheStats, GcResult};
 use packrelay_core::client::Client;
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
+use packrelay_core::key_pins::{KeyChanged, KeyPinStore, TrustedKey};
 use packrelay_core::profile::{
     self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout,
 };
@@ -59,10 +60,55 @@ fn store_layout(app: &AppHandle) -> Result<StoreLayout, String> {
 async fn build_install_context(app: &AppHandle) -> Result<InstallContext, String> {
     let layout = store_layout(app)?;
     let profile_mods = active_pack_mods_dir(&layout).await;
+    // Signing-key pins sit beside the store, not in it: they're about
+    // which publishers the player trusts, not about any profile.
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("resolving app data dir: {e}"))?;
     Ok(InstallContext {
         cache_root: Some(layout.cache_dir()),
         profile_mods,
+        key_pins: Some(KeyPinStore::in_dir(&data_dir)),
+        trust_key: None,
     })
+}
+
+/// Error shape for `install_pack` / `update_pack`. `keyChanged` means
+/// the pack is validly signed but by a key the player hasn't trusted
+/// for it yet; the UI shows both keys and can retry with `trustKey`
+/// set to `offered`. Everything else is a plain message.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum InstallError {
+    KeyChanged {
+        message: String,
+        #[serde(flatten)]
+        change: KeyChanged,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl From<anyhow::Error> for InstallError {
+    fn from(e: anyhow::Error) -> Self {
+        match e.downcast_ref::<KeyChanged>() {
+            Some(change) => InstallError::KeyChanged {
+                message: change.to_string(),
+                change: change.clone(),
+            },
+            None => InstallError::Failed {
+                message: format!("{e:#}"),
+            },
+        }
+    }
+}
+
+impl From<String> for InstallError {
+    fn from(message: String) -> Self {
+        InstallError::Failed { message }
+    }
 }
 
 /// Resolve the active profile's active pack's `mods/` directory --
@@ -312,7 +358,8 @@ async fn install_pack(
     slug: String,
     dest: String,
     version: Option<String>,
-) -> Result<InstallReport, String> {
+    trust_key: Option<TrustedKey>,
+) -> Result<InstallReport, InstallError> {
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
 
@@ -362,7 +409,8 @@ async fn install_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let ctx = build_install_context(&app).await?;
+    let mut ctx = build_install_context(&app).await?;
+    ctx.trust_key = trust_key;
     let report = install(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
@@ -406,8 +454,7 @@ async fn install_pack(
         // mid-install; the install itself still completes on disk.
         let _ = app_clone.emit("install://progress", payload);
     })
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    .await?;
 
     // Best-effort: tell the active profile what pack lives here now.
     // Failures are non-fatal — the install itself succeeded.
@@ -434,7 +481,8 @@ async fn update_pack(
     slug: String,
     dest: String,
     version: Option<String>,
-) -> Result<UpdateReport, String> {
+    trust_key: Option<TrustedKey>,
+) -> Result<UpdateReport, InstallError> {
     let client = Client::new(DEFAULT_API_URL);
     let dest_path = PathBuf::from(&dest);
 
@@ -450,7 +498,8 @@ async fn update_pack(
     let file_count_clone = file_count.clone();
     let app_clone = app.clone();
 
-    let ctx = build_install_context(&app).await?;
+    let mut ctx = build_install_context(&app).await?;
+    ctx.trust_key = trust_key;
     let report = update(&client, &slug, &dest_path, 8, version.as_deref(), ctx, move |ev: ProgressEvent| {
         let payload = match ev {
             ProgressEvent::Started {
@@ -492,8 +541,7 @@ async fn update_pack(
         };
         let _ = app_clone.emit("install://progress", payload);
     })
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    .await?;
 
     // Update the profile's bound version to the new one.
     if let Ok(layout) = store_layout(&app) {

@@ -8,6 +8,7 @@ pub mod blob_cache;
 pub mod canonical_json;
 pub mod client;
 pub mod install;
+pub mod key_pins;
 pub mod manifest;
 pub mod profile;
 pub mod signature;

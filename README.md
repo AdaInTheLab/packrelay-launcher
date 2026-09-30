@@ -69,6 +69,8 @@ The launcher fetches a signed JSON manifest from packrelay.cloud listing every f
 
 The manifest itself is Ed25519-signed by the publisher. On every install and update the launcher looks up the key the manifest names in packrelay.cloud's public key directory and verifies the signature over the manifest's canonical JSON — it refuses to lay down any byte from an unsigned, wrong-key, revoked-key, or tampered manifest, or from one built for a game it doesn't support. See [`signature.rs`](crates/packrelay-core/src/signature.rs) for the verify path.
 
+The launcher also remembers which key signed each pack the first time you install it (trust on first use). If a later version is signed by a different key, it stops and shows you both keys before installing anything. That can be legitimate, when a pack's team adds a signer or its owner changes keys, so you can choose to trust the new key, but it also means a compromised key directory can't quietly re-sign a pack you already have. See [`key_pins.rs`](crates/packrelay-core/src/key_pins.rs).
+
 **No telemetry. No analytics. No background processes when the launcher window is closed.**
 
 ## Architecture

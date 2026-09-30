@@ -139,11 +139,50 @@ type DoneResult =
   | { mode: "install" | "reinstall"; report: InstallReport }
   | { mode: "update"; report: UpdateReport };
 
+// Mirrors packrelay_core::key_pins::TrustedKey: a signing key the
+// player agreed to trust for a pack.
+type TrustedKey = { keyId: string; publicKey: string };
+
+// install_pack / update_pack's `keyChanged` error (Rust InstallError):
+// the pack is validly signed, but by a key this launcher hasn't
+// trusted for it yet. `publicKey` is null for a key known only by
+// name from an install made before key pinning.
+type KeyChange = {
+  kind: "keyChanged";
+  message: string;
+  slug: string;
+  trusted: { keyId: string; publicKey: string | null }[];
+  offered: TrustedKey;
+};
+
 type InstallState =
   | { kind: "idle" }
   | { kind: "running"; progress: InstallProgress | null }
   | { kind: "done"; result: DoneResult }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | { kind: "keyChanged"; change: KeyChange };
+
+function isKeyChange(e: unknown): e is KeyChange {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    (e as { kind?: unknown }).kind === "keyChanged"
+  );
+}
+
+// Tauri commands reject with a string, a { kind, message } object
+// (install_pack / update_pack), or a thrown Error.
+function commandErrorMessage(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (
+    typeof e === "object" &&
+    e !== null &&
+    typeof (e as { message?: unknown }).message === "string"
+  ) {
+    return (e as { message: string }).message;
+  }
+  return `${e}`;
+}
 
 // Lives at the App level so the bottom-of-LeftRail dock can show
 // progress even when the user has navigated away from InstallView.
@@ -2913,7 +2952,9 @@ function InstallView({
     }
   }
 
-  async function startInstall() {
+  // `trustKey` is set only when retrying after a KeyChangedCard: the
+  // exact key the player agreed to trust for this pack.
+  async function startInstall(trustKey?: TrustedKey) {
     setState({ kind: "running", progress: null });
 
     // Pre-flight disk-presence probe. The chosen `mode` is derived
@@ -2969,6 +3010,7 @@ function InstallView({
           slug: pack.slug,
           dest,
           version: targetVersion,
+          trustKey: trustKey ?? null,
         });
         // Thicc check: even with the Rust-side guard, sanity-check the
         // returned report against the caller's pin before showing a
@@ -2988,6 +3030,7 @@ function InstallView({
           slug: pack.slug,
           dest,
           version: targetVersion,
+          trustKey: trustKey ?? null,
         });
         if (targetVersion && report.version !== targetVersion) {
           throw new Error(
@@ -3007,10 +3050,11 @@ function InstallView({
         onInstalled(report);
       }
     } catch (e) {
-      setState({
-        kind: "error",
-        message: typeof e === "string" ? e : `${e}`,
-      });
+      if (isKeyChange(e)) {
+        setState({ kind: "keyChanged", change: e });
+      } else {
+        setState({ kind: "error", message: commandErrorMessage(e) });
+      }
     } finally {
       // Done OR error → clear the dock either way. The InstallView
       // itself shows the success/failure card to the user; the dock
@@ -3162,7 +3206,7 @@ function InstallView({
           {state.kind === "idle" && (
             <button
               type="button"
-              onClick={startInstall}
+              onClick={() => startInstall()}
               disabled={!dest.trim()}
               className="inline-flex items-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
             >
@@ -3251,14 +3295,108 @@ function InstallView({
               </div>
               <button
                 type="button"
-                onClick={startInstall}
+                onClick={() => startInstall()}
                 className="mt-3 inline-flex items-center gap-2 px-4 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 hover:text-[var(--color-text-bright)] text-[var(--color-text-bright)]/85 text-xs"
               >
                 Retry
               </button>
             </div>
           )}
+          {state.kind === "keyChanged" && (
+            <KeyChangedCard
+              change={state.change}
+              actionLabel={
+                mode === "update"
+                  ? "Trust new key & update"
+                  : "Trust new key & install"
+              }
+              onTrust={() => startInstall(state.change.offered)}
+              onCancel={() => setState({ kind: "idle" })}
+            />
+          )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Shown when a pack's new version is validly signed, but by a key this
+// launcher hasn't trusted for the pack (packrelay-core key_pins.rs).
+// Trusting retries with exactly the offered key; if the cloud serves a
+// different key on the retry, the card comes straight back.
+function KeyChangedCard({
+  change,
+  actionLabel,
+  onTrust,
+  onCancel,
+}: {
+  change: KeyChange;
+  actionLabel: string;
+  onTrust: () => void;
+  onCancel: () => void;
+}) {
+  const sameName = change.trusted.some(
+    (k) => k.keyId === change.offered.keyId
+  );
+  const shortKey = (k: string) => `${k.slice(0, 12)}…`;
+  return (
+    <div className="rounded-md border border-[var(--color-status-warning)]/40 bg-[var(--color-status-warning)]/10 px-4 py-3 text-sm">
+      <div className="font-medium mb-2">
+        Signing key changed for {change.slug}
+      </div>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs mb-3">
+        <dt className="text-[var(--color-text-dim)]">Trusted</dt>
+        <dd className="font-mono break-all">
+          {change.trusted.map((k) => (
+            <div
+              key={`${k.keyId}:${k.publicKey ?? ""}`}
+              title={k.publicKey ?? undefined}
+            >
+              {k.keyId}
+              {k.publicKey && (
+                <span className="text-[var(--color-text-dim)]">
+                  {" "}
+                  · {shortKey(k.publicKey)}
+                </span>
+              )}
+            </div>
+          ))}
+        </dd>
+        <dt className="text-[var(--color-text-dim)]">Now signed by</dt>
+        <dd className="font-mono break-all" title={change.offered.publicKey}>
+          {change.offered.keyId}
+          <span className="text-[var(--color-text-dim)]">
+            {" "}
+            · {shortKey(change.offered.publicKey)}
+          </span>
+        </dd>
+      </dl>
+      <p className="text-xs text-[var(--color-text-dim)]">
+        This happens when a pack's team adds a signer or its owner changes
+        keys, and also when someone is tampering with the pack. If you're not
+        sure, cancel and check with the pack's publisher.
+      </p>
+      {sameName && (
+        <p className="text-xs text-[var(--color-status-danger)] mt-2">
+          The key name is unchanged but the key itself is different.
+          PackRelay keys never change like that on their own.
+        </p>
+      )}
+      <div className="mt-3 flex gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="inline-flex items-center px-4 py-1.5 rounded-md border border-[var(--color-bg-raised)] hover:border-[var(--color-accent-soft)]/40 text-[var(--color-text-bright)]/85 text-xs"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onTrust}
+          className="inline-flex items-center px-4 py-1.5 rounded-md border border-[var(--color-status-warning)]/50 hover:bg-[var(--color-status-warning)]/15 text-[var(--color-text-bright)] text-xs"
+        >
+          {actionLabel}
+        </button>
       </div>
     </div>
   );

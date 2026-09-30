@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 
-use crate::client::Client;
+use crate::client::{Client, VerifiedManifest};
 use crate::install::{download_and_verify, InstallContext, ProgressEvent};
 use crate::manifest::{FileEntry, Manifest};
 
@@ -75,7 +75,17 @@ where
     // endpoint so a server pinned to v0.2.0 doesn't silently get
     // updated to latest v0.4.0 — this is the v0.1.6 bug screenshot
     // upgrade-to-pinned shows in the wild.
-    let (new_raw, new_manifest) = client.fetch_manifest_at(slug, target_version).await?;
+    let VerifiedManifest {
+        raw: new_raw,
+        manifest: new_manifest,
+        key,
+    } = client.fetch_verified_manifest_at(slug, target_version).await?;
+    // Checked ahead of the no-op exit below, so installs from before
+    // key pinning get their key pinned on the first update check. The
+    // installed copy's signer only counts if it's this pack's sidecar.
+    let installed_key_id = (old_manifest.name == slug)
+        .then_some(old_manifest.signature.public_key_id.as_str());
+    ctx.check_signing_key(slug, &key, installed_key_id).await?;
 
     // No-op early exit when the catalog matches what's installed.
     // Saves us from emitting a Started/Done pair for zero work.

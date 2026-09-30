@@ -14,7 +14,7 @@
  * Keys come from fixed seeds, so re-running produces the same file
  * unless the cloud's canonicalization or schema changes.
  */
-import { createPrivateKey, createPublicKey, sign } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import { execSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -49,22 +49,27 @@ function keyFromSeed(fill: number) {
 
 const signer = keyFromSeed(0x11);
 const stranger = keyFromSeed(0x22);
+// A second key the same publisher "rotates" to, for key-pinning tests.
+const rotated = keyFromSeed(0x33);
+const ROTATED_KEY_ID = "fixture-pub/rotated";
 
-function signManifest(unsigned: Record<string, unknown>) {
-  const value = sign(null, canonicalBytes(unsigned), signer.privateKey).toString("hex");
-  return { ...unsigned, signature: { algo: "ed25519", publicKeyId: KEY_ID, value } };
+type KeyPair = ReturnType<typeof keyFromSeed>;
+
+function signManifest(unsigned: Record<string, unknown>, key: KeyPair = signer, keyId = KEY_ID) {
+  const value = sign(null, canonicalBytes(unsigned), key.privateKey).toString("hex");
+  return { ...unsigned, signature: { algo: "ed25519", publicKeyId: keyId, value } };
 }
 
 // What the versions route stores and the manifest route serves:
 // JSON.stringify of the Zod-parsed manifest. Verified with the cloud's
 // own verifier so a fixture the cloud would reject can't sneak in.
-async function stored(signed: Record<string, unknown>) {
+async function stored(signed: Record<string, unknown>, key: KeyPair = signer, wrongKey: KeyPair = stranger) {
   const parsed = parseManifest(signed);
   if (!parsed.ok) throw new Error(`cloud rejected fixture manifest: ${parsed.error}`);
-  if (!(await verifyManifestSignature(parsed.manifest, signer.publicKey))) {
+  if (!(await verifyManifestSignature(parsed.manifest, key.publicKey))) {
     throw new Error("cloud failed to verify fixture signature");
   }
-  if (await verifyManifestSignature(parsed.manifest, stranger.publicKey)) {
+  if (await verifyManifestSignature(parsed.manifest, wrongKey.publicKey)) {
     throw new Error("cloud verified fixture against the wrong key");
   }
   return JSON.stringify(parsed.manifest);
@@ -163,6 +168,33 @@ const canonicalInputs: unknown[] = [
   { outer: { zeta: [{ y: 2, x: 1 }], alpha: { "b c": "d\ne" } } },
 ];
 
+// End-to-end pack for install/update tests (key pinning). Its files
+// are real, so the launcher can download and hash-check them. v1.1.0
+// exists twice: signed with the pack's usual key, and with a rotated
+// one, as if the publisher had changed keys between versions.
+const e2eFiles: Record<string, string> = {
+  "Mods/E2E/hello.txt": "hello from the fixture pack\n",
+  "Mods/E2E/second.txt": "added in 1.1.0\n",
+};
+const e2eEntry = (path: string) => ({
+  path,
+  sha256: createHash("sha256").update(e2eFiles[path]).digest("hex"),
+  size: Buffer.byteLength(e2eFiles[path]),
+});
+const e2eManifest = (version: string, paths: string[]) => ({
+  schemaVersion: 2,
+  name: "fixture-e2e",
+  displayName: "Fixture E2E",
+  version,
+  game: "7d2d",
+  gameVersion: "V 2.4",
+  publisher: "Fixture Publisher",
+  publishedAt: "2026-09-30T12:00:00Z",
+  files: paths.map(e2eEntry),
+});
+const e2eV100 = e2eManifest("1.0.0", ["Mods/E2E/hello.txt"]);
+const e2eV110 = e2eManifest("1.1.0", ["Mods/E2E/hello.txt", "Mods/E2E/second.txt"]);
+
 let cloudSha = "unknown";
 try {
   cloudSha = execSync("git rev-parse --short HEAD", { cwd: cloudDir }).toString().trim();
@@ -180,6 +212,19 @@ const fixture = {
     otherGame: JSON.stringify(otherGame),
   },
   canonical: canonicalInputs.map((input) => ({ input, canonical: canonicalize(input) })),
+  e2e: {
+    rotatedKeyId: ROTATED_KEY_ID,
+    rotatedPublicKey: rotated.publicKey,
+    // sha256 -> file contents, served by the test's fake file endpoint.
+    files: Object.fromEntries(
+      Object.keys(e2eFiles).map((p) => [e2eEntry(p).sha256, e2eFiles[p]])
+    ),
+    manifests: {
+      v100: await stored(signManifest(e2eV100)),
+      v110: await stored(signManifest(e2eV110)),
+      v110Rotated: await stored(signManifest(e2eV110, rotated, ROTATED_KEY_ID), rotated, signer),
+    },
+  },
 };
 
 const out = join(here, "signing-fixture.json");
