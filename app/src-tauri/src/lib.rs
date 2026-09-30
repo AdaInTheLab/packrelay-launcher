@@ -1128,6 +1128,24 @@ async fn profile_delete(app: AppHandle, id: String) -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Live game `Mods/` dirs whose sidecar the cache GC must also count:
+/// the active profile's configured userdata `Mods/`, plus the
+/// platform default (where installs land when profiles aren't set
+/// up). The active pack's files can exist only there, so leaving
+/// them out would let GC delete blobs the running pack still uses.
+async fn gc_live_mods_dirs(layout: &StoreLayout) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok((_, Some(userdata))) = profile::read_active(layout).await {
+        dirs.push(PathBuf::from(userdata).join("Mods"));
+    }
+    if let Some(p) = canonical_mods_path() {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
 /// Dry-run snapshot of what's in the blob cache + how much of it
 /// could be reclaimed. Backs the "Cache" section of the Settings
 /// page — the user sees the number BEFORE clicking the destructive
@@ -1138,6 +1156,7 @@ async fn cache_stats(app: AppHandle) -> Result<CacheStats, String> {
     blob_cache::cache_stats(
         &layout.cache_dir(),
         &layout.profiles_dir(),
+        &gc_live_mods_dirs(&layout).await,
         Some(&layout.cache_gc_state_path()),
     )
     .await
@@ -1153,6 +1172,7 @@ async fn cache_gc(app: AppHandle) -> Result<GcResult, String> {
     blob_cache::gc_cache(
         &layout.cache_dir(),
         &layout.profiles_dir(),
+        &gc_live_mods_dirs(&layout).await,
         &layout.cache_gc_state_path(),
     )
     .await
@@ -1617,6 +1637,7 @@ pub fn run() {
                 match blob_cache::gc_if_due(
                     &layout.cache_dir(),
                     &layout.profiles_dir(),
+                    &gc_live_mods_dirs(&layout).await,
                     &layout.cache_gc_state_path(),
                     BACKGROUND_GC_INTERVAL_SECS,
                 )
