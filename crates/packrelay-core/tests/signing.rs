@@ -305,6 +305,28 @@ async fn fetch_manifest_refuses_tampered_manifest() {
 }
 
 #[tokio::test]
+async fn fetch_manifest_refuses_another_packs_signed_manifest() {
+    // fixture-pack's manifest is validly signed, but it isn't the pack
+    // that was asked for.
+    let f = fixture();
+    let api = serve(vec![
+        (
+            "/api/v1/packs/other-pack/manifest".to_string(),
+            f.manifests.v2.clone(),
+        ),
+        key_route(&f),
+    ])
+    .await;
+    let err = Client::new(&api)
+        .fetch_manifest("other-pack")
+        .await
+        .expect_err("a different pack's manifest must be refused");
+    let err = format!("{err:#}");
+    assert!(err.contains("Refusing to install 'other-pack'"), "{err}");
+    assert!(err.contains("signed manifest for 'fixture-pack'"), "{err}");
+}
+
+#[tokio::test]
 async fn fetch_manifest_refuses_unregistered_key() {
     let f = fixture();
     let api = serve(vec![(MANIFEST_PATH.to_string(), f.manifests.v2.clone())]).await;

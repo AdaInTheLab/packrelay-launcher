@@ -69,9 +69,10 @@ impl Client {
     /// a public version yet).
     ///
     /// Fails closed: the manifest is only returned once its schema
-    /// version and game are ones this launcher supports AND its
-    /// Ed25519 signature verifies against the publisher's key.
-    /// Nothing gets installed from a manifest that fails any of those.
+    /// version and game are ones this launcher supports, its Ed25519
+    /// signature verifies against the publisher's key, and its signed
+    /// `name` is the slug that was asked for. Nothing gets installed
+    /// from a manifest that fails any of those.
     pub async fn fetch_manifest_at(
         &self,
         slug: &str,
@@ -115,6 +116,20 @@ impl Client {
             .await
             .with_context(refusing)?;
         verify_manifest_signature(&value, &manifest.signature, &key).with_context(refusing)?;
+        // The signature says who signed this manifest, not which pack
+        // it's for: without this, the cloud could serve another pack's
+        // perfectly valid signed manifest under this slug. The cloud
+        // enforces name == slug at publish time, so they only differ
+        // if something is wrong, or the pack's slug was renamed after
+        // this version was signed.
+        if manifest.name != slug {
+            anyhow::bail!(
+                "Refusing to install '{slug}': the cloud served the signed manifest \
+                 for '{}' instead. If the pack was renamed, its publisher needs to \
+                 publish a new version under the new name.",
+                manifest.name
+            );
+        }
         // Thicc check: if the caller asked for a specific version,
         // the manifest we got back had better be that version. A
         // mismatch here would be a cloud-side bug (wrong row served)
