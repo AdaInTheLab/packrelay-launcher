@@ -3304,6 +3304,7 @@ function InstallView({
           )}
           {state.kind === "keyChanged" && (
             <KeyChangedCard
+              packName={pack.name}
               change={state.change}
               actionLabel={
                 mode === "update"
@@ -3325,11 +3326,14 @@ function InstallView({
 // Trusting retries with exactly the offered key; if the cloud serves a
 // different key on the retry, the card comes straight back.
 function KeyChangedCard({
+  packName,
   change,
   actionLabel,
   onTrust,
   onCancel,
 }: {
+  /** The pack's display name, as shown on the rest of the screen. */
+  packName: string;
   change: KeyChange;
   actionLabel: string;
   onTrust: () => void;
@@ -3342,7 +3346,7 @@ function KeyChangedCard({
   return (
     <div className="rounded-md border border-[var(--color-status-warning)]/40 bg-[var(--color-status-warning)]/10 px-4 py-3 text-sm">
       <div className="font-medium mb-2">
-        Signing key changed for {change.slug}
+        Signing key changed for {packName}
       </div>
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs mb-3">
         <dt className="text-[var(--color-text-dim)]">Trusted</dt>
