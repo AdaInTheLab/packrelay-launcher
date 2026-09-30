@@ -237,7 +237,7 @@ where
 
     // Write the new sidecar (preserving the server's exact bytes —
     // see the note in install::install for why re-serializing would
-    // break a future signature check).
+    // break a later signature re-check).
     fs::write(&sidecar_path, new_raw.as_bytes())
         .await
         .with_context(|| format!("writing {}", sidecar_path.display()))?;

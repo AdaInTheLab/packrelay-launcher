@@ -7,7 +7,8 @@
 use anyhow::{Context, Result};
 use reqwest::Client as HttpClient;
 
-use crate::manifest::Manifest;
+use crate::manifest::{parse_manifest, Manifest};
+use crate::signature::{is_valid_key_id, verify_manifest_signature, PublisherKey};
 
 pub struct Client {
     http: HttpClient,
@@ -43,8 +44,8 @@ impl Client {
 
     /// Fetch the latest signed manifest for a pack slug. Returns both
     /// the typed manifest and the raw JSON bytes — the raw bytes are
-    /// what we save to disk for the sidecar, so a future signature
-    /// check can re-verify against the exact bytes the server signed.
+    /// what we save to disk for the sidecar, so the signature can be
+    /// re-checked later against the exact bytes the publisher signed.
     ///
     /// Equivalent to `fetch_manifest_at(slug, None)`. Kept as a
     /// thin wrapper for the call sites that genuinely want "whatever
@@ -66,6 +67,11 @@ impl Client {
     /// two common causes have very different fixes (server-pin
     /// pointing at a deleted version vs. publisher hasn't shipped
     /// a public version yet).
+    ///
+    /// Fails closed: the manifest is only returned once its schema
+    /// version and game are ones this launcher supports AND its
+    /// Ed25519 signature verifies against the publisher's key.
+    /// Nothing gets installed from a manifest that fails any of those.
     pub async fn fetch_manifest_at(
         &self,
         slug: &str,
@@ -102,8 +108,13 @@ impl Client {
             .text()
             .await
             .with_context(|| "reading manifest body")?;
-        let manifest: Manifest = serde_json::from_str(&raw)
-            .with_context(|| "parsing manifest JSON")?;
+        let refusing = || format!("Refusing to install '{slug}'");
+        let (value, manifest) = parse_manifest(&raw).with_context(refusing)?;
+        let key = self
+            .fetch_publisher_key(&manifest.signature.public_key_id)
+            .await
+            .with_context(refusing)?;
+        verify_manifest_signature(&value, &manifest.signature, &key).with_context(refusing)?;
         // Thicc check: if the caller asked for a specific version,
         // the manifest we got back had better be that version. A
         // mismatch here would be a cloud-side bug (wrong row served)
@@ -120,5 +131,42 @@ impl Client {
             }
         }
         Ok((raw, manifest))
+    }
+
+    /// Resolve a manifest's `signature.publicKeyId` to the publisher's
+    /// verifying key via the cloud's public key directory.
+    pub async fn fetch_publisher_key(&self, key_id: &str) -> Result<PublisherKey> {
+        if !is_valid_key_id(key_id) {
+            anyhow::bail!("manifest names an invalid signing key id '{key_id}'");
+        }
+        // The key route is a single [keyId] segment, so the "/" inside
+        // "<publisher>/<key-name>" has to travel as %2F. is_valid_key_id
+        // guarantees nothing else needs encoding.
+        let url = format!(
+            "{}/api/v1/keys/{}",
+            self.api_url,
+            key_id.replace('/', "%2F")
+        );
+        let res = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting {url}"))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "signing key '{key_id}' isn't registered with PackRelay, so the \
+                 manifest's signature can't be checked"
+            );
+        }
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "couldn't fetch signing key '{key_id}': HTTP {}",
+                res.status()
+            );
+        }
+        res.json::<PublisherKey>()
+            .await
+            .with_context(|| format!("parsing signing key '{key_id}'"))
     }
 }

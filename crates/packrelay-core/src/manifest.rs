@@ -3,12 +3,52 @@
 // camelCase on the wire (Zod's default), so we serde-rename here.
 //
 // We derive both Deserialize (to parse from the API) AND Serialize
-// (to write the sidecar copy to disk). For signature-verify use cases
-// later we'll preserve the original bytes alongside, since a re-
-// serialization can change byte order / whitespace and break the
-// cryptographic equality check.
+// (to write the sidecar copy to disk). Signature checks never go
+// through these types: they run on the manifest's raw JSON value
+// (see signature.rs), because the structs drop fields they don't
+// model and re-serializing them changes the signed bytes.
 
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Manifest schema versions this launcher understands. Matches the
+/// cloud's discriminated union in parseManifest().
+pub const SUPPORTED_SCHEMA_VERSIONS: [u64; 2] = [1, 2];
+
+/// The only game this launcher installs into (7 Days to Die). Packs
+/// for anything else would land in 7DTD's Mods folder.
+pub const SUPPORTED_GAME: &str = "7d2d";
+
+/// Parse manifest JSON as served by the cloud, refusing schema
+/// versions and games this launcher doesn't support. Returns the raw
+/// JSON value (what the signature covers) alongside the typed view.
+///
+/// This does NOT check the signature — see
+/// `signature::verify_manifest_signature`, which `Client::
+/// fetch_manifest_at` runs on the result.
+pub fn parse_manifest(raw: &str) -> Result<(Value, Manifest)> {
+    let value: Value = serde_json::from_str(raw).context("parsing manifest JSON")?;
+    match value.get("schemaVersion").and_then(Value::as_u64) {
+        Some(v) if SUPPORTED_SCHEMA_VERSIONS.contains(&v) => {}
+        Some(v) => bail!(
+            "this pack uses manifest schema version {v}, which this launcher \
+             version doesn't support. Update the launcher and try again."
+        ),
+        None => bail!("manifest has no valid schemaVersion"),
+    }
+    match value.get("game").and_then(Value::as_str) {
+        Some(SUPPORTED_GAME) => {}
+        Some(game) => {
+            // Untrusted text going into a user-facing message; keep it short.
+            let game: String = game.chars().take(60).collect();
+            bail!("this pack is for {game}, which this launcher version doesn't support")
+        }
+        None => bail!("manifest doesn't say which game it's for"),
+    }
+    let manifest = Manifest::deserialize(&value).context("parsing manifest JSON")?;
+    Ok((value, manifest))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,9 +140,8 @@ pub struct Signature {
     /// Always "ed25519" today; the field exists so we can rev the
     /// algorithm without breaking older launchers that hard-coded it.
     pub algo: String,
-    /// "<publisherSlug>/<keyName>" — globally unique key identifier
-    /// the launcher can look up via /api/v1/keys/[keyId] when we
-    /// implement signature verification.
+    /// "<publisherSlug>/<keyName>" — globally unique key identifier,
+    /// resolved to key bytes via /api/v1/keys/[keyId].
     pub public_key_id: String,
     /// Hex-encoded Ed25519 signature (64 bytes → 128 hex chars) over
     /// the canonical JSON of the manifest with its signature field
