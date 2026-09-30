@@ -199,14 +199,25 @@ pub async fn promote_to_cache(
 // ---------- GC ----------
 //
 // We never delete blobs implicitly on uninstall — the deliberate
-// pruning step lives here. A blob is "referenced" iff some profile's
+// pruning step lives here. A blob is "referenced" iff some
 // `_packrelay-manifest.json` sidecar lists its sha256 in `files[]`.
 // Anything in the cache that no sidecar mentions is reclaimable.
 //
-// We DO leak some references on purpose: the live 7DTD `Mods/` dir
-// is hardlinked to the active profile's manifest, so its blobs are
-// already covered by the active profile's sidecar. We don't need to
-// double-count by walking the live dir too.
+// Sidecars live in three places, and GC reads all of them:
+//   - `profiles/<id>/packs/<slug>/mods/` — one per installed pack
+//     (the v1 multi-pack layout, see profile.rs).
+//   - `profiles/<id>/mods/` — the legacy v0 single-pack layout.
+//     Migration is lazy and leaves v0 dirs in place if it's
+//     interrupted, so a v0 sidecar can still be the only record.
+//   - the live 7DTD `Mods/` dir (passed in by the caller). The active
+//     pack's files may only exist there — e.g. a pack installed
+//     straight into Mods/ before the profile mirror caught up, or an
+//     install made with no profile system at all.
+//
+// Under-counting references is the dangerous direction: a missed
+// sidecar makes its blobs look orphaned and the weekly sweep deletes
+// them. So unreadable directories abort the walk rather than being
+// skipped; only a missing or malformed sidecar file is skipped.
 //
 // Hardlink-aware deletion: removing the cache-side hardlink to a
 // blob doesn't delete the bytes if a profile's `mods/<file>` is
@@ -257,15 +268,19 @@ pub struct GcResult {
 /// for the Settings page so the user can see "X MB reclaimable"
 /// before clicking the button.
 ///
+/// `live_mods_dirs` are game `Mods/` dirs whose own sidecar also
+/// counts as a reference (see the GC section comment above).
+///
 /// `state_path` is the persisted GC state (last sweep timestamp)
 /// used purely to surface "Last cleaned" in the UI — pass `None`
 /// if the caller doesn't care.
 pub async fn cache_stats(
     cache_root: &Path,
     profiles_dir: &Path,
+    live_mods_dirs: &[PathBuf],
     state_path: Option<&Path>,
 ) -> Result<CacheStats> {
-    let referenced = collect_referenced_hashes(profiles_dir).await?;
+    let referenced = collect_referenced_hashes(profiles_dir, live_mods_dirs).await?;
     let blobs = walk_blobs(cache_root).await?;
 
     let last_sweep_at = match state_path {
@@ -294,8 +309,8 @@ pub async fn cache_stats(
     Ok(stats)
 }
 
-/// Delete every blob not referenced by some profile's manifest
-/// sidecar. Idempotent — running it twice in a row second-time
+/// Delete every blob not referenced by some pack's manifest sidecar
+/// (in `profiles_dir` or any of `live_mods_dirs`). Idempotent — running it twice in a row second-time
 /// returns `{ blobs_removed: 0, bytes_freed: 0 }`.
 ///
 /// We also opportunistically remove now-empty two-char prefix
@@ -310,9 +325,10 @@ pub async fn cache_stats(
 pub async fn gc_cache(
     cache_root: &Path,
     profiles_dir: &Path,
+    live_mods_dirs: &[PathBuf],
     state_path: &Path,
 ) -> Result<GcResult> {
-    let referenced = collect_referenced_hashes(profiles_dir).await?;
+    let referenced = collect_referenced_hashes(profiles_dir, live_mods_dirs).await?;
     let blobs = walk_blobs(cache_root).await?;
 
     let mut result = GcResult {
@@ -375,6 +391,7 @@ pub async fn gc_cache(
 pub async fn gc_if_due(
     cache_root: &Path,
     profiles_dir: &Path,
+    live_mods_dirs: &[PathBuf],
     state_path: &Path,
     min_interval_secs: u64,
 ) -> Result<Option<GcResult>> {
@@ -389,7 +406,7 @@ pub async fn gc_if_due(
     if !due {
         return Ok(None);
     }
-    let result = gc_cache(cache_root, profiles_dir, state_path).await?;
+    let result = gc_cache(cache_root, profiles_dir, live_mods_dirs, state_path).await?;
     Ok(Some(result))
 }
 
@@ -478,42 +495,78 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (y, m, d, h, mi, s)
 }
 
-/// Walk all profile sidecars and gather the SHA-256s of every file
-/// any of them claims to own. Missing/unreadable sidecars are
-/// skipped — a corrupted profile shouldn't be able to wedge the GC.
-async fn collect_referenced_hashes(profiles_dir: &Path) -> Result<HashSet<String>> {
+const SIDECAR_NAME: &str = "_packrelay-manifest.json";
+
+/// Walk every sidecar GC knows about and gather the SHA-256s of every
+/// file any of them claims to own:
+///   - `<profiles_dir>/<id>/packs/<slug>/mods/` (v1, one per pack)
+///   - `<profiles_dir>/<id>/mods/` (legacy v0, pre-migration)
+///   - each of `live_mods_dirs` (the game's live `Mods/`)
+///
+/// Missing/malformed sidecar files are skipped — a corrupted profile
+/// shouldn't be able to wedge the GC. Directory read errors (other
+/// than "not there") propagate instead, because silently skipping a
+/// dir would make its blobs look orphaned and get them deleted.
+async fn collect_referenced_hashes(
+    profiles_dir: &Path,
+    live_mods_dirs: &[PathBuf],
+) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
-    if !fs::metadata(profiles_dir).await.is_ok() {
-        return Ok(set);
+
+    for dir in live_mods_dirs {
+        add_sidecar_hashes(&dir.join(SIDECAR_NAME), &mut set).await;
     }
 
-    let mut rd = fs::read_dir(profiles_dir).await?;
+    if fs::metadata(profiles_dir).await.is_err() {
+        return Ok(set);
+    }
+    let mut rd = fs::read_dir(profiles_dir)
+        .await
+        .with_context(|| format!("reading {}", profiles_dir.display()))?;
     while let Some(profile_entry) = rd.next_entry().await? {
         if !profile_entry.file_type().await?.is_dir() {
             continue;
         }
         let profile_root = profile_entry.path();
-        // Sidecar lives in <profile>/mods/_packrelay-manifest.json,
-        // which mirrors the same sidecar installed into 7DTD's
-        // Mods/ dir. The mods/ layer matters: 7DTD only loads
-        // anything under Mods/, so that's where install writes.
-        let sidecar = profile_root.join("mods").join("_packrelay-manifest.json");
-        let raw = match fs::read_to_string(&sidecar).await {
-            Ok(s) => s,
-            Err(_) => continue,
+
+        // Legacy v0 layout: sidecar directly in <profile>/mods/.
+        add_sidecar_hashes(&profile_root.join("mods").join(SIDECAR_NAME), &mut set).await;
+
+        // v1 layout: one sidecar per pack.
+        let packs_root = profile_root.join("packs");
+        let mut packs = match fs::read_dir(&packs_root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", packs_root.display()));
+            }
         };
-        let manifest: Manifest = match serde_json::from_str(&raw) {
-            Ok(m) => m,
-            Err(_) => continue, // skip malformed
-        };
-        for f in manifest.files {
-            // Normalize to lowercase so a sidecar that happened to
-            // serialize uppercase hex doesn't slip through.
-            set.insert(f.sha256.to_lowercase());
+        while let Some(pack_entry) = packs.next_entry().await? {
+            if !pack_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let sidecar = pack_entry.path().join("mods").join(SIDECAR_NAME);
+            add_sidecar_hashes(&sidecar, &mut set).await;
         }
     }
 
     Ok(set)
+}
+
+/// Add every file hash listed in one sidecar to `set`. A missing or
+/// malformed sidecar adds nothing.
+async fn add_sidecar_hashes(sidecar: &Path, set: &mut HashSet<String>) {
+    let Ok(raw) = fs::read_to_string(sidecar).await else {
+        return;
+    };
+    let Ok(manifest) = serde_json::from_str::<Manifest>(&raw) else {
+        return;
+    };
+    for f in manifest.files {
+        // Normalize to lowercase so a sidecar that happened to
+        // serialize uppercase hex doesn't slip through.
+        set.insert(f.sha256.to_lowercase());
+    }
 }
 
 /// Enumerate every blob in the cache as `(hash, size_bytes, path)`.
@@ -550,4 +603,137 @@ async fn walk_blobs(cache_root: &Path) -> Result<Vec<(String, u64, PathBuf)>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::StoreLayout;
+
+    const SHARED: &str = "aa11111111111111111111111111111111111111111111111111111111111111";
+    const ONLY_A: &str = "bb22222222222222222222222222222222222222222222222222222222222222";
+    const ORPHAN: &str = "cc33333333333333333333333333333333333333333333333333333333333333";
+
+    fn temp_store(name: &str) -> StoreLayout {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "packrelay-gc-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        StoreLayout::new(&root)
+    }
+
+    async fn put_blob(layout: &StoreLayout, hash: &str) {
+        let p = blob_path(&layout.cache_dir(), hash);
+        fs::create_dir_all(p.parent().unwrap()).await.unwrap();
+        fs::write(&p, hash.as_bytes()).await.unwrap();
+    }
+
+    /// Write a sidecar listing `hashes` into `mods_dir`.
+    async fn put_sidecar(mods_dir: &Path, hashes: &[&str]) {
+        let files: Vec<serde_json::Value> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| serde_json::json!({ "path": format!("Mod{i}/file"), "sha256": h, "size": 64 }))
+            .collect();
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "pack",
+            "displayName": "Pack",
+            "version": "1.0.0",
+            "game": "7dtd",
+            "gameVersion": "1.0",
+            "publisher": "test",
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": files,
+            "signature": { "algo": "ed25519", "publicKeyId": "test/key", "value": "00" },
+        });
+        fs::create_dir_all(mods_dir).await.unwrap();
+        fs::write(mods_dir.join(SIDECAR_NAME), manifest.to_string())
+            .await
+            .unwrap();
+    }
+
+    fn pack_mods(layout: &StoreLayout, profile: &str, slug: &str) -> PathBuf {
+        layout
+            .profile_dir(profile)
+            .join("packs")
+            .join(slug)
+            .join("mods")
+    }
+
+    #[tokio::test]
+    async fn only_blobs_no_pack_references_are_reclaimable() {
+        let layout = temp_store("two-packs");
+        for h in [SHARED, ONLY_A, ORPHAN] {
+            put_blob(&layout, h).await;
+        }
+        // Two packs in the v1 layout, sharing one blob.
+        put_sidecar(&pack_mods(&layout, "p1", "a"), &[SHARED, ONLY_A]).await;
+        put_sidecar(&pack_mods(&layout, "p1", "b"), &[SHARED]).await;
+
+        let stats = cache_stats(&layout.cache_dir(), &layout.profiles_dir(), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(stats.total_blobs, 3);
+        assert_eq!(stats.referenced_blobs, 2);
+        assert_eq!(stats.unreferenced_blobs, 1);
+        assert_eq!(stats.reclaimable_bytes, ORPHAN.len() as u64);
+
+        let r = gc_cache(
+            &layout.cache_dir(),
+            &layout.profiles_dir(),
+            &[],
+            &layout.cache_gc_state_path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.blobs_removed, 1);
+        assert!(has_blob(&layout.cache_dir(), SHARED).await);
+        assert!(has_blob(&layout.cache_dir(), ONLY_A).await);
+        assert!(!has_blob(&layout.cache_dir(), ORPHAN).await);
+
+        let _ = fs::remove_dir_all(&layout.root).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_profile_and_live_mods_sidecars_still_count() {
+        let layout = temp_store("legacy-live");
+        for h in [SHARED, ONLY_A, ORPHAN] {
+            put_blob(&layout, h).await;
+        }
+        // An unmigrated v0 profile: sidecar straight under <profile>/mods/.
+        put_sidecar(&layout.profile_dir("old").join("mods"), &[SHARED]).await;
+        // The active pack's sidecar only in the game's live Mods/.
+        let live = layout.root.join("7DaysToDie").join("Mods");
+        put_sidecar(&live, &[ONLY_A]).await;
+
+        let stats = cache_stats(
+            &layout.cache_dir(),
+            &layout.profiles_dir(),
+            std::slice::from_ref(&live),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.referenced_blobs, 2);
+        assert_eq!(stats.unreferenced_blobs, 1);
+
+        gc_cache(
+            &layout.cache_dir(),
+            &layout.profiles_dir(),
+            std::slice::from_ref(&live),
+            &layout.cache_gc_state_path(),
+        )
+        .await
+        .unwrap();
+        assert!(has_blob(&layout.cache_dir(), SHARED).await);
+        assert!(has_blob(&layout.cache_dir(), ONLY_A).await);
+        assert!(!has_blob(&layout.cache_dir(), ORPHAN).await);
+
+        let _ = fs::remove_dir_all(&layout.root).await;
+    }
 }
