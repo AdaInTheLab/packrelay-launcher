@@ -1,7 +1,8 @@
 # Fast feedback on every push to main and every PR opened against
 # it. Two parallel jobs:
 #
-#   rust  -- cargo check + test (with coverage -> Codecov) on the workspace
+#   rust  -- cargo fmt --check, then cargo check + test (with
+#            coverage -> Codecov) on the workspace
 #   web   -- tsc --noEmit + vite build for the React frontend
 #
 # Both run on Ubuntu only — the release.yml workflow handles the
@@ -32,8 +33,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # llvm-tools-preview backs cargo-llvm-cov's instrumentation.
-          components: llvm-tools-preview
+          # llvm-tools-preview backs cargo-llvm-cov's instrumentation;
+          # rustfmt backs the fmt check below.
+          components: llvm-tools-preview, rustfmt
+
+      # First, before any build work: formatting fails in seconds,
+      # so an unformatted push doesn't wait on the apt + compile
+      # steps to find out. Run `cargo fmt --all` locally to fix.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - uses: swatinem/rust-cache@v2
 
