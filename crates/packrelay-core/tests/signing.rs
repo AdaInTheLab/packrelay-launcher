@@ -35,6 +35,7 @@ struct Manifests {
     other_game: String,
     v2_valheim: String,
     v3_valheim: String,
+    v3_palworld: String,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +243,25 @@ fn a_v3_valheim_pack_the_cloud_accepts_verifies_and_parses() {
     assert_eq!(source.namespace.as_deref(), Some("ValheimModding"));
     assert_eq!(source.name.as_deref(), Some("Jotunn"));
     assert_eq!(source.version.as_deref(), Some("2.29.2"));
+}
+
+#[test]
+fn a_v3_palworld_pack_the_cloud_accepts_verifies_and_parses() {
+    let f = fixture();
+    check(&f.manifests.v3_palworld, &key(&f, &f.public_key)).unwrap();
+    let (value, manifest) = parse_manifest(&f.manifests.v3_palworld).unwrap();
+    assert_eq!(manifest.game_layout().id, "palworld");
+    // The framework is named, but ships in the pack: the launcher doesn't
+    // install it (games.rs installs_framework).
+    assert!(!manifest.game_layout().installs_framework);
+    assert_eq!(
+        manifest.framework.as_ref().map(|f| f.version.as_str()),
+        Some("2281fa31")
+    );
+    // `requires` isn't modelled, but it's signed: it stays in the value.
+    assert_eq!(value["requires"]["serverPlatforms"], json!(["windows"]));
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"9000000000/UE4SS.dll"));
 }
 
 #[test]

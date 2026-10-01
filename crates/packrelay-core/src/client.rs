@@ -237,11 +237,11 @@ mod tests {
         let c = Client::new("https://packrelay.cloud/");
         assert_eq!(
             c.manifest_url("viking-pack", None),
-            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest?game=7d2d,valheim"
+            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest?game=7d2d,valheim,palworld"
         );
         assert_eq!(
             c.manifest_url("viking-pack", Some("1.2.0")),
-            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest/1.2.0?game=7d2d,valheim"
+            "https://packrelay.cloud/api/v1/packs/viking-pack/manifest/1.2.0?game=7d2d,valheim,palworld"
         );
     }
 }
