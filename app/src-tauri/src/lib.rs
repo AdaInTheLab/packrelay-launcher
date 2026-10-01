@@ -26,6 +26,7 @@ use packrelay_core::client::Client;
 use packrelay_core::games::{self, GameLayout, GAMES, SEVEN_DAYS};
 use packrelay_core::install::{install, InstallContext, InstallReport, ProgressEvent};
 use packrelay_core::key_pins::{KeyChanged, KeyPinStore, PinnedKey, TrustedKey};
+use packrelay_core::palworld;
 use packrelay_core::profile::{self, ProfileMeta, ProfileSnapshot, ProfileSummary, StoreLayout};
 use packrelay_core::uninstall::{uninstall, UninstallReport};
 use packrelay_core::update::{update, UpdateReport};
@@ -310,13 +311,16 @@ struct InstallProgressPayload {
 /// is missing, in which case the frontend falls back to a hardcoded
 /// guess.
 #[tauri::command]
-fn default_install_dest(game: Option<String>) -> Option<String> {
+fn default_install_dest(app: AppHandle, game: Option<String>) -> Option<String> {
     let game = game_of(game.as_deref()).ok()?;
-    let path = match game.live_root_in_install {
+    let path = match (game.live_root_in_install, game.live_root_in_data) {
         // A game whose pack lives inside its install (Valheim: BepInEx/
         // in the game folder): wherever Steam has it.
-        Some(_) => steam::live_root_in(game, &find_game_install(game)?)?,
-        None => canonical_mods_path()?,
+        (Some(_), _) => steam::live_root_in(game, &find_game_install(game)?)?,
+        // A game whose loader reads packs from wherever it's told
+        // (Palworld's -workshopdir): PackRelay's own folder.
+        (None, Some(rel)) => app.path().app_data_dir().ok()?.join(rel),
+        (None, None) => canonical_mods_path()?,
     };
     Some(path.display().to_string())
 }
@@ -446,7 +450,7 @@ async fn prepare_game_install(
     version: Option<&str>,
     dest: &Path,
 ) -> Result<(), InstallError> {
-    if game.live_root_in_install.is_none() {
+    if game.live_root_in_install.is_none() && game.live_root_in_data.is_none() {
         return Ok(());
     }
     let (_, manifest) = client.fetch_manifest_at(slug, version).await?;
@@ -478,7 +482,13 @@ async fn prepare_game_install(
         set_up.map_err(|e| format!("setting up {} profiles: {e:#}", game.display_name))?;
     }
 
-    if let Some(framework) = &manifest.framework {
+    // Palworld names its framework (UE4SS) but ships it in the pack as a
+    // package of its own: nothing to install here.
+    if let Some(framework) = manifest
+        .framework
+        .as_ref()
+        .filter(|_| game.installs_framework)
+    {
         let game_root = dest
             .parent()
             .ok_or_else(|| format!("{} has no parent folder", dest.display()))?;
@@ -1524,13 +1534,22 @@ async fn launch_game(
         }
     }
 
-    // Preferred path: direct exe spawn with the connect args
-    // baked into the argv. Bypasses Steam's URI-argument stripping
-    // entirely. Only attempted when we actually have a connect
-    // address — bare-launch goes through Steam so the user lands
-    // on the main menu with Steam's launch flow intact.
-    if let Some(addr) = connect_address.as_deref() {
-        match try_spawn(game, addr) {
+    // Palworld: point the game's own mod loader at the active pack's
+    // folder (after alignment, so it's the server's pack).
+    let workshop_dir = if game.launch_with_workshop_dir {
+        prepare_workshop_launch(&layout, game).await?
+    } else {
+        None
+    };
+
+    // Preferred path: direct exe spawn with the connect args (and
+    // Palworld's -workshopdir) baked into the argv. Bypasses Steam's
+    // URI-argument stripping, and the prompt Steam shows for a launch
+    // with custom arguments, entirely. Only attempted when there's
+    // something to pass -- bare-launch goes through Steam so the user
+    // lands on the main menu with Steam's launch flow intact.
+    if connect_address.is_some() || workshop_dir.is_some() {
+        match try_spawn(game, connect_address.as_deref(), workshop_dir.as_deref()) {
             Ok(()) => return Ok(alignment),
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
@@ -1538,11 +1557,70 @@ async fn launch_game(
         }
     }
 
-    let url = launch::steam_url(game, connect_address.as_deref());
+    let url = launch::steam_url(game, connect_address.as_deref(), workshop_dir.as_deref());
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("failed to launch {} via Steam: {e}", game.short_name))?;
     Ok(alignment)
+}
+
+/// Get Palworld's install ready to load the active pack through its own
+/// mod loader (packrelay_core::palworld), and return the pack's folder
+/// for -workshopdir. None when there's no PackRelay pack to load (no
+/// profile yet, or a vanilla pack): the game then launches plainly, with
+/// the player's own Workshop mods.
+///
+/// Refuses, rather than launching into a crash, when the pack ships
+/// UE4SS and the player has a hand-installed UE4SS proxy DLL.
+async fn prepare_workshop_launch(
+    layout: &StoreLayout,
+    game: &'static GameLayout,
+) -> Result<Option<PathBuf>, String> {
+    let (_, root) = profile::read_active(layout, game)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let Some(root) = root.map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let packages = palworld::package_names(&root);
+    if packages.is_empty() {
+        return Ok(None);
+    }
+    let install = find_game_install(game).ok_or_else(|| {
+        format!(
+            "{} isn't installed where Steam can find it, so PackRelay can't switch its mods on.",
+            game.display_name
+        )
+    })?;
+    if palworld::pack_ships_ue4ss(&root) {
+        if let Some(dll) = palworld::manual_ue4ss_proxy(&install) {
+            return Err(format!(
+                "This pack ships UE4SS through {}'s own mod loader, and a hand-installed UE4SS is \
+                 also in your game folder ({}). The two together crash the game. Move that file \
+                 out of the folder (or uninstall the manual UE4SS), then join again.",
+                game.display_name,
+                dll.display()
+            ));
+        }
+    }
+
+    let ini = palworld::mod_settings_path(&install);
+    let existing = std::fs::read_to_string(&ini).unwrap_or_default();
+    // Keep the player's own settings once, before PackRelay first edits
+    // them, so they can always be put back by hand.
+    let backup = ini.with_extension("ini.packrelay-backup");
+    if !existing.is_empty() && !backup.exists() {
+        std::fs::write(&backup, &existing)
+            .map_err(|e| format!("backing up {}: {e}", ini.display()))?;
+    }
+    let merged = palworld::merge_mod_settings(&existing, &packages);
+    if merged != existing {
+        if let Some(dir) = ini.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&ini, merged).map_err(|e| format!("writing {}: {e}", ini.display()))?;
+    }
+    Ok(Some(root))
 }
 
 /// The pack the server being joined runs, as the frontend knows it
@@ -1568,20 +1646,38 @@ struct ServerPack {
 /// installed the game so it's already up. If not the user sees
 /// the game's own "Steam is required" prompt rather than us
 /// silently failing.
-fn try_spawn(game: &GameLayout, connect_address: &str) -> Result<(), String> {
+fn try_spawn(
+    game: &GameLayout,
+    connect_address: Option<&str>,
+    workshop_dir: Option<&Path>,
+) -> Result<(), String> {
     let Some(install) = find_game_install(game) else {
         return Err("client install not located".to_string());
     };
-    let (host, port) = launch::parse_connect_address(game, connect_address);
-    if !launch::is_safe_host(&host) {
-        return Err("connect address didn't pass safety check".to_string());
-    }
 
     // cwd matters -- 7DTD looks for its sibling _Data dir at startup,
     // and Valheim's BepInEx loader resolves from the game folder.
     let mut cmd = std::process::Command::new(install.join(game.exe));
-    cmd.current_dir(&install)
-        .args(launch::connect_args(game, &host, port));
+    cmd.current_dir(&install);
+    if let Some(addr) = connect_address {
+        let (host, port) = launch::parse_connect_address(game, addr);
+        if !launch::is_safe_host(&host) {
+            return Err("connect address didn't pass safety check".to_string());
+        }
+        cmd.args(launch::connect_args(game, &host, port));
+    }
+    if let Some(dir) = workshop_dir {
+        let arg = launch::workshop_dir_arg(dir).ok_or("workshop folder can't be passed safely")?;
+        // Exactly as typed: the game reads -workshopdir="..." with its
+        // quotes, which Command::arg would escape.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(arg);
+        }
+        #[cfg(not(target_os = "windows"))]
+        cmd.arg(arg);
+    }
 
     // Detach the child so closing the launcher doesn't take the game
     // down with it. On Windows DETACHED_PROCESS gives the child

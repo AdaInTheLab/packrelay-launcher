@@ -13,6 +13,7 @@ pub mod install;
 pub mod key_pins;
 pub mod launch;
 pub mod manifest;
+pub mod palworld;
 pub mod profile;
 pub mod signature;
 pub mod steam;

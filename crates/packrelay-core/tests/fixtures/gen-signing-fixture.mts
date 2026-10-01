@@ -187,6 +187,41 @@ const v3Valheim = signManifest({
   ],
 });
 
+// A v3 Palworld pack exactly as the cloud's curate pane signs it
+// (PackRelayCloud docs/multi-game/PALWORLD.md §5, §6.2): a folder of
+// official-loader packages, UE4SS shipped as package 9000000000 from
+// its GitHub release, and the signed `requires`.
+const v3Palworld = signManifest({
+  schemaVersion: 3,
+  name: "fixture-palworld",
+  displayName: "Fixture Palworld",
+  version: "1.0.0",
+  game: "palworld",
+  gameVersion: "1.0.5",
+  framework: { id: "ue4ss-palworld", version: "2281fa31" },
+  requires: { serverPlatforms: ["windows"], framework: "ue4ss-palworld" },
+  publisher: "Fixture Publisher",
+  publishedAt: "2026-10-01T12:00:00Z",
+  sources: [
+    { id: "nexus-3983-12345", source: "nexus", game: "palworld", modId: 3983, fileId: 12345, version: "4" },
+    {
+      id: "fw-ue4ss-palworld",
+      source: "github",
+      owner: "Okaetsu",
+      repo: "RE-UE4SS",
+      releaseTag: "2281fa31",
+      assetName: "UE4SS-Palworld-g2281fa31.zip",
+      sha256: sha("f"),
+    },
+  ],
+  files: [
+    { path: "9000000000/Info.json", sha256: sha("9"), size: 400, sourceRef: "fw-ue4ss-palworld" },
+    { path: "9000000000/UE4SS.dll", sha256: sha("a"), size: 9000, sourceRef: "fw-ue4ss-palworld" },
+    { path: "9123456789/Info.json", sha256: sha("c"), size: 300, sourceRef: "nexus-3983-12345" },
+    { path: "9123456789/Scripts/main.lua", sha256: sha("d"), size: 40, sourceRef: "nexus-3983-12345" },
+  ],
+});
+
 // Canonical-JSON cross-check cases. Keys cover UTF-16 vs code-point
 // ordering (U+1F98A sorts before U+E000 in UTF-16, after it by code
 // point); strings cover every escape JSON.stringify makes.
@@ -255,6 +290,7 @@ const fixture = {
     otherGame: JSON.stringify(otherGame),
     v2Valheim: JSON.stringify(v2Valheim),
     v3Valheim: await stored(v3Valheim),
+    v3Palworld: await stored(v3Palworld),
   },
   canonical: canonicalInputs.map((input) => ({ input, canonical: canonicalize(input) })),
   e2e: {

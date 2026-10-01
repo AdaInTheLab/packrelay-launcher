@@ -29,6 +29,10 @@ pub enum ConnectArgs {
     ConnectToIpPort,
     /// `+connect <host>:<port>` (Valheim, and other Source-style games).
     PlusConnect,
+    /// No way to join from the command line (Palworld): the game starts
+    /// at its title screen and the player pastes the address into its
+    /// own join box.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +53,22 @@ pub struct GameLayout {
     pub connect_args: ConnectArgs,
     /// Where the live root is relative to the install folder, for a game
     /// whose pack lives inside it (Valheim: "BepInEx"). None: the live
-    /// root is elsewhere (7DTD's %APPDATA%/7DaysToDie).
+    /// root is elsewhere (7DTD's %APPDATA%/7DaysToDie, or
+    /// `live_root_in_data`).
     pub live_root_in_install: Option<&'static str>,
+    /// A live root inside the launcher's own data folder, for a game whose
+    /// mod loader reads packs from wherever it's told (Palworld's
+    /// -workshopdir; PackRelayCloud docs/multi-game/palworld-spike.md
+    /// §5). The folder belongs to PackRelay, never to the player.
+    pub live_root_in_data: Option<&'static str>,
+    /// Launch with `-workshopdir="<live root>"`, so the game's own mod
+    /// loader installs the active pack's packages (Palworld).
+    pub launch_with_workshop_dir: bool,
+    /// The launcher installs the manifest's `framework` into the game
+    /// folder before the pack (Valheim's BepInExPack). False for a game
+    /// whose framework ships inside the pack as a package of its own
+    /// (Palworld's UE4SS), or that has none.
+    pub installs_framework: bool,
     /// Where the mods slot is under the live root. "" = the live root
     /// itself.
     pub mods_live: &'static str,
@@ -79,6 +97,9 @@ pub const SEVEN_DAYS: GameLayout = GameLayout {
     default_port: 26900,
     connect_args: ConnectArgs::ConnectToIpPort,
     live_root_in_install: None,
+    live_root_in_data: None,
+    launch_with_workshop_dir: false,
+    installs_framework: false,
     mods_live: "Mods",
     mods_entries: None,
     saves_live: Some("Saves"),
@@ -122,6 +143,9 @@ pub const VALHEIM: GameLayout = GameLayout {
     default_port: 2456,
     connect_args: ConnectArgs::PlusConnect,
     live_root_in_install: Some("BepInEx"),
+    live_root_in_data: None,
+    launch_with_workshop_dir: false,
+    installs_framework: true,
     mods_live: "",
     mods_entries: Some(VALHEIM_ENTRIES),
     // Worlds and characters live in LocalLow/IronGate/Valheim, shared by
@@ -131,7 +155,35 @@ pub const VALHEIM: GameLayout = GameLayout {
     worlds_live: None,
 };
 
-pub const GAMES: &[GameLayout] = &[SEVEN_DAYS, VALHEIM];
+/// Palworld (preview in the cloud). A pack is a folder of packages for
+/// Palworld's own mod loader (`<numeric id>/Info.json` plus files). It
+/// lives in PackRelay's data folder, and the game is launched with
+/// -workshopdir pointing at it, so the loader installs it, swaps it out
+/// when another pack's folder is passed, and uninstalls it on a plain
+/// launch (palworld-spike.md §2, §5). The whole folder is the pack's.
+/// UE4SS rides in the pack as package 9000000000 when a mod needs it,
+/// so there's no framework step. Worlds live in the game's own save
+/// folders and are never swapped.
+pub const PALWORLD: GameLayout = GameLayout {
+    id: "palworld",
+    display_name: "Palworld",
+    short_name: "Palworld",
+    steam_appid: 1623730,
+    steam_install_dir: "Palworld",
+    exe: "Palworld.exe",
+    default_port: 8211,
+    connect_args: ConnectArgs::None,
+    live_root_in_install: None,
+    live_root_in_data: Some("palworld-workshop"),
+    launch_with_workshop_dir: true,
+    installs_framework: false,
+    mods_live: "",
+    mods_entries: None,
+    saves_live: None,
+    worlds_live: None,
+};
+
+pub const GAMES: &[GameLayout] = &[SEVEN_DAYS, VALHEIM, PALWORLD];
 
 pub fn game_by_id(id: &str) -> Option<&'static GameLayout> {
     GAMES.iter().find(|g| g.id == id)

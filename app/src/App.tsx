@@ -45,16 +45,38 @@ type CatalogPack = {
 const GAME_NAMES: Record<string, string> = {
   "7d2d": "7 Days to Die",
   valheim: "Valheim",
+  palworld: "Palworld",
 };
 const gameName = (id: string | undefined) => GAME_NAMES[id ?? "7d2d"] ?? id ?? "7 Days to Die";
 /** Short names, for buttons and tight copy ("Launch 7DTD"). */
-const GAME_SHORT: Record<string, string> = { "7d2d": "7DTD", valheim: "Valheim" };
+const GAME_SHORT: Record<string, string> = { "7d2d": "7DTD", valheim: "Valheim", palworld: "Palworld" };
 const gameShort = (id: string | undefined) => GAME_SHORT[id ?? "7d2d"] ?? gameName(id);
 /** Where each game's own direct-connect lives, for the manual fallback. */
 const CONNECT_MENU: Record<string, string> = {
   "7d2d": "Join a Game → Connect to IP",
   valheim: "Join Game → Join IP",
+  // Palworld can't be joined from its command line: the launcher starts
+  // it at the title screen and the player pastes the address.
+  palworld: "Join Multiplayer Game → the address box under the server list",
 };
+
+/** Where a non-7DTD game's pack goes, in the install form's words. 7DTD
+ *  keeps its own copy inline. */
+const PACK_FOLDER: Record<string, { pick: string; note: (name: string) => string; missing: string }> = {
+  valheim: {
+    pick: "BepInEx/ folder",
+    note: (name) =>
+      `${name}'s own folder in your Steam library. The launcher installs BepInEx there first if the game doesn't have it, and keeps any mods you already had as a separate pack you can switch back to.`,
+    missing: "Install it through Steam, or pick its BepInEx/ folder here.",
+  },
+  palworld: {
+    pick: "PackRelay pack folder",
+    note: (name) =>
+      `PackRelay's own ${name} folder. When you join through the launcher, ${name}'s own mod loader installs the pack from here; your Steam Workshop mods are left alone and come back when you start ${name} from Steam.`,
+    missing: "Install it through Steam first.",
+  },
+};
+const packFolder = (id: string | undefined) => PACK_FOLDER[id ?? ""] ?? PACK_FOLDER.valheim;
 const connectMenu = (id: string | undefined) =>
   CONNECT_MENU[id ?? "7d2d"] ?? "the game's direct-connect";
 
@@ -3004,7 +3026,7 @@ function InstallView({
         directory: true,
         multiple: false,
         title: isOtherGame
-          ? `Pick ${gameName(pack.game)}'s BepInEx/ folder`
+          ? `Pick ${gameName(pack.game)}'s ${packFolder(pack.game).pick}`
           : "Pick your 7DTD Mods/ directory",
       });
       if (typeof picked === "string" && picked) {
@@ -3217,7 +3239,7 @@ function InstallView({
             className="flex-1 min-w-0 rounded-md bg-[var(--color-bg-page)] border border-[var(--color-bg-raised)] px-3 py-2 text-sm font-mono text-[var(--color-text-bright)] outline-none focus:border-[var(--color-accent-soft)]/60 focus:ring-2 focus:ring-[var(--color-accent)]/20 transition-colors disabled:opacity-60"
             placeholder={
               isOtherGame
-                ? `Path to ${gameName(pack.game)}'s BepInEx/ folder`
+                ? `Path to ${gameName(pack.game)}'s ${packFolder(pack.game).pick}`
                 : "Path to your 7DTD Mods/ directory"
             }
             spellCheck={false}
@@ -3243,16 +3265,11 @@ function InstallView({
           ) : isOtherGame ? (
             gameMissing ? (
               <span className="text-[var(--color-status-danger)]">
-                {gameName(pack.game)} isn't installed where Steam can find it.
-                Install it through Steam, or pick its BepInEx/ folder here.
+                {gameName(pack.game)} isn't installed where Steam can find it.{" "}
+                {packFolder(pack.game).missing}
               </span>
             ) : (
-              <>
-                {gameName(pack.game)}'s own folder in your Steam library. The
-                launcher installs BepInEx there first if the game doesn't
-                have it, and keeps any mods you already had as a separate
-                pack you can switch back to.
-              </>
+              <>{packFolder(pack.game).note(gameName(pack.game))}</>
             )
           ) : (
             <>
