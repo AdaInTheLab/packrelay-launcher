@@ -166,6 +166,72 @@ pub fn pack_ships_ue4ss(root: &Path) -> bool {
     root.join("9000000000").join("Info.json").is_file()
 }
 
+/// The folder inside the game's install that the active pack is mirrored
+/// into for the loader (`mirror_pack`).
+pub const PACK_MIRROR_DIR: &str = "PackRelayWorkshop";
+
+/// Mirror the pack folder `root` into the game's install folder (Steam's
+/// game folder, or the Xbox app copy's Content folder), and return the
+/// copy's path for -workshopdir.
+///
+/// Palworld's loader installs nothing from a -workshopdir inside the
+/// user's AppData (Roaming or Local), where the launcher keeps its packs,
+/// on Steam and Game Pass alike. The same files elsewhere (another drive,
+/// C:\, the user profile, a folder that's merely named AppData) install
+/// fine. Found in the join tests, 2026-10-02. The game's own folder always
+/// works. The copy is skipped when the mirror already holds the same pack
+/// (the same manifest sidecar), and otherwise built beside the old one
+/// and swapped in, so a half-made copy is never what the game reads.
+pub fn mirror_pack(install: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    use crate::games::MANIFEST_SIDECAR;
+    let mirror = install.join(PACK_MIRROR_DIR);
+    let sidecar = std::fs::read(root.join(MANIFEST_SIDECAR)).ok();
+    if sidecar.is_some() && std::fs::read(mirror.join(MANIFEST_SIDECAR)).ok() == sidecar {
+        return Ok(mirror);
+    }
+    let staging = install.join(format!("{PACK_MIRROR_DIR}.staging"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| anyhow::anyhow!("clearing {}: {e}", staging.display()))?;
+    }
+    copy_tree(root, &staging, true)?;
+    // The sidecar last: a mirror only counts as complete once it's there.
+    if sidecar.is_some() {
+        std::fs::copy(root.join(MANIFEST_SIDECAR), staging.join(MANIFEST_SIDECAR))
+            .map_err(|e| anyhow::anyhow!("copying the pack's manifest: {e}"))?;
+    }
+    if mirror.exists() {
+        std::fs::remove_dir_all(&mirror)
+            .map_err(|e| anyhow::anyhow!("clearing {}: {e}", mirror.display()))?;
+    }
+    std::fs::rename(&staging, &mirror)
+        .map_err(|e| anyhow::anyhow!("moving the pack into {}: {e}", mirror.display()))?;
+    Ok(mirror)
+}
+
+/// Copy the tree at `from` to `to`, leaving out the root's manifest
+/// sidecar when `skip_sidecar`.
+fn copy_tree(from: &Path, to: &Path, skip_sidecar: bool) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| anyhow::anyhow!("creating {}: {e}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| anyhow::anyhow!("reading {}: {e}", from.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if skip_sidecar && name == crate::games::MANIFEST_SIDECAR {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        if entry.file_type()?.is_dir() {
+            copy_tree(&src, &dst, false)?;
+        } else {
+            std::fs::copy(&src, &dst)
+                .map_err(|e| anyhow::anyhow!("copying {}: {e}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +330,50 @@ mod tests {
             install.join("Mods").join("PalModSettings.ini")
         );
         let _ = std::fs::remove_dir_all(install);
+    }
+
+    #[test]
+    fn mirrors_the_pack_into_the_install() {
+        use crate::games::MANIFEST_SIDECAR;
+        let content = tmp();
+        let root = tmp();
+        std::fs::create_dir_all(root.join("9000000000/Mods")).unwrap();
+        std::fs::write(root.join("9000000000/Info.json"), "{}").unwrap();
+        std::fs::write(root.join("9000000000/Mods/mods.txt"), "a").unwrap();
+        std::fs::write(root.join(MANIFEST_SIDECAR), "v1").unwrap();
+
+        let mirror = mirror_pack(&content, &root).unwrap();
+        assert_eq!(mirror, content.join(PACK_MIRROR_DIR));
+        assert_eq!(
+            std::fs::read_to_string(mirror.join("9000000000/Mods/mods.txt")).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mirror.join(MANIFEST_SIDECAR)).unwrap(),
+            "v1"
+        );
+        assert!(!content.join(format!("{PACK_MIRROR_DIR}.staging")).exists());
+
+        // The same pack: left as it is.
+        std::fs::write(mirror.join("marker"), "kept").unwrap();
+        mirror_pack(&content, &root).unwrap();
+        assert!(mirror.join("marker").exists());
+
+        // Another pack: replaced whole, nothing of the old one left.
+        std::fs::remove_dir_all(root.join("9000000000")).unwrap();
+        std::fs::create_dir_all(root.join("9900000003")).unwrap();
+        std::fs::write(root.join("9900000003/Info.json"), "{}").unwrap();
+        std::fs::write(root.join(MANIFEST_SIDECAR), "v2").unwrap();
+        mirror_pack(&content, &root).unwrap();
+        assert!(!mirror.join("marker").exists());
+        assert!(!mirror.join("9000000000").exists());
+        assert!(mirror.join("9900000003/Info.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(mirror.join(MANIFEST_SIDECAR)).unwrap(),
+            "v2"
+        );
+
+        let _ = std::fs::remove_dir_all(&content);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
