@@ -72,8 +72,8 @@ const PACK_FOLDER: Record<string, { pick: string; note: (name: string) => string
   palworld: {
     pick: "PackRelay pack folder",
     note: (name) =>
-      `PackRelay's own ${name} folder. When you join through the launcher, ${name}'s own mod loader installs the pack from here; your Steam Workshop mods are left alone and come back when you start ${name} from Steam.`,
-    missing: "Install it through Steam first.",
+      `PackRelay's own ${name} folder. When you join through the launcher, ${name}'s own mod loader installs the pack from here; your own mods are left alone and come back when you start ${name} from Steam or the Xbox app.`,
+    missing: "Install it through Steam or the Xbox app (Game Pass) first.",
   },
 };
 const packFolder = (id: string | undefined) => PACK_FOLDER[id ?? ""] ?? PACK_FOLDER.valheim;
@@ -5423,6 +5423,8 @@ function SettingsView({
         )}
       </div>
 
+      <GameCopySection game="palworld" />
+
       <CacheSection />
 
       <TrustedKeysSection packBySlug={packBySlug} />
@@ -5629,6 +5631,84 @@ type GcResult = {
   blobsRemoved: number;
   bytesFreed: number;
 };
+
+// Wire type for game_copies (Rust GameCopies): where a game is installed
+// per store, and which copy the launcher starts.
+type GameCopies = {
+  steam: string | null;
+  xbox: string | null;
+  using: "steam" | "xbox" | null;
+};
+
+// Settings card for a game installed through both Steam and the Xbox
+// app (Game Pass): which copy the launcher starts and installs packs
+// into. Hidden unless both are installed.
+function GameCopySection({ game }: { game: string }) {
+  const [copies, setCopies] = useState<GameCopies | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setCopies(await invoke<GameCopies>("game_copies", { game }));
+      setError(null);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  }, [game]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (!copies?.steam || !copies.xbox) return null;
+
+  const choose = async (store: "steam" | "xbox") => {
+    try {
+      await invoke("set_game_store", { game, store });
+      await refresh();
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  };
+  const options: { store: "steam" | "xbox"; label: string; path: string }[] = [
+    { store: "steam", label: "Steam", path: copies.steam },
+    { store: "xbox", label: "Xbox app (Game Pass)", path: copies.xbox },
+  ];
+
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-1">
+        {gameName(game)} copy
+      </h2>
+      <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed mb-4">
+        You have {gameName(game)} from both Steam and the Xbox app. The launcher starts this
+        one when you join a server, and its mod loader installs the pack.
+      </p>
+      {error && (
+        <div className="mb-3 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)]">
+          {error}
+        </div>
+      )}
+      <div className="space-y-2">
+        {options.map((o) => (
+          <label key={o.store} className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name={`${game}-copy`}
+              className="mt-0.5"
+              checked={copies.using === o.store}
+              onChange={() => void choose(o.store)}
+            />
+            <span>
+              <span className="block text-sm text-[var(--color-text-bright)]">{o.label}</span>
+              <span className="block text-[10px] text-[var(--color-text-dim)] break-all">{o.path}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // Cache disk-usage card for the Settings page. Shows the totals
 // straight from packrelay-core's cache_stats command, plus a

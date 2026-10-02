@@ -8,6 +8,7 @@ pub mod blob_cache;
 pub mod canonical_json;
 pub mod client;
 pub mod framework;
+pub mod gamepass;
 pub mod games;
 pub mod install;
 pub mod key_pins;
