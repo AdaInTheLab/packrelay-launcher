@@ -35,6 +35,17 @@ pub enum ConnectArgs {
     None,
 }
 
+/// A game's Game Pass (Xbox app) edition, when PackRelay supports it
+/// (gamepass.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XboxLayout {
+    /// The package's identity name, as its MicrosoftGame.config gives it.
+    pub identity: &'static str,
+    /// The app to start: `<package family name>!<application id>`, opened
+    /// as `shell:AppsFolder\<this>` (the Xbox app's own launch).
+    pub app_user_model_id: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameLayout {
     /// Manifest `game`, as the cloud's registry names it.
@@ -46,6 +57,8 @@ pub struct GameLayout {
     /// The install folder under steamapps/common when the app manifest
     /// doesn't say otherwise.
     pub steam_install_dir: &'static str,
+    /// The Game Pass edition, when PackRelay can install packs into it.
+    pub xbox: Option<XboxLayout>,
     /// The client executable, relative to the install folder.
     pub exe: &'static str,
     /// The client port a server uses when its address names none.
@@ -93,6 +106,7 @@ pub const SEVEN_DAYS: GameLayout = GameLayout {
     short_name: "7DTD",
     steam_appid: 251570,
     steam_install_dir: "7 Days To Die",
+    xbox: None,
     exe: "7DaysToDie.exe",
     default_port: 26900,
     connect_args: ConnectArgs::ConnectToIpPort,
@@ -139,6 +153,7 @@ pub const VALHEIM: GameLayout = GameLayout {
     short_name: "Valheim",
     steam_appid: 892970,
     steam_install_dir: "Valheim",
+    xbox: None,
     exe: "valheim.exe",
     default_port: 2456,
     connect_args: ConnectArgs::PlusConnect,
@@ -163,13 +178,20 @@ pub const VALHEIM: GameLayout = GameLayout {
 /// launch (palworld-spike.md §2, §5). The whole folder is the pack's.
 /// UE4SS rides in the pack as package 9000000000 when a mod needs it,
 /// so there's no framework step. Worlds live in the game's own save
-/// folders and are never swapped.
+/// folders and are never swapped. The Game Pass edition works the same
+/// way (gamepass.rs).
 pub const PALWORLD: GameLayout = GameLayout {
     id: "palworld",
     display_name: "Palworld",
     short_name: "Palworld",
     steam_appid: 1623730,
     steam_install_dir: "Palworld",
+    // The Game Pass build has the same mod loader as Steam's, and reads
+    // -workshopdir from its UECommandLine.txt (PALWORLD.md §7).
+    xbox: Some(XboxLayout {
+        identity: "PocketpairInc.Palworld",
+        app_user_model_id: "PocketpairInc.Palworld_ad4psfrxyesvt!AppPalShipping",
+    }),
     exe: "Palworld.exe",
     default_port: 8211,
     connect_args: ConnectArgs::None,

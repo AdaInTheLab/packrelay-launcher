@@ -33,7 +33,7 @@ use packrelay_core::update::{update, UpdateReport};
 use packrelay_core::verify::{
     presence_check, repair, verify, PresenceReport, RepairReport, VerifyReport,
 };
-use packrelay_core::{launch, steam};
+use packrelay_core::{gamepass, launch, steam};
 
 /// How many pre-launch snapshots we keep per profile before
 /// pruning the oldest. User-tweakable in a future settings panel;
@@ -316,7 +316,7 @@ fn default_install_dest(app: AppHandle, game: Option<String>) -> Option<String> 
     let path = match (game.live_root_in_install, game.live_root_in_data) {
         // A game whose pack lives inside its install (Valheim: BepInEx/
         // in the game folder): wherever Steam has it.
-        (Some(_), _) => steam::live_root_in(game, &find_game_install(game)?)?,
+        (Some(_), _) => steam::live_root_in(game, &find_game_install(&app, game)?.dir)?,
         // A game whose loader reads packs from wherever it's told
         // (Palworld's -workshopdir): PackRelay's own folder.
         (None, Some(rel)) => app.path().app_data_dir().ok()?.join(rel),
@@ -1534,13 +1534,24 @@ async fn launch_game(
         }
     }
 
+    // Which copy of the game to start: Steam's, or the Xbox app's
+    // (Game Pass), as the player chose in Settings when they have both.
+    let install = find_game_install(&app, game);
+
     // Palworld: point the game's own mod loader at the active pack's
     // folder (after alignment, so it's the server's pack).
     let workshop_dir = if game.launch_with_workshop_dir {
-        prepare_workshop_launch(&layout, game).await?
+        prepare_workshop_launch(&layout, game, install.as_ref()).await?
     } else {
         None
     };
+
+    // The Xbox app's copy takes no command line: the pack folder goes in
+    // its UECommandLine.txt instead, and it starts through the Xbox app.
+    if let Some(found) = install.as_ref().filter(|i| i.store == GameStore::Xbox) {
+        launch_xbox(game, &found.dir, workshop_dir.as_deref())?;
+        return Ok(alignment);
+    }
 
     // Preferred path: direct exe spawn with the connect args (and
     // Palworld's -workshopdir) baked into the argv. Bypasses Steam's
@@ -1549,7 +1560,12 @@ async fn launch_game(
     // something to pass -- bare-launch goes through Steam so the user
     // lands on the main menu with Steam's launch flow intact.
     if connect_address.is_some() || workshop_dir.is_some() {
-        match try_spawn(game, connect_address.as_deref(), workshop_dir.as_deref()) {
+        match try_spawn(
+            game,
+            install.as_ref(),
+            connect_address.as_deref(),
+            workshop_dir.as_deref(),
+        ) {
             Ok(()) => return Ok(alignment),
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
@@ -1575,6 +1591,7 @@ async fn launch_game(
 async fn prepare_workshop_launch(
     layout: &StoreLayout,
     game: &'static GameLayout,
+    install: Option<&GameInstall>,
 ) -> Result<Option<PathBuf>, String> {
     let (_, root) = profile::read_active(layout, game)
         .await
@@ -1586,14 +1603,19 @@ async fn prepare_workshop_launch(
     if packages.is_empty() {
         return Ok(None);
     }
-    let install = find_game_install(game).ok_or_else(|| {
-        format!(
-            "{} isn't installed where Steam can find it, so PackRelay can't switch its mods on.",
+    let Some(install) = install.map(|i| &i.dir) else {
+        let finders = if game.xbox.is_some() {
+            "Steam or the Xbox app"
+        } else {
+            "Steam"
+        };
+        return Err(format!(
+            "{} isn't installed where {finders} can find it, so PackRelay can't switch its mods on.",
             game.display_name
-        )
-    })?;
+        ));
+    };
     if palworld::pack_ships_ue4ss(&root) {
-        if let Some(dll) = palworld::manual_ue4ss_proxy(&install) {
+        if let Some(dll) = palworld::manual_ue4ss_proxy(install) {
             return Err(format!(
                 "This pack ships UE4SS through {}'s own mod loader, and a hand-installed UE4SS is \
                  also in your game folder ({}). The two together crash the game. Move that file \
@@ -1604,7 +1626,7 @@ async fn prepare_workshop_launch(
         }
     }
 
-    let ini = palworld::mod_settings_path(&install);
+    let ini = palworld::mod_settings_path(install);
     let existing = std::fs::read_to_string(&ini).unwrap_or_default();
     // Keep the player's own settings once, before PackRelay first edits
     // them, so they can always be put back by hand.
@@ -1648,17 +1670,21 @@ struct ServerPack {
 /// silently failing.
 fn try_spawn(
     game: &GameLayout,
+    install: Option<&GameInstall>,
     connect_address: Option<&str>,
     workshop_dir: Option<&Path>,
 ) -> Result<(), String> {
-    let Some(install) = find_game_install(game) else {
+    let Some(install) = install
+        .filter(|i| i.store == GameStore::Steam)
+        .map(|i| &i.dir)
+    else {
         return Err("client install not located".to_string());
     };
 
     // cwd matters -- 7DTD looks for its sibling _Data dir at startup,
     // and Valheim's BepInEx loader resolves from the game folder.
     let mut cmd = std::process::Command::new(install.join(game.exe));
-    cmd.current_dir(&install);
+    cmd.current_dir(install);
     if let Some(addr) = connect_address {
         let (host, port) = launch::parse_connect_address(game, addr);
         if !launch::is_safe_host(&host) {
@@ -1694,14 +1720,217 @@ fn try_spawn(
     cmd.spawn().map(|_| ()).map_err(|e| format!("spawn: {e}"))
 }
 
-/// Locate the game's install by walking every Steam library on the
-/// machine (steam::find_install reads each library's app manifest).
+/// Which store's copy of a game the launcher drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GameStore {
+    Steam,
+    /// The Xbox app (Game Pass); gamepass.rs.
+    Xbox,
+}
+
+/// A game's install folder, and which store it came from. For the Xbox
+/// app's copy the folder is its Content folder (the one holding Pal/).
+#[derive(Debug, Clone)]
+struct GameInstall {
+    dir: PathBuf,
+    store: GameStore,
+}
+
+/// Locate the game's install: Steam's copy (steam::find_install reads
+/// each library's app manifest) or, for a game with a Game Pass edition,
+/// the Xbox app's (gamepass::find_install). With both installed, the
+/// one the player chose in Settings, else Steam's.
 ///
 /// We don't cache the result -- call sites fire on user click
 /// (rare), and an install can move between calls (e.g. Steam
 /// rebalances libraries). The whole probe is a few stats; cheap.
-fn find_game_install(game: &GameLayout) -> Option<PathBuf> {
+fn find_game_install(app: &AppHandle, game: &GameLayout) -> Option<GameInstall> {
+    let steam = steam_install(game).map(|dir| GameInstall {
+        dir,
+        store: GameStore::Steam,
+    });
+    let xbox = xbox_install(game).map(|dir| GameInstall {
+        dir,
+        store: GameStore::Xbox,
+    });
+    match chosen_store(app, game) {
+        Some(GameStore::Xbox) => xbox.or(steam),
+        _ => steam.or(xbox),
+    }
+}
+
+fn steam_install(game: &GameLayout) -> Option<PathBuf> {
     steam::find_install(game, &steam::steam_libraries(&steam_roots()))
+}
+
+/// The Xbox app's copy, for a game PackRelay supports there.
+fn xbox_install(game: &GameLayout) -> Option<PathBuf> {
+    let xbox = game.xbox?;
+    gamepass::find_install(xbox.identity, &gamepass::gaming_libraries(&drive_roots()))
+}
+
+/// Every drive root (`C:\`, `D:\`, ...) the Xbox app has marked as
+/// holding a library. None off Windows.
+fn drive_roots() -> Vec<PathBuf> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    (b'A'..=b'Z')
+        .map(|d| PathBuf::from(format!("{}:\\", d as char)))
+        .filter(|root| root.join(".GamingRoot").is_file())
+        .collect()
+}
+
+/// The settings file holding which store's copy to use per game, when a
+/// player has both: `{ "palworld": "xbox" }`.
+fn store_choices_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(app.path().app_data_dir().ok()?.join("game-stores.json"))
+}
+
+fn read_store_choices(app: &AppHandle) -> std::collections::BTreeMap<String, GameStore> {
+    store_choices_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn chosen_store(app: &AppHandle, game: &GameLayout) -> Option<GameStore> {
+    read_store_choices(app).get(game.id).copied()
+}
+
+/// Where a game is installed, per store, for the Settings choice
+/// between them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameCopies {
+    steam: Option<String>,
+    xbox: Option<String>,
+    /// The copy the launcher starts.
+    using: Option<GameStore>,
+}
+
+#[tauri::command]
+fn game_copies(app: AppHandle, game: Option<String>) -> Result<GameCopies, String> {
+    let game = game_of(game.as_deref())?;
+    Ok(GameCopies {
+        steam: steam_install(game).map(|p| p.display().to_string()),
+        xbox: xbox_install(game).map(|p| p.display().to_string()),
+        using: find_game_install(&app, game).map(|i| i.store),
+    })
+}
+
+#[tauri::command]
+fn set_game_store(app: AppHandle, game: Option<String>, store: GameStore) -> Result<(), String> {
+    let game = game_of(game.as_deref())?;
+    if store == GameStore::Xbox && game.xbox.is_none() {
+        return Err(format!(
+            "PackRelay doesn't support the Xbox app's {}.",
+            game.display_name
+        ));
+    }
+    let path = store_choices_path(&app).ok_or("no app data folder")?;
+    let mut choices = read_store_choices(&app);
+    choices.insert(game.id.to_string(), store);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(&choices).map_err(|e| e.to_string())?;
+    std::fs::write(&path, raw).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Start the Xbox app's copy of `game`, loading `workshop_dir` (Palworld's
+/// -workshopdir) or, None, no PackRelay pack. The Xbox app starts the
+/// game with no arguments, so the folder goes in its UECommandLine.txt,
+/// which the game reads as it starts. Once it's running the file is put
+/// back, so starting the game from the Xbox app later loads no PackRelay
+/// pack: the loader then uninstalls it, as a plain Steam launch does.
+fn launch_xbox(
+    game: &GameLayout,
+    content: &Path,
+    workshop_dir: Option<&Path>,
+) -> Result<(), String> {
+    let xbox = game.xbox.ok_or("no Xbox app edition")?;
+    gamepass::set_workshop_dir(content, workshop_dir).map_err(|e| format!("{e:#}"))?;
+    let started = start_xbox_app(xbox.app_user_model_id);
+    if workshop_dir.is_some() {
+        let content = content.to_path_buf();
+        let process = gamepass::process_name(&content);
+        let ok = started.is_ok();
+        std::thread::spawn(move || {
+            if ok {
+                if let Some(name) = process {
+                    wait_for_process(&name, std::time::Duration::from_secs(180));
+                }
+                // The game reads the file early in its start; give it
+                // time before taking the folder back out.
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
+            if let Err(e) = gamepass::clear_workshop_dir(&content) {
+                eprintln!("[launch] couldn't reset UECommandLine.txt: {e:#}");
+            }
+        });
+    }
+    started.map_err(|e| {
+        format!(
+            "failed to start {} through the Xbox app: {e}",
+            game.short_name
+        )
+    })
+}
+
+fn start_xbox_app(app_user_model_id: &str) -> std::io::Result<()> {
+    std::process::Command::new("explorer.exe")
+        .arg(gamepass::launch_uri(app_user_model_id))
+        .spawn()
+        .map(|_| ())
+}
+
+/// Wait until a process named `name` is running, up to `limit`.
+fn wait_for_process(name: &str, limit: std::time::Duration) {
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until {
+        if process_running(name) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_running(name: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH", "/FO", "CSV"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains(&format!("\"{}\"", name.to_ascii_lowercase()))
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_running(_name: &str) -> bool {
+    false
+}
+
+/// Take a PackRelay -workshopdir left in an Xbox app copy's
+/// UECommandLine.txt back out, for when the launcher closed before
+/// putting it back after a launch.
+fn reset_xbox_command_lines() {
+    for game in GAMES {
+        if let Some(content) = xbox_install(game) {
+            if let Err(e) = gamepass::clear_workshop_dir(&content) {
+                eprintln!(
+                    "[startup] couldn't reset {}'s UECommandLine.txt: {e:#}",
+                    game.short_name
+                );
+            }
+        }
+    }
 }
 
 /// Where Steam is installed: the path Steam records in the registry
@@ -1816,6 +2045,8 @@ pub fn run() {
                 }
             });
 
+            std::thread::spawn(reset_xbox_command_lines);
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(
@@ -1849,6 +2080,8 @@ pub fn run() {
             list_servers,
             install_pack,
             default_install_dest,
+            game_copies,
+            set_game_store,
             launch_game,
             verify_pack,
             check_pack_present,
