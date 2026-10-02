@@ -79,6 +79,38 @@ const PACK_FOLDER: Record<string, { pick: string; note: (name: string) => string
 const packFolder = (id: string | undefined) => PACK_FOLDER[id ?? ""] ?? PACK_FOLDER.valheim;
 const connectMenu = (id: string | undefined) =>
   CONNECT_MENU[id ?? "7d2d"] ?? "the game's direct-connect";
+/** Games that can't be told a server on their command line (Rust
+ *  `ConnectArgs::None`): the launcher starts them with the pack, and the
+ *  player pastes the address. */
+const pastesAddress = (id: string | undefined) => id === "palworld";
+
+/** Palworld's join copy, for both join buttons. Steam asks once before
+ *  it passes a new launch option on (the pack's folder), even when the
+ *  launcher starts the game itself: Palworld.exe hands the start back to
+ *  Steam. The Xbox app copy doesn't ask. */
+function PalworldJoinNote({ when }: { when: "idle" | "launched" }) {
+  const menu = (
+    <span className="text-[var(--color-text-bright)]">{connectMenu("palworld")}</span>
+  );
+  return (
+    <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+      {when === "idle" ? (
+        <>
+          Starts Palworld with this server&apos;s pack and copies the address.
+          Palworld can&apos;t join a server on its own, so paste the address
+          into {menu}.
+        </>
+      ) : (
+        <>
+          Palworld is starting with the pack. If Steam asks about launching
+          with custom arguments, click Continue: that&apos;s the pack. At the
+          title screen, paste the address (it&apos;s on your clipboard) into{" "}
+          {menu}.
+        </>
+      )}
+    </p>
+  );
+}
 
 // Mirrors the Rust CatalogServer struct.
 type AttachedPack = {
@@ -4981,28 +5013,34 @@ function ConnectButton({
       >
         {state.kind === "launching" ? "Launching…" : "Connect"}
       </button>
-      {state.kind === "idle" && (
-        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Launches {gameShort(game)} and joins this server. If the auto-connect
-          drops you on the main menu, the address is on your
-          clipboard for a manual paste.
-        </p>
-      )}
+      {state.kind === "idle" &&
+        (pastesAddress(game) ? (
+          <PalworldJoinNote when="idle" />
+        ) : (
+          <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            Launches {gameShort(game)} and joins this server. If the auto-connect
+            drops you on the main menu, the address is on your
+            clipboard for a manual paste.
+          </p>
+        ))}
       {state.kind === "launched" && state.note && (
         <p className="text-[11px] text-[var(--color-accent-soft)] leading-relaxed">
           {state.note}
         </p>
       )}
-      {state.kind === "launched" && (
-        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          {gameShort(game)} is launching with the connect args. If the menu
-          loads instead of the server, paste the address into{" "}
-          <span className="text-[var(--color-text-bright)]">
-            {connectMenu(game)}
-          </span>
-          .
-        </p>
-      )}
+      {state.kind === "launched" &&
+        (pastesAddress(game) ? (
+          <PalworldJoinNote when="launched" />
+        ) : (
+          <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            {gameShort(game)} is launching with the connect args. If the menu
+            loads instead of the server, paste the address into{" "}
+            <span className="text-[var(--color-text-bright)]">
+              {connectMenu(game)}
+            </span>
+            .
+          </p>
+        ))}
       {state.kind === "error" && (
         <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed break-words">
           Couldn&apos;t launch {gameShort(game)}: {state.message}. Address is on
@@ -5069,34 +5107,44 @@ function LaunchPanel({
         disabled={state.kind === "launching"}
         className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
       >
-        {state.kind === "launching" ? "Opening Steam…" : `Launch ${gameShort(game)}`}
+        {state.kind === "launching"
+          ? pastesAddress(game)
+            ? "Launching…"
+            : "Opening Steam…"
+          : `Launch ${gameShort(game)}`}
       </button>
       {state.kind === "launched" && state.note && (
         <p className="text-[11px] text-[var(--color-accent-soft)] leading-relaxed">
           {state.note}
         </p>
       )}
-      {state.kind === "launched" && (
-        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Steam is launching {gameShort(game)} with the connect args. If it lands
-          on the main menu instead, the address is on your clipboard —
-          paste it into <span className="text-[var(--color-text-bright)]">{connectMenu(game)}</span>.
-        </p>
-      )}
+      {state.kind === "launched" &&
+        (pastesAddress(game) ? (
+          <PalworldJoinNote when="launched" />
+        ) : (
+          <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            Steam is launching {gameShort(game)} with the connect args. If it lands
+            on the main menu instead, the address is on your clipboard —
+            paste it into <span className="text-[var(--color-text-bright)]">{connectMenu(game)}</span>.
+          </p>
+        ))}
       {state.kind === "error" && (
         <p className="text-[11px] text-[var(--color-status-danger)] leading-relaxed">
-          Couldn&apos;t open Steam: {state.message}. The address is
+          Couldn&apos;t {pastesAddress(game) ? `start ${gameShort(game)}` : "open Steam"}: {state.message}. The address is
           still on your clipboard — launch {gameShort(game)} manually and paste it
           into {connectMenu(game)}.
         </p>
       )}
-      {state.kind === "idle" && (
-        <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
-          Asks Steam to launch {gameShort(game)} and connect to this server. If
-          Steam strips the connect args the address is on your
-          clipboard for a manual paste.
-        </p>
-      )}
+      {state.kind === "idle" &&
+        (pastesAddress(game) ? (
+          <PalworldJoinNote when="idle" />
+        ) : (
+          <p className="text-[11px] text-[var(--color-text-dim)] leading-relaxed">
+            Asks Steam to launch {gameShort(game)} and connect to this server. If
+            Steam strips the connect args the address is on your
+            clipboard for a manual paste.
+          </p>
+        ))}
     </div>
   );
 }

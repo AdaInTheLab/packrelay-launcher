@@ -1555,8 +1555,10 @@ async fn launch_game(
 
     // Preferred path: direct exe spawn with the connect args (and
     // Palworld's -workshopdir) baked into the argv. Bypasses Steam's
-    // URI-argument stripping, and the prompt Steam shows for a launch
-    // with custom arguments, entirely. Only attempted when there's
+    // URI-argument stripping. Not Steam's "launch with custom arguments"
+    // prompt for Palworld, though: Palworld.exe hands the start back to
+    // Steam, which asks once per new argument string (the join copy says
+    // so; found in the Steam join test). Only attempted when there's
     // something to pass -- bare-launch goes through Steam so the user
     // lands on the main menu with Steam's launch flow intact.
     if connect_address.is_some() || workshop_dir.is_some() {
