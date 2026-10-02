@@ -1842,15 +1842,28 @@ fn set_game_store(app: AppHandle, game: Option<String>, store: GameStore) -> Res
 /// Start the Xbox app's copy of `game`, loading `workshop_dir` (Palworld's
 /// -workshopdir) or, None, no PackRelay pack. The Xbox app starts the
 /// game with no arguments, so the folder goes in its UECommandLine.txt,
-/// which the game reads as it starts. Once it's running the file is put
-/// back, so starting the game from the Xbox app later loads no PackRelay
-/// pack: the loader then uninstalls it, as a plain Steam launch does.
+/// and the pack is mirrored into the install first (gamepass::mirror_pack).
+///
+/// The game reads that file again when it joins a server, and its loader
+/// uninstalls the pack if the folder is gone by then (found in the Game
+/// Pass join test). So the file keeps the folder for as long as the game
+/// runs, and is put back once it exits: starting the game from the Xbox
+/// app later loads no PackRelay pack, and the loader uninstalls it, as a
+/// plain Steam launch does.
 fn launch_xbox(
     game: &GameLayout,
     content: &Path,
     workshop_dir: Option<&Path>,
 ) -> Result<(), String> {
     let xbox = game.xbox.ok_or("no Xbox app edition")?;
+    // The game can't read the launcher's own folder (it's in AppData, which
+    // a packaged app sees its own copy of), so the pack goes in its
+    // install first.
+    let workshop_dir = match workshop_dir {
+        Some(root) => Some(gamepass::mirror_pack(content, root).map_err(|e| format!("{e:#}"))?),
+        None => None,
+    };
+    let workshop_dir = workshop_dir.as_deref();
     gamepass::set_workshop_dir(content, workshop_dir).map_err(|e| format!("{e:#}"))?;
     let started = start_xbox_app(xbox.app_user_model_id);
     if workshop_dir.is_some() {
@@ -1860,11 +1873,10 @@ fn launch_xbox(
         std::thread::spawn(move || {
             if ok {
                 if let Some(name) = process {
-                    wait_for_process(&name, std::time::Duration::from_secs(180));
+                    if wait_for_process(&name, std::time::Duration::from_secs(180)) {
+                        wait_for_exit(&name);
+                    }
                 }
-                // The game reads the file early in its start; give it
-                // time before taking the folder back out.
-                std::thread::sleep(std::time::Duration::from_secs(20));
             }
             if let Err(e) = gamepass::clear_workshop_dir(&content) {
                 eprintln!("[launch] couldn't reset UECommandLine.txt: {e:#}");
@@ -1886,14 +1898,23 @@ fn start_xbox_app(app_user_model_id: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// Wait until a process named `name` is running, up to `limit`.
-fn wait_for_process(name: &str, limit: std::time::Duration) {
+/// Wait until a process named `name` is running, up to `limit`. False
+/// when it never started.
+fn wait_for_process(name: &str, limit: std::time::Duration) -> bool {
     let until = std::time::Instant::now() + limit;
     while std::time::Instant::now() < until {
         if process_running(name) {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    false
+}
+
+/// Wait until no process named `name` is running.
+fn wait_for_exit(name: &str) {
+    while process_running(name) {
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }
 
@@ -1919,10 +1940,14 @@ fn process_running(_name: &str) -> bool {
 
 /// Take a PackRelay -workshopdir left in an Xbox app copy's
 /// UECommandLine.txt back out, for when the launcher closed before
-/// putting it back after a launch.
+/// putting it back after a launch. Not while the game is running: it
+/// reads the file again when it joins a server (launch_xbox).
 fn reset_xbox_command_lines() {
     for game in GAMES {
         if let Some(content) = xbox_install(game) {
+            if gamepass::process_name(&content).is_some_and(|name| process_running(&name)) {
+                continue;
+            }
             if let Err(e) = gamepass::clear_workshop_dir(&content) {
                 eprintln!(
                     "[startup] couldn't reset {}'s UECommandLine.txt: {e:#}",
