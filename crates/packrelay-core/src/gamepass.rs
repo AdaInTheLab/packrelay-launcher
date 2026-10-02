@@ -283,15 +283,21 @@ mod tests {
     #[test]
     fn adds_and_takes_out_the_workshop_dir() {
         let base = "../../../Pal/Pal.uproject";
-        let dir = Path::new(r"C:\Users\Player\AppData\Roaming\PackRelay\palworld-workshop");
-        let with = command_line_with_workshop_dir(base, Some(dir)).unwrap();
+        // Absolute on whichever OS runs the tests (CI is Linux).
+        let dir = std::env::temp_dir()
+            .join("PackRelay")
+            .join("palworld-workshop");
+        let with = command_line_with_workshop_dir(base, Some(&dir)).unwrap();
         assert_eq!(
             with,
-            r#"../../../Pal/Pal.uproject -workshopdir="C:\Users\Player\AppData\Roaming\PackRelay\palworld-workshop""#
+            format!(
+                "../../../Pal/Pal.uproject -workshopdir=\"{}\"",
+                dir.display()
+            )
         );
         // Again: replaced, not added twice.
         assert_eq!(
-            command_line_with_workshop_dir(&with, Some(dir)).unwrap(),
+            command_line_with_workshop_dir(&with, Some(&dir)).unwrap(),
             with
         );
         // Off: back to what it was.
