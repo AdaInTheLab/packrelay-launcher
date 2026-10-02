@@ -1842,7 +1842,8 @@ fn set_game_store(app: AppHandle, game: Option<String>, store: GameStore) -> Res
 /// Start the Xbox app's copy of `game`, loading `workshop_dir` (Palworld's
 /// -workshopdir) or, None, no PackRelay pack. The Xbox app starts the
 /// game with no arguments, so the folder goes in its UECommandLine.txt,
-/// which the game reads as it starts. Once it's running the file is put
+/// which the game reads as it starts, and the pack is mirrored into the
+/// install first (gamepass::mirror_pack). Once it's running the file is put
 /// back, so starting the game from the Xbox app later loads no PackRelay
 /// pack: the loader then uninstalls it, as a plain Steam launch does.
 fn launch_xbox(
@@ -1851,6 +1852,14 @@ fn launch_xbox(
     workshop_dir: Option<&Path>,
 ) -> Result<(), String> {
     let xbox = game.xbox.ok_or("no Xbox app edition")?;
+    // The game can't read the launcher's own folder (it's in AppData, which
+    // a packaged app sees its own copy of), so the pack goes in its
+    // install first.
+    let workshop_dir = match workshop_dir {
+        Some(root) => Some(gamepass::mirror_pack(content, root).map_err(|e| format!("{e:#}"))?),
+        None => None,
+    };
+    let workshop_dir = workshop_dir.as_deref();
     gamepass::set_workshop_dir(content, workshop_dir).map_err(|e| format!("{e:#}"))?;
     let started = start_xbox_app(xbox.app_user_model_id);
     if workshop_dir.is_some() {
