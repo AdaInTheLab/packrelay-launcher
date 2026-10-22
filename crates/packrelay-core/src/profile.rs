@@ -71,6 +71,10 @@ pub struct ProfilePaths {
     pub worlds: PathBuf,
     /// Parent of per-pack subdirectories (`packs/<slug>/`).
     pub packs_root: PathBuf,
+    /// Saves made in vanilla mode (`vanilla/saves/`). Vanilla isn't a
+    /// pack, but its worlds are kept like one's: captured when the
+    /// profile leaves vanilla, put back when it returns (#654).
+    pub vanilla_saves: PathBuf,
 }
 
 impl ProfilePaths {
@@ -80,6 +84,7 @@ impl ProfilePaths {
             meta: profile_root.join("meta.json"),
             worlds: profile_root.join("worlds"),
             packs_root: profile_root.join("packs"),
+            vanilla_saves: profile_root.join("vanilla").join("saves"),
         }
     }
 
@@ -87,6 +92,14 @@ impl ProfilePaths {
     /// whether the pack actually exists on disk.
     pub fn pack_paths(&self, slug: &str) -> PackPaths {
         PackPaths::from_root(&self.packs_root.join(slug))
+    }
+
+    /// Where the saves of `slug`, or of vanilla mode (None), are kept.
+    pub fn saves_slot(&self, slug: Option<&str>) -> PathBuf {
+        match slug {
+            Some(slug) => self.pack_paths(slug).saves,
+            None => self.vanilla_saves.clone(),
+        }
     }
 }
 
@@ -610,17 +623,15 @@ pub async fn switch_profile(
                     replace_dir(&prev_paths.worlds, live_worlds).await?;
                 }
             }
-            // Mods + Saves go to the outgoing profile's ACTIVE pack.
-            // If no active pack, the user was in vanilla mode and we
-            // skip the per-pack capture.
-            if let Some(active_slug) = &prev_meta.active_pack_slug {
-                let prev_pack = prev_paths.pack_paths(active_slug);
-                capture_mods(game, &userdata, &prev_pack.mods).await?;
-                if let Some(live_saves) = &live_saves {
-                    if fs::metadata(live_saves).await.is_ok() {
-                        replace_dir(&prev_pack.saves, live_saves).await?;
-                    }
-                }
+            // Mods go to the outgoing profile's ACTIVE pack; in vanilla
+            // mode there are none to keep. Saves go to that pack, or to
+            // the profile's vanilla slot (#654).
+            let prev_slug = prev_meta.active_pack_slug.as_deref();
+            if let Some(active_slug) = prev_slug {
+                capture_mods(game, &userdata, &prev_paths.pack_paths(active_slug).mods).await?;
+            }
+            if let Some(live_saves) = &live_saves {
+                capture_saves(live_saves, &prev_paths.saves_slot(prev_slug)).await?;
             }
         }
     }
@@ -633,24 +644,15 @@ pub async fn switch_profile(
         replace_dir(live_worlds, &next_paths.worlds).await?;
     }
 
-    // Mods + Saves come from incoming's active pack. If no active
-    // pack (vanilla mode), CLEAR live mods + saves so the user
-    // doesn't inherit the prior profile's leftovers.
-    if let Some(next_slug) = &next_meta.active_pack_slug {
-        let next_pack = next_paths.pack_paths(next_slug);
-        deploy_mods(game, &userdata, Some(&next_pack.mods)).await?;
-        if let Some(live_saves) = &live_saves {
-            replace_dir(live_saves, &next_pack.saves).await?;
-        }
-    } else {
-        // Vanilla mode: empty mods + saves.
-        deploy_mods(game, &userdata, None).await?;
-        if let Some(live_saves) = &live_saves {
-            if fs::metadata(live_saves).await.is_ok() {
-                remove_dir_all_safe(live_saves).await?;
-            }
-            fs::create_dir_all(live_saves).await?;
-        }
+    // Mods come from incoming's active pack; with no active pack
+    // (vanilla mode), live mods are cleared so the user doesn't inherit
+    // the prior profile's leftovers. Saves come from that pack, or from
+    // the profile's vanilla slot (empty until a vanilla world exists).
+    let next_slug = next_meta.active_pack_slug.as_deref();
+    let next_mods = next_slug.map(|slug| next_paths.pack_paths(slug).mods);
+    deploy_mods(game, &userdata, next_mods.as_deref()).await?;
+    if let Some(live_saves) = &live_saves {
+        mount_saves(live_saves, &next_paths.saves_slot(next_slug)).await?;
     }
 
     // Step 3: flip the pointer.
@@ -701,34 +703,24 @@ pub async fn set_active_pack(
         }
     }
 
-    // Capture current live mods + saves back into the OUTGOING
-    // pack's dirs (if there is one). Same logic as switch_profile's
-    // step 1, scoped to the single profile.
-    if let Some(outgoing) = &meta.active_pack_slug {
-        let outgoing_pack = paths.pack_paths(outgoing);
-        capture_mods(game, &userdata, &outgoing_pack.mods).await?;
-        if let Some(live_saves) = &live_saves {
-            if fs::metadata(live_saves).await.is_ok() {
-                replace_dir(&outgoing_pack.saves, live_saves).await?;
-            }
-        }
+    // Capture current live mods back into the OUTGOING pack (vanilla
+    // mode has none), and live saves into that pack or the vanilla slot
+    // (#654). Same logic as switch_profile's step 1, scoped to the
+    // single profile.
+    let outgoing = meta.active_pack_slug.as_deref();
+    if let Some(outgoing) = outgoing {
+        capture_mods(game, &userdata, &paths.pack_paths(outgoing).mods).await?;
+    }
+    if let Some(live_saves) = &live_saves {
+        capture_saves(live_saves, &paths.saves_slot(outgoing)).await?;
     }
 
-    // Mount the incoming pack (or clear live for vanilla mode).
-    if let Some(incoming) = target_slug {
-        let incoming_pack = paths.pack_paths(incoming);
-        deploy_mods(game, &userdata, Some(&incoming_pack.mods)).await?;
-        if let Some(live_saves) = &live_saves {
-            replace_dir(live_saves, &incoming_pack.saves).await?;
-        }
-    } else {
-        deploy_mods(game, &userdata, None).await?;
-        if let Some(live_saves) = &live_saves {
-            if fs::metadata(live_saves).await.is_ok() {
-                remove_dir_all_safe(live_saves).await?;
-            }
-            fs::create_dir_all(live_saves).await?;
-        }
+    // Mount the incoming pack (or clear live mods for vanilla mode),
+    // with its saves or vanilla's.
+    let incoming_mods = target_slug.map(|slug| paths.pack_paths(slug).mods);
+    deploy_mods(game, &userdata, incoming_mods.as_deref()).await?;
+    if let Some(live_saves) = &live_saves {
+        mount_saves(live_saves, &paths.saves_slot(target_slug)).await?;
     }
 
     // Update meta.json.
@@ -1442,6 +1434,23 @@ async fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Keep the live saves in `slot` (a pack's saves, or the profile's
+/// vanilla slot), replacing what the slot held. Nothing to keep when
+/// the game has no live saves folder yet.
+async fn capture_saves(live_saves: &Path, slot: &Path) -> Result<()> {
+    if fs::metadata(live_saves).await.is_ok() {
+        replace_dir(slot, live_saves).await?;
+    }
+    Ok(())
+}
+
+/// Make `slot`'s saves the live ones. A slot that doesn't exist yet
+/// (vanilla mode before its first world) mounts as an empty folder.
+async fn mount_saves(live_saves: &Path, slot: &Path) -> Result<()> {
+    fs::create_dir_all(slot).await?;
+    replace_dir(live_saves, slot).await
+}
+
 /// Replace `dst` with the contents of `src` (after first deleting
 /// whatever's currently at `dst`). Used during profile switching
 /// where we want the destination's old contents gone.
@@ -1773,6 +1782,64 @@ mod tests {
             Alignment::AlreadyAligned
         );
         assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    fn saves(userdata: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(userdata.join("Saves"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn make_world(userdata: &Path, name: &str) {
+        let dir = userdata.join("Saves").join(name);
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join("main.ttw"), name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vanilla_mode_keeps_its_own_saves() {
+        // #654: a world made in vanilla mode used to be deleted the next
+        // time the profile switched to a pack.
+        let (layout, userdata, id) = fixture("vanilla-saves").await;
+        make_world(&userdata, "PackWorld").await;
+
+        set_active_pack(&layout, &SEVEN_DAYS, &id, None)
+            .await
+            .unwrap();
+        assert!(saves(&userdata).is_empty(), "vanilla starts with no worlds");
+        make_world(&userdata, "VanillaWorld").await;
+
+        set_active_pack(&layout, &SEVEN_DAYS, &id, Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(saves(&userdata), vec!["PackWorld"]);
+
+        set_active_pack(&layout, &SEVEN_DAYS, &id, None)
+            .await
+            .unwrap();
+        assert_eq!(saves(&userdata), vec!["VanillaWorld"]);
+        assert!(live(&userdata).is_empty(), "vanilla still has no mods");
+    }
+
+    #[tokio::test]
+    async fn a_vanilla_profile_keeps_its_saves_across_a_profile_switch() {
+        let (layout, userdata, main) = fixture("vanilla-profile").await;
+        set_active_pack(&layout, &SEVEN_DAYS, &main, None)
+            .await
+            .unwrap();
+        make_world(&userdata, "VanillaWorld").await;
+
+        let other = create_profile(&layout, &SEVEN_DAYS, "Other").await.unwrap();
+        switch_profile(&layout, &SEVEN_DAYS, &other.id)
+            .await
+            .unwrap();
+        assert!(saves(&userdata).is_empty());
+
+        switch_profile(&layout, &SEVEN_DAYS, &main).await.unwrap();
+        assert_eq!(saves(&userdata), vec!["VanillaWorld"]);
     }
 
     #[tokio::test]
