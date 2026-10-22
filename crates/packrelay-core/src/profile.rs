@@ -203,6 +203,13 @@ pub struct ProfileMeta {
     #[serde(default)]
     pub active_pack_slug: Option<String>,
 
+    /// The pack "back to vanilla after play" switched away from when
+    /// the game closed (PackRelayCloud #753): a plain launch from the
+    /// launcher puts it back (resume_parked). Cleared whenever the
+    /// player picks a pack, or vanilla, themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_pack_slug: Option<String>,
+
     /// Legacy v0 single-pack fields. Kept on the struct so we can
     /// READ old meta.json files into this type; migration moves
     /// their content into the `packs` vec then clears them. Always
@@ -340,6 +347,7 @@ pub async fn create_profile(
         game: game.id.to_string(),
         packs: Vec::new(),
         active_pack_slug: None,
+        parked_pack_slug: None,
         pack_slug: None,
         pack_version: None,
         created_at: now_rfc3339(),
@@ -466,6 +474,7 @@ pub async fn clone_profile(
         game: src_meta.game.clone(),
         packs: src_meta.packs.clone(),
         active_pack_slug: src_meta.active_pack_slug.clone(),
+        parked_pack_slug: None,
         pack_slug: None,
         pack_version: None,
         created_at: now_rfc3339(),
@@ -695,6 +704,10 @@ pub async fn set_active_pack(
     // Validate the target exists in the profile (or is None for
     // vanilla). No-op if already active.
     if meta.active_pack_slug.as_deref() == target_slug {
+        // Picking what's already live still ends a park: the player chose.
+        if meta.parked_pack_slug.take().is_some() {
+            write_meta(&paths, &meta).await?;
+        }
         return Ok(());
     }
     if let Some(slug) = target_slug {
@@ -725,8 +738,65 @@ pub async fn set_active_pack(
 
     // Update meta.json.
     meta.active_pack_slug = target_slug.map(|s| s.to_string());
+    meta.parked_pack_slug = None;
     write_meta(&paths, &meta).await?;
     Ok(())
+}
+
+/// Back to vanilla once a game session ends (PackRelayCloud #753, L2).
+///
+/// 7DTD loads every mod in its live Mods/ for every server, so a pack
+/// left live after a session can stop the player joining another server
+/// later, from the game's own list or a Steam launch, neither of which
+/// goes through the launcher. Parking the pack (it and its saves stay in
+/// the profile, as on any switch) leaves the live folders vanilla, and
+/// remembers the pack so a plain launch from the launcher can put it
+/// back (resume_parked).
+///
+/// Returns the pack parked; None when there was nothing to park (no
+/// profile system, or already vanilla).
+pub async fn park_to_vanilla(layout: &StoreLayout, game: &GameLayout) -> Result<Option<String>> {
+    let Some(meta) = active_profile(layout, game).await? else {
+        return Ok(None);
+    };
+    let Some(slug) = meta.active_pack_slug.clone() else {
+        return Ok(None);
+    };
+    set_active_pack(layout, game, &meta.id, None).await?;
+    let paths = ProfilePaths::from_root(&layout.profile_dir(&meta.id));
+    let mut meta = read_meta_migrated(layout, &paths).await?;
+    meta.parked_pack_slug = Some(slug.clone());
+    write_meta(&paths, &meta).await?;
+    Ok(Some(slug))
+}
+
+/// Put back the pack park_to_vanilla parked, before a plain launch.
+/// Returns the pack resumed; None when nothing is parked, or the park is
+/// stale (the player picked something else since, or removed the pack),
+/// in which case it's dropped.
+pub async fn resume_parked(layout: &StoreLayout, game: &GameLayout) -> Result<Option<String>> {
+    let Some(meta) = active_profile(layout, game).await? else {
+        return Ok(None);
+    };
+    let Some(slug) = meta.parked_pack_slug.clone() else {
+        return Ok(None);
+    };
+    if meta.active_pack_slug.is_some() || !meta.packs.iter().any(|p| p.slug == slug) {
+        let paths = ProfilePaths::from_root(&layout.profile_dir(&meta.id));
+        let mut meta = meta;
+        meta.parked_pack_slug = None;
+        write_meta(&paths, &meta).await?;
+        return Ok(None);
+    }
+    set_active_pack(layout, game, &meta.id, Some(&slug))
+        .await
+        .with_context(|| {
+            format!(
+                "Couldn't put your {} pack '{slug}' back. If {} is open, close it and launch again.",
+                game.short_name, game.display_name
+            )
+        })?;
+    Ok(Some(slug))
 }
 
 /// Add (or update) a pack inside a profile. Called by the install /
@@ -808,6 +878,9 @@ pub enum Alignment {
         from: Option<String>,
         to: Option<String>,
     },
+    /// A plain launch put back the pack parked when the game last
+    /// closed (park_to_vanilla, resume_parked).
+    Resumed { pack: String },
 }
 
 /// Make live mods match the server about to be joined: the server's
@@ -1840,6 +1913,64 @@ mod tests {
 
         switch_profile(&layout, &SEVEN_DAYS, &main).await.unwrap();
         assert_eq!(saves(&userdata), vec!["VanillaWorld"]);
+    }
+
+    #[tokio::test]
+    async fn parking_goes_vanilla_and_a_plain_launch_resumes_the_pack() {
+        let (layout, userdata, id) = fixture("park").await;
+        make_world(&userdata, "PackWorld").await;
+
+        assert_eq!(
+            park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap(),
+            Some("a".into())
+        );
+        assert!(live(&userdata).is_empty());
+        assert!(saves(&userdata).is_empty());
+        // Nothing left to park.
+        assert_eq!(park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap(), None);
+
+        assert_eq!(
+            resume_parked(&layout, &SEVEN_DAYS).await.unwrap(),
+            Some("a".into())
+        );
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+        assert_eq!(saves(&userdata), vec!["PackWorld"]);
+        // The park is spent.
+        assert_eq!(resume_parked(&layout, &SEVEN_DAYS).await.unwrap(), None);
+        let meta = active_profile(&layout, &SEVEN_DAYS).await.unwrap().unwrap();
+        assert_eq!((meta.id, meta.parked_pack_slug), (id, None));
+    }
+
+    #[tokio::test]
+    async fn picking_a_pack_or_vanilla_by_hand_ends_the_park() {
+        let (layout, userdata, id) = fixture("park-pick").await;
+        park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap();
+        // Choosing vanilla, which is already live, still counts.
+        set_active_pack(&layout, &SEVEN_DAYS, &id, None)
+            .await
+            .unwrap();
+        assert_eq!(resume_parked(&layout, &SEVEN_DAYS).await.unwrap(), None);
+        assert!(live(&userdata).is_empty());
+
+        park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap(); // nothing live: no park
+        set_active_pack(&layout, &SEVEN_DAYS, &id, Some("b"))
+            .await
+            .unwrap();
+        park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap();
+        set_active_pack(&layout, &SEVEN_DAYS, &id, Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(resume_parked(&layout, &SEVEN_DAYS).await.unwrap(), None);
+        assert_eq!(live(&userdata), vec!["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_parked_pack_that_was_removed_is_dropped() {
+        let (layout, userdata, id) = fixture("park-removed").await;
+        park_to_vanilla(&layout, &SEVEN_DAYS).await.unwrap();
+        remove_pack_from_profile(&layout, &id, "a").await.unwrap();
+        assert_eq!(resume_parked(&layout, &SEVEN_DAYS).await.unwrap(), None);
+        assert!(live(&userdata).is_empty());
     }
 
     #[tokio::test]

@@ -1518,6 +1518,12 @@ async fn launch_game(
                 .await
                 .map_err(|e| format!("{e:#}"))?,
         ),
+        // A plain launch plays the pack the player had: put back the one
+        // parked when the game last closed (watch_and_park, #753).
+        None if !game.launch_with_workshop_dir => profile::resume_parked(&layout, game)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .map(|pack| profile::Alignment::Resumed { pack }),
         None => None,
     };
 
@@ -1568,7 +1574,10 @@ async fn launch_game(
             connect_address.as_deref(),
             workshop_dir.as_deref(),
         ) {
-            Ok(()) => return Ok(alignment),
+            Ok(()) => {
+                watch_and_park(&app, game);
+                return Ok(alignment);
+            }
             Err(e) => {
                 eprintln!("[launch] direct spawn unavailable ({e}); falling back to Steam URI");
             }
@@ -1579,7 +1588,154 @@ async fn launch_game(
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("failed to launch {} via Steam: {e}", game.short_name))?;
+    watch_and_park(&app, game);
     Ok(alignment)
+}
+
+// ---------- Back to vanilla after play (#753) ----------
+//
+// 7DTD (and Valheim, whose plugins live in the install) loads every mod
+// in its live folder for every server. A pack left live after a session
+// stops the player joining any server that doesn't run it, and joins
+// from the game's own list or a launch from Steam never pass through the
+// launcher to fix that. So once a session the launcher started ends,
+// the pack is parked (profile::park_to_vanilla) and live goes vanilla;
+// the next plain launch from here puts it back (resume_parked). On by
+// default; Settings turns it off. Palworld loads its pack only when
+// launched with -workshopdir, so it has nothing to park.
+
+/// The launcher's own settings (launcher-settings.json).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LauncherSettings {
+    /// Switch live mods back to vanilla when a game the launcher
+    /// started closes.
+    #[serde(default = "yes")]
+    vanilla_after_play: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for LauncherSettings {
+    fn default() -> Self {
+        Self {
+            vanilla_after_play: true,
+        }
+    }
+}
+
+fn launcher_settings_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(
+        app.path()
+            .app_data_dir()
+            .ok()?
+            .join("launcher-settings.json"),
+    )
+}
+
+fn read_launcher_settings(app: &AppHandle) -> LauncherSettings {
+    launcher_settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn launcher_settings(app: AppHandle) -> LauncherSettings {
+    read_launcher_settings(&app)
+}
+
+#[tauri::command]
+fn set_vanilla_after_play(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let path = launcher_settings_path(&app).ok_or("no app data folder")?;
+    let mut settings = read_launcher_settings(&app);
+    settings.vanilla_after_play = enabled;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, raw).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Sent to the window when a closed game's pack was parked.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModsParked {
+    game: &'static str,
+    pack: String,
+}
+
+/// The games whose session is being watched, so launching again while
+/// one runs doesn't start a second watcher.
+static PARK_WATCHES: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// After a launch: wait for `game` to start and then exit, and park its
+/// pack (see above). Gives up if the game never starts within three
+/// minutes (Steam updating it, a failed start). Checks the setting again
+/// at the end, so turning it off mid-session counts.
+fn watch_and_park(app: &AppHandle, game: &'static GameLayout) {
+    if game.launch_with_workshop_dir || !read_launcher_settings(app).vanilla_after_play {
+        return;
+    }
+    if !PARK_WATCHES
+        .lock()
+        .map(|mut w| w.insert(game.id))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let name = Path::new(game.exe)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| game.exe.to_string());
+        if wait_for_process(&name, std::time::Duration::from_secs(180)) {
+            wait_for_exit(&name);
+            if read_launcher_settings(&app).vanilla_after_play {
+                park_after_play(&app, game);
+            }
+        }
+        if let Ok(mut w) = PARK_WATCHES.lock() {
+            w.remove(game.id);
+        }
+    });
+}
+
+/// Park `game`'s pack now that it has closed. The game can hold its mod
+/// files for a moment after its process is gone, so one failed try is
+/// retried after a pause.
+fn park_after_play(app: &AppHandle, game: &'static GameLayout) {
+    let Ok(layout) = store_layout(app) else {
+        return;
+    };
+    for attempt in 0..2 {
+        std::thread::sleep(std::time::Duration::from_secs(if attempt == 0 {
+            3
+        } else {
+            30
+        }));
+        match tauri::async_runtime::block_on(profile::park_to_vanilla(&layout, game)) {
+            Ok(Some(pack)) => {
+                let _ = app.emit(
+                    "mods://parked",
+                    ModsParked {
+                        game: game.id,
+                        pack,
+                    },
+                );
+                return;
+            }
+            Ok(None) => return,
+            Err(e) => eprintln!(
+                "[park] couldn't switch {} back to vanilla: {e:#}",
+                game.short_name
+            ),
+        }
+    }
 }
 
 /// Get Palworld's install ready to load the active pack through its own
@@ -2105,6 +2261,8 @@ pub fn run() {
             game_copies,
             set_game_store,
             launch_game,
+            launcher_settings,
+            set_vanilla_after_play,
             verify_pack,
             check_pack_present,
             repair_pack,
