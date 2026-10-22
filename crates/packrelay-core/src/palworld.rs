@@ -30,7 +30,12 @@ pub fn package_names(root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return names;
     };
-    for entry in entries.flatten() {
+    // In folder order: when two packages differ only in case, the first
+    // folder's spelling wins on every OS, not whichever read_dir yields
+    // first (it's unordered on Linux).
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let name = entry.file_name();
         let numeric = name
             .to_str()
