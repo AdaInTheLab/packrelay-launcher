@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "cloud.packrelay.app.test",
+  "productName": "PackRelay Test",
+  "app": {
+    "windows": [
+      {
+        "title": "PackRelay (test build)",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 480
+      }
+    ]
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "signCommand": null
+    }
+  }
+}
