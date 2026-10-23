@@ -858,6 +858,20 @@ function App() {
   // when out, or from the menu when in.
   const [auth, setAuth] = useState<AuthState>({ kind: "signedOut" });
   const [showSignIn, setShowSignIn] = useState(false);
+  // A pack the backend parked when the game closed (#753), for the
+  // one-time notice. Cleared when the player dismisses it.
+  const [parked, setParked] = useState<{ game: string; pack: string } | null>(null);
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void listen<{ game: string; pack: string }>("mods://parked", (e) => setParked(e.payload)).then(
+      (fn) => {
+        unlisten = fn;
+      },
+    );
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // Favorites: two Sets of slugs the signed-in user has hearted.
   // Sourced from /api/v1/me/favorites, refreshed after every
@@ -1534,7 +1548,10 @@ function App() {
             });
           }}
         />
-        <main className="flex-1 overflow-y-auto">{mainContent}</main>
+        <main className="flex-1 overflow-y-auto">
+          {parked && <ParkedNotice parked={parked} onDismiss={() => setParked(null)} />}
+          {mainContent}
+        </main>
       </div>
       <FooterStrip />
       {showSignIn && (
@@ -4940,11 +4957,15 @@ function ConnectCopy({ address }: { address: string }) {
 type Alignment =
   | { kind: "noProfile" }
   | { kind: "alreadyAligned" }
-  | { kind: "switched"; from: string | null; to: string | null };
+  | { kind: "switched"; from: string | null; to: string | null }
+  | { kind: "resumed"; pack: string };
 
 /** The line telling the player their Mods folder changed for this
  *  join. null when nothing changed, so there's nothing to say. */
 function alignmentNote(a: Alignment | null | undefined): string | null {
+  if (a?.kind === "resumed") {
+    return `Put ${a.pack} back in your Mods folder for this launch. It went back to vanilla when you last closed the game.`;
+  }
   if (a?.kind !== "switched") return null;
   return a.to
     ? "Switched your Mods folder to this server's pack. Your other packs are kept in your profile."
@@ -4952,7 +4973,8 @@ function alignmentNote(a: Alignment | null | undefined): string | null {
 }
 
 /** Tauri args for a JOIN: the server's pack (null = it runs none).
- *  Bare launches don't send this, so they never touch Mods/. */
+ *  Bare launches don't send this: they only put back a pack parked
+ *  when the game last closed (#753). */
 function joinArgs(address: string, serverPack: string | null, game?: string) {
   return { connectAddress: address, serverPack: { slug: serverPack }, game: game ?? null };
 }
@@ -5442,6 +5464,8 @@ function SettingsView({
 
       <UpdatesSection updater={updater} />
 
+      <VanillaAfterPlaySection />
+
       <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
         <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
           Account
@@ -5691,6 +5715,90 @@ type GameCopies = {
 // Settings card for a game installed through both Steam and the Xbox
 // app (Game Pass): which copy the launcher starts and installs packs
 // into. Hidden unless both are installed.
+/** Shown once the backend parks a pack after the game closed (#753). */
+function ParkedNotice({
+  parked,
+  onDismiss,
+}: {
+  parked: { game: string; pack: string };
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="mx-6 mt-4 rounded-xl border border-[var(--color-accent-soft)]/30 bg-[var(--color-accent)]/10 px-4 py-3 flex items-start gap-3">
+      <p className="flex-1 text-[12px] text-[var(--color-text-bright)]/90 leading-relaxed">
+        You closed {gameName(parked.game)}, so your Mods folder is back to vanilla and{" "}
+        <span className="font-mono">{parked.pack}</span> is kept in your profile. Joining any
+        server from the game&apos;s own list now works. Launching from PackRelay puts{" "}
+        <span className="font-mono">{parked.pack}</span> back, or pick it on Profiles to play it
+        from Steam.
+      </p>
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="text-[11px] tracking-[0.14em] uppercase text-[var(--color-text-dim)] hover:text-[var(--color-text-bright)]"
+      >
+        OK
+      </button>
+    </div>
+  );
+}
+
+/** Settings: switch live mods back to vanilla when a game the launcher
+ *  started closes (#753). On by default. */
+function VanillaAfterPlaySection() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<{ vanillaAfterPlay: boolean }>("launcher_settings")
+      .then((s) => setEnabled(s.vanillaAfterPlay))
+      .catch((e) => setError(typeof e === "string" ? e : `${e}`));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    try {
+      await invoke("set_vanilla_after_play", { enabled: next });
+      setEnabled(next);
+      setError(null);
+    } catch (e) {
+      setError(typeof e === "string" ? e : `${e}`);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+      <h2 className="text-[10px] font-medium tracking-[0.14em] uppercase text-[var(--color-text-bright)]/85 mb-3">
+        After you play
+      </h2>
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={enabled ?? true}
+          disabled={enabled === null}
+          onChange={(e) => void toggle(e.target.checked)}
+        />
+        <span>
+          <span className="block text-sm text-[var(--color-text-bright)]">
+            Switch my mods back to vanilla when I close the game
+          </span>
+          <span className="block text-[11px] text-[var(--color-text-dim)] leading-relaxed mt-1">
+            7 Days to Die and Valheim load your mods for every server you join. With this on,
+            closing a game PackRelay started puts your pack (and its saves) back in your
+            profile, so a server you join from the game&apos;s own list later doesn&apos;t
+            choke on mods it doesn&apos;t run. Launching from PackRelay puts the pack back.
+          </span>
+        </span>
+      </label>
+      {error && (
+        <div className="mt-3 rounded-md border border-[var(--color-status-danger)]/40 bg-[var(--color-status-danger)]/10 px-3 py-2 text-[11px] text-[var(--color-status-danger)]">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GameCopySection({ game }: { game: string }) {
   const [copies, setCopies] = useState<GameCopies | null>(null);
   const [error, setError] = useState<string | null>(null);
