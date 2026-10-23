@@ -1,0 +1,85 @@
+# Test build: an unsigned Windows launcher from any branch, for trying
+# changes by hand before a release.
+#
+# Run it from the Actions tab (Test build -> Run workflow -> pick the
+# branch). It uploads the bare exe as a workflow artifact and nothing
+# else: no installer, no release, no draft, no updater files, so no
+# player is offered it and the release flow (release.yml) is untouched.
+#
+# The build runs as a separate app (app/src-tauri/tauri.test-build.conf.json):
+#   - identifier cloud.packrelay.app.test, so its profiles, store and
+#     sign-in live apart from the real launcher's cloud.packrelay.app;
+#   - no installer, so nothing re-registers packrelay:// away from the
+#     real launcher (the app has no runtime register call);
+#   - the window says "PackRelay (test build)".
+# It still talks to the live packrelay.cloud, and the GAME's folders
+# (%APPDATA%\7DaysToDie\Mods, Saves) are the real ones: back them up
+# before testing anything that swaps packs.
+
+name: Test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            app/src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install npm deps
+        working-directory: app
+        run: npm ci
+
+      # --no-bundle: just the exe, no installer and nothing to sign.
+      - name: Build (test identifier, no bundle)
+        working-directory: app
+        run: npx tauri build --no-bundle --config src-tauri/tauri.test-build.conf.json
+
+      - name: Stage the artifact
+        shell: pwsh
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target/release/packrelay-app.exe "out/PackRelay-test-$short.exe"
+          @"
+          PackRelay launcher TEST BUILD
+          branch ${{ github.ref_name }}, commit ${{ github.sha }}
+
+          Unsigned, so Windows SmartScreen will warn: More info -> Run anyway.
+          It runs as a separate app (cloud.packrelay.app.test), so your real
+          launcher's profiles and sign-in aren't touched, and it doesn't take
+          over packrelay:// links. It does use the real packrelay.cloud and the
+          game's real folders: back up %APPDATA%\7DaysToDie\Mods and \Saves
+          before trying anything that swaps packs.
+          "@ | Set-Content -Encoding utf8 out/README-test-build.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          # No ref name here: a branch's "/" isn't allowed in artifact names.
+          name: packrelay-launcher-test-${{ github.run_number }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
