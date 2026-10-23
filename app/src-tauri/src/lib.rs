@@ -1478,10 +1478,9 @@ async fn profile_restore_snapshot(
 
 /// Open 7DTD via the Steam protocol. If `connect_address` is
 /// provided (server-browse one-click-join flow), we ride Steam's
-/// `steam://run/<appid>//<args>` form to pass
-/// `-connecttoip=<ip> -connecttoport=<port>` through to the
-/// client — the long-documented community pattern for "launch
-/// the game and jump straight into a server."
+/// `steam://run/<appid>//<args>` form to pass the game's join
+/// arguments (7DTD: `-SessionInvite=STM<ip>:<port>`, games.rs
+/// ConnectArgs) through to the client.
 ///
 /// Steam occasionally strips args (varies by Steam client
 /// version). When that happens the user still lands on the main
@@ -1814,7 +1813,7 @@ struct ServerPack {
 }
 
 /// Try to spawn the game's client directly with its connect args
-/// (launch::connect_args: 7DTD's `-connecttoip`/`-connecttoport`,
+/// (launch::connect_args: 7DTD's `-SessionInvite=STM<host>:<port>`,
 /// Valheim's `+connect host:port`). Direct spawn dodges Steam URI's
 /// habit of silently stripping args -- we hand the game its arg vector
 /// and the OS, not Steam's URI parser, decides what reaches it.

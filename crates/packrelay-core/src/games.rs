@@ -25,8 +25,13 @@ pub struct SwapEntry {
 /// How a game takes "join this server" on its command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectArgs {
-    /// `-connecttoip=<host> -connecttoport=<port>` (7DTD).
-    ConnectToIpPort,
+    /// `-SessionInvite=STM<host>:<port>` (7DTD). The game reads it into
+    /// LaunchPrefs.SessionInvite at startup: "STM" picks its Steam invite
+    /// listener, and the main menu joins `<host>:<port>` the way a Steam
+    /// "join game" does (InviteManager.HandleIpPortInvite). The older
+    /// `-connecttoip`/`-connecttoport` are ignored by current builds
+    /// ("is not a configfile property, ignoring").
+    SessionInvite,
     /// `+connect <host>:<port>` (Valheim, and other Source-style games).
     PlusConnect,
     /// No way to join from the command line (Palworld): the game starts
@@ -109,7 +114,7 @@ pub const SEVEN_DAYS: GameLayout = GameLayout {
     xbox: None,
     exe: "7DaysToDie.exe",
     default_port: 26900,
-    connect_args: ConnectArgs::ConnectToIpPort,
+    connect_args: ConnectArgs::SessionInvite,
     live_root_in_install: None,
     live_root_in_data: None,
     launch_with_workshop_dir: false,
