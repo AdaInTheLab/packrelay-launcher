@@ -1521,10 +1521,8 @@ function App() {
             if (!lastJoined) return;
             // Prime the clipboard with the address so the
             // ConnectButton's fallback path (paste into Direct
-            // Connect) still works if 7DTD silently ignores
-            // -connecttoip (which it does in 2.6 -- the WRN
-            // line in the launcher's own copy of the Pack Detail
-            // hedge is honest about this).
+            // Connect) still works if the game doesn't take the
+            // join arguments (Steam can strip them on its URI path).
             try {
               await navigator.clipboard.writeText(lastJoined.address);
             } catch {
@@ -5106,10 +5104,10 @@ function LaunchPanel({
       // Non-fatal — the address is still visible and selectable.
     }
     try {
-      // Pass the connect address through so the Rust side can ask
-      // Steam to forward -connecttoip / -connecttoport to the
-      // client. Steam occasionally strips args (varies by version),
-      // so the clipboard prime above is the reliable fallback.
+      // Pass the connect address through so the Rust side starts the
+      // game with its join arguments (7DTD: -SessionInvite). Steam can
+      // strip args on its URI fallback, so the clipboard prime above
+      // stays as the fallback.
       const a = await invoke<Alignment | null>(
         "launch_game",
         joinArgs(address, serverPack, game),

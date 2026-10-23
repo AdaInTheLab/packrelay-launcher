@@ -35,12 +35,7 @@ pub fn is_safe_host(host: &str) -> bool {
 /// The client arguments that join `host:port`.
 pub fn connect_args(game: &GameLayout, host: &str, port: u16) -> Vec<String> {
     match game.connect_args {
-        ConnectArgs::ConnectToIpPort => {
-            vec![
-                format!("-connecttoip={host}"),
-                format!("-connecttoport={port}"),
-            ]
-        }
+        ConnectArgs::SessionInvite => vec![format!("-SessionInvite=STM{host}:{port}")],
         ConnectArgs::PlusConnect => vec!["+connect".to_string(), format!("{host}:{port}")],
         // Palworld: nothing to pass; the player pastes the address.
         ConnectArgs::None => Vec::new(),
@@ -110,15 +105,16 @@ mod tests {
     use crate::games::{PALWORLD, SEVEN_DAYS, VALHEIM};
 
     #[test]
-    fn seven_days_keeps_its_connect_args_and_url() {
+    fn seven_days_joins_through_a_steam_session_invite() {
+        // The game ignores -connecttoip/-connecttoport; it joins an
+        // address handed to it as a Steam ("STM") session invite.
         assert_eq!(
             connect_args(&SEVEN_DAYS, "play.example.com", 26900),
-            vec!["-connecttoip=play.example.com", "-connecttoport=26900"]
+            vec!["-SessionInvite=STMplay.example.com:26900"]
         );
-        // Exactly the URL the app built before this moved here.
         assert_eq!(
             steam_url(&SEVEN_DAYS, Some("play.example.com:26901"), None),
-            "steam://run/251570//-connecttoip=play.example.com%20-connecttoport=26901"
+            "steam://run/251570//-SessionInvite=STMplay.example.com:26901"
         );
         assert_eq!(
             steam_url(&SEVEN_DAYS, None, None),
