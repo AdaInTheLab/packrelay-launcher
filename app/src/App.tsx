@@ -188,6 +188,7 @@ type UpdateReport = {
   filesAdded: number;
   filesChanged: number;
   filesRemoved: number;
+  filesRestored: number;
   filesKept: number;
   bytesDownloaded: number;
   dest: string;
@@ -3398,6 +3399,8 @@ function InstallView({
                   {state.result.report.filesChanged} changed,{" "}
                   {state.result.report.filesAdded} new,{" "}
                   {state.result.report.filesRemoved} removed,{" "}
+                  {state.result.report.filesRestored > 0 &&
+                    `${state.result.report.filesRestored} missing put back, `}
                   {state.result.report.filesKept} kept · downloaded{" "}
                   {formatBytes(state.result.report.bytesDownloaded)}
                 </div>

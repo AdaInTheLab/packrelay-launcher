@@ -3,12 +3,16 @@
 // only refetches files that changed (or were added), deletes files
 // that no longer exist in the new version, and skips the rest.
 //
-// Trust model: we trust the old sidecar's record of what we put on
-// disk. If the user has manually edited a file, the diff won't
-// re-download it (the manifest entries match), and the edit
-// survives. If they want byte-exact integrity, verify::repair is
-// the right tool — update is the fast path for the "new version
-// landed" case.
+// Trust model: we trust the old sidecar's record of what's in each
+// file, but not that the file is still there. A file the diff would
+// keep is checked on disk (it must exist at the manifest's size);
+// a missing or wrong-sized one is downloaded again and counted as
+// restored, even when the version hasn't changed. Without that, a
+// folder that went missing (a 233 MB texture pack on a player's
+// machine, 2026-10-23) was skipped by every later update while the
+// new sidecar went on claiming it. Same-size edits still survive,
+// since only the size is checked; verify::repair is the tool for
+// byte-exact integrity.
 //
 // Removed-file deletes are best-effort: same rationale as the
 // uninstall module — we'd rather complete the update than abort
@@ -38,6 +42,9 @@ pub struct UpdateReport {
     pub files_added: u32,
     pub files_changed: u32,
     pub files_removed: u32,
+    /// Files the old sidecar listed unchanged but that were missing
+    /// from disk (or the wrong size), so they were downloaded again.
+    pub files_restored: u32,
     pub files_kept: u32,
     pub bytes_downloaded: u64,
     pub dest: String,
@@ -90,32 +97,6 @@ where
         (old_manifest.name == slug).then_some(old_manifest.signature.public_key_id.as_str());
     ctx.check_signing_key(slug, &key, installed_key_id).await?;
 
-    // No-op early exit when the catalog matches what's installed.
-    // Saves us from emitting a Started/Done pair for zero work.
-    if old_manifest.version == new_manifest.version {
-        on_progress(ProgressEvent::Started {
-            display_name: new_manifest.display_name.clone(),
-            version: new_manifest.version.clone(),
-            file_count: 0,
-            total_bytes: 0,
-        });
-        on_progress(ProgressEvent::Done {
-            file_count: 0,
-            total_bytes: 0,
-        });
-        return Ok(UpdateReport {
-            display_name: new_manifest.display_name,
-            from_version: old_manifest.version.clone(),
-            to_version: new_manifest.version,
-            files_added: 0,
-            files_changed: 0,
-            files_removed: 0,
-            files_kept: old_manifest.files.len() as u32,
-            bytes_downloaded: 0,
-            dest: dest.display().to_string(),
-        });
-    }
-
     // Index the old manifest by normalized path so the diff loop
     // is O(n) instead of O(n²). Paths in manifests can use either
     // separator on Windows-published packs; canonicalize before
@@ -135,11 +116,19 @@ where
     let mut to_download: Vec<FileEntry> = Vec::new();
     let mut files_added: u32 = 0;
     let mut files_changed: u32 = 0;
+    let mut files_restored: u32 = 0;
     let mut files_kept: u32 = 0;
     for file in &new_manifest.files {
         let key = normalize_path(&file.path);
         match old_by_path.get(&key) {
-            Some(old) if old.sha256 == file.sha256 => files_kept += 1,
+            Some(old) if old.sha256 == file.sha256 => {
+                if on_disk(dest, file).await {
+                    files_kept += 1;
+                } else {
+                    to_download.push(file.clone());
+                    files_restored += 1;
+                }
+            }
             Some(_) => {
                 to_download.push(file.clone());
                 files_changed += 1;
@@ -156,6 +145,37 @@ where
         .iter()
         .filter(|f| !new_paths.contains(&normalize_path(&f.path)))
         .collect();
+
+    // No-op early exit when the catalog matches what's installed and
+    // every file is still on disk. Saves us from emitting a
+    // Started/Done pair for zero work.
+    if old_manifest.version == new_manifest.version
+        && to_download.is_empty()
+        && to_delete.is_empty()
+    {
+        on_progress(ProgressEvent::Started {
+            display_name: new_manifest.display_name.clone(),
+            version: new_manifest.version.clone(),
+            file_count: 0,
+            total_bytes: 0,
+        });
+        on_progress(ProgressEvent::Done {
+            file_count: 0,
+            total_bytes: 0,
+        });
+        return Ok(UpdateReport {
+            display_name: new_manifest.display_name,
+            from_version: old_manifest.version.clone(),
+            to_version: new_manifest.version,
+            files_added: 0,
+            files_changed: 0,
+            files_removed: 0,
+            files_restored: 0,
+            files_kept,
+            bytes_downloaded: 0,
+            dest: dest.display().to_string(),
+        });
+    }
 
     let bytes_to_download: u64 = to_download.iter().map(|f| f.size).sum();
 
@@ -207,7 +227,7 @@ where
         return Err(anyhow!(
             "{} of {} updated file(s) failed verification.",
             failures.len(),
-            files_added + files_changed
+            files_added + files_changed + files_restored
         ));
     }
 
@@ -262,7 +282,7 @@ where
     }
 
     on_progress(ProgressEvent::Done {
-        file_count: files_added + files_changed,
+        file_count: files_added + files_changed + files_restored,
         total_bytes: bytes_to_download,
     });
 
@@ -273,6 +293,7 @@ where
         files_added,
         files_changed,
         files_removed,
+        files_restored,
         files_kept,
         bytes_downloaded: bytes_to_download,
         dest: dest.display().to_string(),
@@ -281,4 +302,13 @@ where
 
 fn normalize_path(p: &str) -> String {
     p.replace('\\', "/")
+}
+
+/// Whether `file` is in `dest` at the manifest's size. A stat, not a
+/// hash, so checking a whole pack stays cheap on every update.
+async fn on_disk(dest: &Path, file: &FileEntry) -> bool {
+    match fs::metadata(dest.join(normalize_path(&file.path))).await {
+        Ok(meta) => meta.is_file() && meta.len() == file.size,
+        Err(_) => false,
+    }
 }
