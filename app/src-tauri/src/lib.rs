@@ -403,13 +403,40 @@ async fn list_packs() -> Result<Vec<CatalogPack>, String> {
 
 #[tauri::command]
 async fn list_servers() -> Result<Vec<CatalogServer>, String> {
+    fetch_servers("").await
+}
+
+/// One server by slug, for a `packrelay://join/<slug>` link to a server
+/// that isn't in the first page `list_servers` loads. None when the
+/// cloud has no public server by that slug.
+#[tauri::command]
+async fn get_server(slug: String) -> Result<Option<CatalogServer>, String> {
+    // Slugs are lowercase letters, digits and dashes. Anything else
+    // can't be a server, and never goes into the URL.
+    let plain = !slug.is_empty()
+        && slug.len() <= 100
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !plain {
+        return Ok(None);
+    }
+    let found = fetch_servers(&format!("&slug={slug}")).await?;
+    // A cloud that predates the slug filter ignores it and answers
+    // with the whole first page, so match here too.
+    Ok(found.into_iter().find(|s| s.slug == slug))
+}
+
+/// GET /api/v1/servers for the games this build supports, plus `extra`
+/// query (empty, or starting with `&`).
+async fn fetch_servers(extra: &str) -> Result<Vec<CatalogServer>, String> {
     let http = reqwest::Client::builder()
         .user_agent(user_agent_string())
         .build()
         .map_err(|e| e.to_string())?;
 
     let url = format!(
-        "{DEFAULT_API_URL}/api/v1/servers?game={}",
+        "{DEFAULT_API_URL}/api/v1/servers?game={}{extra}",
         supported_games_param()
     );
     let resp = http
@@ -2256,6 +2283,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_packs,
             list_servers,
+            get_server,
             install_pack,
             default_install_dest,
             game_copies,

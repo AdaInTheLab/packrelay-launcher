@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -1153,12 +1153,20 @@ function App() {
   const [pendingTargetVersion, setPendingTargetVersion] = useState<
     string | null
   >(null);
+  // Set by a server's "Install & play": InstallView starts without
+  // another click and launches the game once the pack is in.
+  const [autoPlay, setAutoPlay] = useState(false);
   const openPackInstall = useCallback(
-    (pack: CatalogPack, targetVersion: string | null = null) => {
+    (
+      pack: CatalogPack,
+      targetVersion: string | null = null,
+      play = false
+    ) => {
       setSelectedPack(pack);
       setPackView("install");
       setCanReturnToDetail(false);
       setPendingTargetVersion(targetVersion);
+      setAutoPlay(play);
     },
     []
   );
@@ -1183,19 +1191,30 @@ function App() {
   // that view already handles the three install states (current →
   // Connect; needs-update → Update & connect; not-installed → Install
   // pack & get connect address) so we don't need to special-case any
-  // of them here. If the server isn't in the catalog (private,
-  // delisted, typo'd), we clear the pending slot silently. Future:
-  // a per-slug fetch fallback so a launcher with a stale catalog can
-  // still resolve a fresh server URL from chat.
+  // of them here. The loaded list is only its first page, so a server
+  // that isn't in it is asked for by slug. If the cloud doesn't know
+  // it either (private, delisted, typo'd), the request is dropped.
   useEffect(() => {
     if (!pendingJoinSlug || !servers) return;
-    const match = servers.find((s) => s.slug === pendingJoinSlug);
-    if (match) {
+    const slug = pendingJoinSlug;
+    setPendingJoinSlug(null);
+    const open = (server: CatalogServer) => {
       setView("servers");
       setSelectedPack(null);
-      setSelectedServer(match);
+      setSelectedServer(server);
+    };
+    const match = servers.find((s) => s.slug === slug);
+    if (match) {
+      open(match);
+      return;
     }
-    setPendingJoinSlug(null);
+    void invoke<CatalogServer | null>("get_server", { slug })
+      .then((found) => {
+        if (found) open(found);
+      })
+      .catch(() => {
+        // Offline or the cloud is down: nothing to open.
+      });
   }, [servers, pendingJoinSlug]);
 
   const recordInstall = useCallback(
@@ -1341,6 +1360,7 @@ function App() {
           installedRecord={installedRecord}
           connectAddress={backToServer?.connectAddress ?? null}
           targetVersion={pendingTargetVersion}
+          autoPlay={autoPlay && backToServer !== null}
           backLabel={
             backToServer
               ? backToServer.name.toUpperCase()
@@ -1377,7 +1397,10 @@ function App() {
           onSignInRequest={() => setShowSignIn(true)}
           onBack={() => setSelectedPack(null)}
           backLabel={detailBackLabelFor(view)}
-          onInstall={() => setPackView("install")}
+          onInstall={() => {
+            setAutoPlay(false);
+            setPackView("install");
+          }}
           onShowServersForPack={(slug) => {
             // Set a transient pack filter, close the pack detail,
             // and switch the user to Browse Servers. The detail
@@ -1417,7 +1440,7 @@ function App() {
         backLabel={detailBackLabelFor(view)}
         recordLastJoined={recordLastJoined}
         onInstall={(pack, targetVersion) =>
-          openPackInstall(pack, targetVersion)
+          openPackInstall(pack, targetVersion, true)
         }
       />
     );
@@ -2952,6 +2975,7 @@ function InstallView({
   installedRecord,
   connectAddress,
   targetVersion,
+  autoPlay = false,
   backLabel,
   seededActive,
   onActiveChange,
@@ -2961,6 +2985,11 @@ function InstallView({
 }: {
   pack: CatalogPack;
   defaultDest: string;
+  /** The player pressed "Install & play" on a server: start as soon as
+   *  the folder is known, and launch the game when the pack is in. A
+   *  missing game, a failed install or a changed signing key all stop
+   *  and wait for the player, as they do without this. */
+  autoPlay?: boolean;
   /** History entry for this pack, if it's already installed.
    *  Drives the InstallView's mode (install vs update vs reinstall)
    *  and locks dest to the on-disk path so update's manifest diff
@@ -3200,6 +3229,20 @@ function InstallView({
     }
   }
 
+  // "Install & play": the player already said go on the server's page.
+  // Waits for the folder (other games look theirs up) and fires once;
+  // after an error or a key change the buttons take over.
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (!autoPlay || autoStarted.current) return;
+    if (state.kind !== "idle" || !dest.trim()) return;
+    autoStarted.current = true;
+    void startInstall();
+    // startInstall reads this render's dest and mode; the guard above
+    // is what decides when it runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPlay, state.kind, dest]);
+
   // Primary button label keys off `desiredVersion`, not `pack.latestVersion`,
   // so a pinned downgrade reads "Update to v0.2.0" rather than picking
   // up the latest publisher version that the user explicitly didn't ask
@@ -3410,7 +3453,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in {gameShort(pack.game)}
                   </div>
-                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} autoLaunch={autoPlay} />
                 </div>
               )}
             </div>
@@ -3434,7 +3477,7 @@ function InstallView({
                   <div className="text-[10px] tracking-[0.14em] uppercase text-[var(--color-accent-soft)] mb-2">
                     Now connect in {gameShort(pack.game)}
                   </div>
-                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} />
+                  <LaunchPanel address={connectAddress} serverPack={pack.slug} game={pack.game} autoLaunch={autoPlay} />
                 </div>
               )}
             </div>
@@ -4732,13 +4775,13 @@ function ServerDetailView({
                   className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 transition-colors text-sm font-medium"
                 >
                   {installState === "needs-update"
-                    ? `Update to v${targetVersion ?? "?"} & connect`
-                    : "Install pack & get connect address"}
+                    ? `Update to v${targetVersion ?? "?"} & play`
+                    : "Install & play"}
                 </button>
                 <p className="mt-2 text-[11px] text-[var(--color-text-dim)] leading-relaxed">
                   {installState === "needs-update"
-                    ? "Smart update only refetches the changed files. We'll surface the direct-connect address when it lands."
-                    : `We'll lay down the pack files, then surface the direct-connect address so you can paste it into ${gameShort(server.game)}.`}
+                    ? `Fetches only the files that changed, then starts ${gameShort(server.game)} and joins this server.`
+                    : `Installs the pack, then starts ${gameShort(server.game)} and joins this server.`}
                 </p>
               </>
             )}
@@ -4749,9 +4792,18 @@ function ServerDetailView({
           </div>
         )
       ) : (
-        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5 text-sm text-[var(--color-text-dim)]">
-          This server doesn&apos;t have a pack attached — connect to
-          it directly with the address above.
+        <div className="rounded-xl border border-[var(--color-bg-raised)] bg-[var(--color-bg-panel)]/60 p-5">
+          <p className="text-sm text-[var(--color-text-dim)] mb-3">
+            This server has no pack, so there&apos;s nothing to install.
+          </p>
+          {server.connectAddress && (
+            <ConnectButton
+              address={server.connectAddress}
+              serverPack={null}
+              game={server.game}
+              onLaunched={onLaunched}
+            />
+          )}
         </div>
       )}
 
@@ -5085,12 +5137,16 @@ function LaunchPanel({
   address,
   serverPack,
   game,
+  autoLaunch = false,
 }: {
   address: string;
   /** Slug of the pack this server runs; null when it runs none. */
   serverPack: string | null;
   /** The game the pack is for; launch_game opens that one. */
   game?: string;
+  /** Launch once as the panel appears ("Install & play"). The button
+   *  stays for a second try. */
+  autoLaunch?: boolean;
 }) {
   const [state, setState] = useState<
     | { kind: "idle" }
@@ -5122,6 +5178,13 @@ function LaunchPanel({
       setState({ kind: "error", message: String(e) });
     }
   }, [address, serverPack, game]);
+
+  const autoLaunched = useRef(false);
+  useEffect(() => {
+    if (!autoLaunch || autoLaunched.current) return;
+    autoLaunched.current = true;
+    void launch();
+  }, [autoLaunch, launch]);
 
   return (
     <div className="space-y-3">
