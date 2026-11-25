@@ -13,6 +13,12 @@
 // cost and zero extra disk space. Cross-volume we fall back to a
 // regular copy and accept the duplication.
 //
+// The price: a file linked from the cache shares its bytes with the
+// blob and with every other link to it. Nothing may write into one in
+// place. New bytes go into a new file that then replaces the old name
+// (install::download_and_verify), and link_into clears a target before
+// linking.
+//
 // We never delete blobs implicitly. Even after a pack is
 // uninstalled, the blobs stick around until a deliberate sweep —
 // reasoning: switching back to an old version should never have to
@@ -73,11 +79,18 @@ pub async fn add_blob_from_file(cache_root: &Path, sha256: &str, source: &Path) 
 /// doesn't know the hash up front (e.g. discovering pre-existing
 /// files during "import current state as profile").
 pub async fn add_blob_unknown_hash(cache_root: &Path, source: &Path) -> Result<(String, PathBuf)> {
-    let mut file = fs::File::open(source)
+    let sha = hash_file(source).await?;
+    let path = add_blob_from_file(cache_root, &sha, source).await?;
+    Ok((sha, path))
+}
+
+/// SHA-256 of a file's contents, as lowercase hex.
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
         .await
-        .with_context(|| format!("opening {}", source.display()))?;
+        .with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {
@@ -85,9 +98,34 @@ pub async fn add_blob_unknown_hash(cache_root: &Path, source: &Path) -> Result<(
         }
         hasher.update(&buf[..n]);
     }
-    let sha = hex::encode(hasher.finalize());
-    let path = add_blob_from_file(cache_root, &sha, source).await?;
-    Ok((sha, path))
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Whether the cached blob for `sha256` holds exactly those bytes:
+/// `size` long, and hashing to its name. Reads the whole blob.
+///
+/// Launchers before the fix in install::download_and_verify wrote an
+/// updated file in place through its hard link to the old version's
+/// blob, so a cache that one of them updated can hold blobs whose
+/// bytes belong to a later version of the same file.
+pub async fn blob_is_intact(cache_root: &Path, sha256: &str, size: u64) -> bool {
+    let path = blob_path(cache_root, sha256);
+    match fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() && meta.len() == size => {}
+        _ => return false,
+    }
+    matches!(hash_file(&path).await, Ok(actual) if actual.eq_ignore_ascii_case(sha256))
+}
+
+/// Drop one blob from the cache. Only the cache's own link goes:
+/// files elsewhere that are hard links to it keep their bytes.
+pub async fn evict_blob(cache_root: &Path, sha256: &str) -> Result<()> {
+    let path = blob_path(cache_root, sha256);
+    match fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// Materialize a cached blob into a target path. Prefers hard link
