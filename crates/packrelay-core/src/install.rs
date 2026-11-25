@@ -322,8 +322,19 @@ where
     let profile_target = ctx.profile_mods.as_ref().map(|root| root.join(&normalized));
 
     // Fast path: cache already has this blob. Link it into dest +
-    // profile mirror without touching the network.
+    // profile mirror without touching the network, once its bytes
+    // are checked: an older launcher wrote new versions of files
+    // through their cache links (see the slow path below), so a blob
+    // can hold bytes that aren't the ones its name promises. Such a
+    // blob is dropped and the file downloaded again.
     if let Some(cache) = ctx.cache_root.as_deref() {
+        if blob_cache::has_blob(cache, &file.sha256).await
+            && !blob_cache::blob_is_intact(cache, &file.sha256, file.size).await
+        {
+            blob_cache::evict_blob(cache, &file.sha256)
+                .await
+                .with_context(|| format!("dropping a bad cached blob for {}", file.path))?;
+        }
         if blob_cache::has_blob(cache, &file.sha256).await {
             blob_cache::link_into(cache, &file.sha256, &target)
                 .await
@@ -346,7 +357,83 @@ where
         }
     }
 
-    // Slow path: download + hash + write in one streaming pass.
+    // Slow path: download + hash + write in one streaming pass, into
+    // a part file beside the target, then move it over the target.
+    // Never write into the target itself: after a cached install it
+    // is a hard link to the cache blob of the sha256 it had before
+    // (and to the profile's copy), so truncating it in place rewrote
+    // that blob with the new bytes. An update that moved Atlas_004's
+    // bytes to Atlas_009 and gave Atlas_004 new art (KitsuneWashitsu
+    // 0.7.0, 2026-11-25) linked Atlas_009 from that rewritten blob,
+    // and the player got the new art twice. A move only changes what
+    // the target's name points at; other links keep their bytes.
+    let part = part_path(&target);
+    if let Err(e) = download_to(http, url, file, &part, on_progress).await {
+        let _ = fs::remove_file(&part).await;
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&part, &target).await {
+        let _ = fs::remove_file(&part).await;
+        return Err(e).with_context(|| format!("moving {} into place", target.display()));
+    }
+
+    // Promote the just-written file into the cache (turns dest
+    // into a hardlink to the canonical blob). Then mirror to the
+    // profile's mods/ if set.
+    if let Some(cache) = ctx.cache_root.as_deref() {
+        blob_cache::promote_to_cache(cache, &file.sha256, &target)
+            .await
+            .with_context(|| format!("caching blob for {}", file.path))?;
+        if let Some(ptarget) = &profile_target {
+            blob_cache::link_into(cache, &file.sha256, ptarget)
+                .await
+                .with_context(|| format!("mirroring blob to profile for {}", file.path))?;
+        }
+    } else if let Some(ptarget) = &profile_target {
+        // No cache — fall back to a direct copy into profile. Clear
+        // the old file first so the copy can't write through a link.
+        if let Some(parent) = ptarget.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        match fs::remove_file(ptarget).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("clearing {}", ptarget.display()));
+            }
+        }
+        fs::copy(&target, ptarget)
+            .await
+            .with_context(|| format!("mirroring {} to profile", file.path))?;
+    }
+
+    on_progress(ProgressEvent::FileDone {
+        path: file.path.clone(),
+    });
+
+    Ok(())
+}
+
+/// Where a download of `target` lands until it's verified.
+fn part_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".packrelay-part");
+    target.with_file_name(name)
+}
+
+/// Stream `url` into a new file at `out_path`, checking it against
+/// `file`'s size and sha256 on the way. On error the caller removes
+/// whatever was written.
+async fn download_to<F>(
+    http: &reqwest::Client,
+    url: &str,
+    file: &FileEntry,
+    out_path: &Path,
+    on_progress: &F,
+) -> Result<()>
+where
+    F: Fn(ProgressEvent) + Send + Sync + ?Sized,
+{
     let res = http
         .get(url)
         .send()
@@ -357,9 +444,9 @@ where
     }
 
     let mut hasher = Sha256::new();
-    let mut out = fs::File::create(&target)
+    let mut out = fs::File::create(out_path)
         .await
-        .with_context(|| format!("creating {}", target.display()))?;
+        .with_context(|| format!("creating {}", out_path.display()))?;
 
     // Stream bytes through the hasher and out to disk in one pass.
     // Avoids ever materializing the full file in memory — important
@@ -379,6 +466,8 @@ where
         });
     }
     out.flush().await?;
+    // Closed before the caller moves the file into place.
+    drop(out);
 
     if total != file.size {
         anyhow::bail!(
@@ -398,32 +487,5 @@ where
             file.sha256
         );
     }
-
-    // Promote the just-written file into the cache (turns dest
-    // into a hardlink to the canonical blob). Then mirror to the
-    // profile's mods/ if set.
-    if let Some(cache) = ctx.cache_root.as_deref() {
-        blob_cache::promote_to_cache(cache, &file.sha256, &target)
-            .await
-            .with_context(|| format!("caching blob for {}", file.path))?;
-        if let Some(ptarget) = &profile_target {
-            blob_cache::link_into(cache, &file.sha256, ptarget)
-                .await
-                .with_context(|| format!("mirroring blob to profile for {}", file.path))?;
-        }
-    } else if let Some(ptarget) = &profile_target {
-        // No cache — fall back to a direct copy into profile.
-        if let Some(parent) = ptarget.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::copy(&target, ptarget)
-            .await
-            .with_context(|| format!("mirroring {} to profile", file.path))?;
-    }
-
-    on_progress(ProgressEvent::FileDone {
-        path: file.path.clone(),
-    });
-
     Ok(())
 }
